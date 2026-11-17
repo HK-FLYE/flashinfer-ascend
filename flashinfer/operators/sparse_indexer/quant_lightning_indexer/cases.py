@@ -1,8 +1,10 @@
-"""CPU golden stubs and first-grid sample matrix for quant_lightning_indexer.
+"""CPU golden and first-grid samples for quant_lightning_indexer.
 
-P1 expands golden to full FP8 dequant + ReLU + stable TopK. P0 only needs the
-schema export surface (sample / CASE_PARAMETERS / golden placeholders).
+quant_mode=1 reference matches the QLIv2 FP8 path used in production DSA:
+dequant Q/K with float32 scales, matmul, ReLU, weighted head reduce, stable TopK.
 """
+
+import math
 
 
 CASE_PARAMETERS = (
@@ -16,32 +18,248 @@ CASE_PARAMETERS = (
         "block": 16,
         "batch": 1,
         "max_seq_len_k": 64,
+        "seqused_k": 48,
+        "residual": 0,
         "quant_mode": 1,
         "mask_mode": 3,
         "cmp_ratio": 4,
+        "seed": 7,
+    },
+    {
+        "name": "short_query_topk_overflow",
+        "tq": 1,
+        "n1": 4,
+        "d": 128,
+        "topk": 16,
+        "pages": 2,
+        "block": 16,
+        "batch": 1,
+        "max_seq_len_k": 8,
+        "seqused_k": 8,
+        "residual": 3,
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 11,
+    },
+    {
+        "name": "multi_batch_ragged",
+        "tq": 6,
+        "n1": 8,
+        "d": 128,
+        "topk": 4,
+        "pages": 6,
+        "block": 16,
+        "batch": 2,
+        "cu_q": (0, 2, 6),
+        "max_seq_len_k": 32,
+        "seqused_k": (10, 24),
+        "residual": (1, 2),
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 13,
     },
 )
 
 
+def _stable_topk(torch, scores, k):
+    rows = []
+    for row in scores:
+        finite = torch.isfinite(row)
+        ids = torch.arange(row.numel(), dtype=torch.int64)[finite]
+        if ids.numel() == 0:
+            rows.append(torch.full((k,), -1, dtype=torch.int32))
+            continue
+        values = row[ids]
+        order = sorted(
+            range(ids.numel()),
+            key=lambda i: (-float(values[i]), int(ids[i])),
+        )[:k]
+        result = torch.full((k,), -1, dtype=torch.int32)
+        if order:
+            result[: len(order)] = ids[torch.tensor(order, dtype=torch.int64)].to(
+                torch.int32
+            )
+        rows.append(result)
+    return torch.stack(rows)
+
+
+def _mask3_visible_len(local_q, q_len, k_act, cmp_ratio=1, residual=0):
+    raw = (k_act * cmp_ratio + residual - q_len + local_q + 1) / float(cmp_ratio)
+    if raw < 0:
+        return 0
+    return min(k_act, math.floor(raw))
+
+
+def _apply_mask(torch, scores, q_act, k_act, *, mask_mode, cmp_ratio, residual):
+    q_len, k_len = scores.shape
+    if q_act < q_len:
+        scores[q_act:q_len, :] = float("-inf")
+    if k_act < k_len:
+        scores[:, k_act:k_len] = float("-inf")
+    if mask_mode == 3:
+        for local_q in range(min(q_act, q_len)):
+            visible = _mask3_visible_len(local_q, q_act, k_act, cmp_ratio, residual)
+            if visible < k_act:
+                scores[local_q, visible:k_act] = float("-inf")
+
+
+def _gather_paged(torch, pages, scales, table, used, max_seq_len_k):
+    if pages.dim() == 4:
+        pages = pages.squeeze(2)
+    if scales.dim() == 3 and scales.shape[-1] == 1:
+        scales = scales.squeeze(-1)
+    batch = table.shape[0]
+    block = pages.shape[1]
+    logical_k = []
+    logical_s = []
+    for b in range(batch):
+        rows = torch.zeros((max_seq_len_k, pages.shape[-1]), dtype=torch.float32)
+        scale_rows = torch.zeros((max_seq_len_k,), dtype=torch.float32)
+        count = int(used[b])
+        for token in range(min(count, max_seq_len_k)):
+            page = int(table[b, token // block])
+            if 0 <= page < pages.shape[0]:
+                rows[token] = pages[page, token % block].float()
+                scale_rows[token] = scales[page, token % block].float()
+        logical_k.append(rows)
+        logical_s.append(scale_rows)
+    return logical_k, logical_s
+
+
+def _reduce_quant(torch, query, key, weights, q_scale, k_scale):
+    # quant_mode=1: dequant then matmul (equivalent to outer-scale ⊙ Q@K for per-token scales).
+    q = query.float() * q_scale.float().unsqueeze(-1)
+    k = key.float() * k_scale.float().unsqueeze(-1)
+    scores = torch.relu(torch.einsum("tnd,sd->tns", q, k))
+    return (scores * weights.float().unsqueeze(-1)).sum(dim=1)
+
+
+def golden(
+    torch,
+    query,
+    key,
+    weights,
+    query_dequant_scale,
+    key_dequant_scale,
+    topk,
+    *,
+    quant_mode=1,
+    layout_q="TND",
+    layout_k="PA_BBND",
+    mask_mode=3,
+    cmp_ratio=4,
+    max_seq_len_k=0,
+    cu_seqlens_q=None,
+    seqused_k=None,
+    cmp_residual_k=None,
+    block_table=None,
+    return_value=0,
+):
+    if quant_mode != 1 or layout_q != "TND" or layout_k != "PA_BBND":
+        raise NotImplementedError("CPU golden currently covers the first grid only")
+    if block_table is None or seqused_k is None or cu_seqlens_q is None:
+        raise ValueError("first-grid golden requires cu_seqlens_q, seqused_k and block_table")
+    if cmp_ratio != 1 and cmp_residual_k is None:
+        raise ValueError("cmp_residual_k is required when cmp_ratio!=1")
+
+    q = query.cpu()
+    w = weights.float().cpu()
+    qs = query_dequant_scale.float().cpu()
+    pages = key.cpu()
+    ks = key_dequant_scale.cpu()
+    table = block_table.cpu()
+    used = seqused_k.cpu()
+    residual = (
+        cmp_residual_k.cpu().tolist()
+        if cmp_residual_k is not None
+        else [0] * table.shape[0]
+    )
+    ql = cu_seqlens_q.cpu().tolist()
+    logical_k, logical_s = _gather_paged(torch, pages, ks, table, used, max_seq_len_k)
+
+    rows_i = []
+    rows_v = []
+    for b in range(len(ql) - 1):
+        q0, q1 = ql[b], ql[b + 1]
+        q_len = q1 - q0
+        score = _reduce_quant(
+            torch, q[q0:q1], logical_k[b], w[q0:q1], qs[q0:q1], logical_s[b]
+        )
+        _apply_mask(
+            torch,
+            score,
+            q_len,
+            int(used[b]),
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+            residual=residual[b],
+        )
+        idx = _stable_topk(torch, score, topk)
+        rows_i.append(idx)
+        if return_value:
+            safe = idx.long().clamp_min(0)
+            vals = torch.gather(score, 1, safe)
+            vals = vals.masked_fill(idx < 0, float("-inf"))
+            rows_v.append(vals)
+
+    indices = torch.cat(rows_i).unsqueeze(1).to(torch.int32)
+    if return_value:
+        values = torch.cat(rows_v).unsqueeze(1).to(torch.bfloat16)
+    else:
+        values = torch.empty((0,), dtype=torch.bfloat16)
+    return indices, values
+
+
 def sample(torch, case=None):
     case = dict(CASE_PARAMETERS[0] if case is None else case)
+    rng = torch.Generator().manual_seed(int(case.get("seed", 7)))
     tq = case["tq"]
     n1 = case["n1"]
     d = case["d"]
     pages = case["pages"]
     block = case["block"]
     batch = case["batch"]
-    query = torch.zeros((tq, n1, d), dtype=torch.float8_e4m3fn)
-    key = torch.zeros((pages, block, 1, d), dtype=torch.float8_e4m3fn)
-    weights = torch.ones((tq, n1), dtype=torch.float32)
-    q_scale = torch.ones((tq, n1), dtype=torch.float32)
-    k_scale = torch.ones((pages, block, 1), dtype=torch.float32)
-    cu = torch.tensor([0, tq], dtype=torch.int32)
-    if batch != 1:
-        raise ValueError("P0 sample only covers batch=1")
-    seqused_k = torch.tensor([min(case["max_seq_len_k"], pages * block)], dtype=torch.int32)
-    residual = torch.tensor([0], dtype=torch.int32)
-    table = torch.zeros((1, max(1, (int(seqused_k[0]) + block - 1) // block)), dtype=torch.int32)
+    max_seq_len_k = case["max_seq_len_k"]
+
+    # Materialize FP8 via float32 then cast; keeps values in a mild range.
+    q_f = torch.randn((tq, n1, d), generator=rng) * 0.1
+    k_f = torch.randn((pages, block, 1, d), generator=rng) * 0.1
+    query = q_f.to(torch.float8_e4m3fn)
+    key = k_f.to(torch.float8_e4m3fn)
+    weights = (torch.randn((tq, n1), generator=rng).abs() * 0.25 + 0.05).to(torch.float32)
+    q_scale = (torch.randn((tq, n1), generator=rng).abs() * 0.05 + 0.01).to(torch.float32)
+    k_scale = (torch.randn((pages, block, 1), generator=rng).abs() * 0.05 + 0.01).to(
+        torch.float32
+    )
+
+    if "cu_q" in case:
+        cu = torch.tensor(list(case["cu_q"]), dtype=torch.int32)
+    else:
+        cu = torch.tensor([0, tq], dtype=torch.int32)
+        if batch != 1:
+            raise ValueError("batch>1 sample requires cu_q")
+    if isinstance(case.get("seqused_k"), (tuple, list)):
+        seqused_k = torch.tensor(list(case["seqused_k"]), dtype=torch.int32)
+    else:
+        seqused_k = torch.tensor([int(case.get("seqused_k", max_seq_len_k))], dtype=torch.int32)
+    if isinstance(case.get("residual"), (tuple, list)):
+        residual = torch.tensor(list(case["residual"]), dtype=torch.int32)
+    else:
+        residual = torch.tensor([int(case.get("residual", 0))], dtype=torch.int32)
+
+    max_blocks = max(1, (max_seq_len_k + block - 1) // block)
+    table = torch.full((batch, max_blocks), -1, dtype=torch.int32)
+    cursor = 0
+    for b in range(batch):
+        need = (int(seqused_k[b]) + block - 1) // block
+        for i in range(need):
+            table[b, i] = cursor
+            cursor += 1
+            if cursor >= pages:
+                cursor = pages - 1
+
     return {
         "query": query,
         "key": key,
@@ -54,14 +272,10 @@ def sample(torch, case=None):
         "layout_k": "PA_BBND",
         "mask_mode": case["mask_mode"],
         "cmp_ratio": case["cmp_ratio"],
-        "max_seq_len_k": case["max_seq_len_k"],
+        "max_seq_len_k": max_seq_len_k,
         "cu_seqlens_q": cu,
         "seqused_k": seqused_k,
         "cmp_residual_k": residual,
         "block_table": table,
         "return_value": 0,
     }
-
-
-def golden(torch, **kwargs):
-    raise NotImplementedError("CPU golden lands in P1")

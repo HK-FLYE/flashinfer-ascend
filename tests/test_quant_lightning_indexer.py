@@ -1,11 +1,23 @@
-"""L0 public contract tests for sparse_indexer.quant_lightning_indexer.
+"""L0/L1 tests for sparse_indexer.quant_lightning_indexer.
 
 First grid: Ascend950 DeepSeek V4 DSA hot path
 (quant_mode=1, TND/PA_BBND, mask_mode=3, cmp_ratio=4, D=128, return_value=0).
+
+L0 = public schema / NativeBinding contract.
+L1 = CPU golden semantic boundaries (device kernel still unverified).
 """
 
-import pytest
+import math
 
+import pytest
+import torch
+
+from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import (
+    CASE_PARAMETERS,
+    _mask3_visible_len,
+    golden,
+    sample,
+)
 from flashinfer.operators.sparse_indexer.quant_lightning_indexer.operator import OPERATOR
 
 
@@ -147,3 +159,70 @@ def test_native_recipe_declares_ordered_abi():
             "bfloat16",
         ),
     )
+
+
+@pytest.mark.parametrize("case", CASE_PARAMETERS, ids=lambda c: c["name"])
+def test_cpu_golden_indices_shape_and_padding(case):
+    tensors = sample(torch, case)
+    indices, values = golden(torch, **tensors)
+    tq = case["tq"]
+    topk = case["topk"]
+    assert indices.shape == (tq, 1, topk)
+    assert indices.dtype == torch.int32
+    assert values.shape == (0,)
+    assert values.dtype == torch.bfloat16
+    assert ((indices >= 0) | (indices == -1)).all()
+    # Padding slots after exhausted valid keys must be -1.
+    for row in indices[:, 0, :]:
+        valid = row[row >= 0]
+        assert valid.numel() == valid.unique().numel()
+        if valid.numel() < topk:
+            assert (row[valid.numel() :] == -1).all()
+
+
+def test_cpu_golden_mask3_respects_visibility_window():
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "hot_path_anchor")
+    tensors = sample(torch, case)
+    # Force residual=0 so the closed-form window is easy to check.
+    tensors["cmp_residual_k"] = torch.zeros_like(tensors["cmp_residual_k"])
+    indices, _ = golden(torch, **tensors)
+    q_len = case["tq"]
+    k_act = int(tensors["seqused_k"][0])
+    cmp_ratio = case["cmp_ratio"]
+    for local_q in range(q_len):
+        visible = _mask3_visible_len(local_q, q_len, k_act, cmp_ratio, 0)
+        chosen = indices[local_q, 0]
+        chosen = chosen[chosen >= 0]
+        if visible > 0:
+            assert (chosen < visible).all()
+        else:
+            assert chosen.numel() == 0
+
+
+def test_cpu_golden_return_value_matches_score_gather():
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "short_query_topk_overflow")
+    tensors = sample(torch, case)
+    tensors["return_value"] = 1
+    indices, values = golden(torch, **tensors)
+    assert values.shape == indices.shape
+    assert values.dtype == torch.bfloat16
+    # Invalid slots stay -inf after bf16 cast of -inf scores.
+    invalid = indices < 0
+    assert torch.isneginf(values[invalid]).all()
+
+
+def test_cpu_golden_is_deterministic():
+    case = CASE_PARAMETERS[0]
+    a = sample(torch, case)
+    b = sample(torch, case)
+    ia, _ = golden(torch, **a)
+    ib, _ = golden(torch, **b)
+    assert torch.equal(ia, ib)
+
+
+def test_mask3_visible_len_formula():
+    # q_len=8, k_act=48, cmp=4, residual=0, local_q=7 → floor((192-8+7+1)/4)=48
+    assert _mask3_visible_len(7, 8, 48, 4, 0) == 48
+    # early query sees fewer keys
+    assert _mask3_visible_len(0, 8, 48, 4, 0) == math.floor((192 - 8 + 0 + 1) / 4)
+    assert _mask3_visible_len(0, 8, 8, 4, 0) < 8

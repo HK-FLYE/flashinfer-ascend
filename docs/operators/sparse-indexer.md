@@ -8,7 +8,7 @@
 
 | logical op | public API | 状态 |
 | --- | --- | --- |
-| `sparse_indexer.quant_lightning_indexer` | `flashinfer.quant_lightning_indexer` | Ascend950 首期热点格：公共契约与 AOT 声明已登记；设备 kernel 仍为桩，数值对拍未完成 |
+| `sparse_indexer.quant_lightning_indexer` | `flashinfer.quant_lightning_indexer` | Ascend950 首期热点格：公共契约、AOT 声明与 CPU golden 已登记；设备 kernel 仍为桩，QLIv2 对拍未完成 |
 
 `sparse_indexer.lightning_indexer` / `general_indexer` 未在本分支创建。独立 metadata 产品算子首期不做；分核调度内嵌 tiling/kernel。
 
@@ -38,9 +38,9 @@ indices = stable_topk(score, topk)
 
 必选运行时输入：`cu_seqlens_q`、`seqused_k`、`block_table`、`cmp_residual_k`、`max_seq_len_k>0`。TND 下 `indices` 形状为 `[Tq, Nk, topk]`；无效位填 `-1`。
 
-正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`（默认严相等）。**当前仅完成公共契约与登记；真机 kernel 与对拍未验证，不声称功能完成或性能优势。**
+正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`（默认严相等）。**真机 kernel 与对拍未验证，不声称功能完成或性能优势。**
 
-源码：[公共定义](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/operator.py)、[AOT/runner](../../flashinfer/ascendc/sparse_indexer/quant_lightning_indexer/)、[设备桩](../../csrc/kernels/sparse_indexer/quant_lightning_indexer/)、[契约测试](../../tests/test_quant_lightning_indexer.py)。
+源码：[公共定义](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/operator.py)、[CPU golden / sample](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/cases.py)、[AOT/runner](../../flashinfer/ascendc/sparse_indexer/quant_lightning_indexer/)、[设备桩](../../csrc/kernels/sparse_indexer/quant_lightning_indexer/)、[契约与 CPU 语义测试](../../tests/test_quant_lightning_indexer.py)。
 
 ## 与 Sparse Attention 的契约
 
@@ -48,5 +48,5 @@ Indexer 与 sparse attention 是两个 domain。本算子输出 token 级 TopK�
 
 ## 验证与限制
 
-- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记。
+- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden（FP8 反量化 + ReLU + 加权 + mask_mode=3 + stable TopK）在首期 sample 矩阵上的形状/填充/可见窗边界。
 - 未验证：设备 kernel 数值、相对 QLIv2 的 indices 对拍、图 capture/replay、性能、非首期 `quant_mode`/布局。
