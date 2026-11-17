@@ -15,7 +15,7 @@
 | backend | 全局 Descriptor | 执行方式 | 主要边界 |
 | --- | ---: | --- | --- |
 | `cann` | 41 | 调用已安装的 Torch/TorchNPU/CANN 算子或组合 | 各算子单独限制 SoC、dtype 和布局 |
-| `ascendc` | 9 | 本仓 v2 op-package，ACLNN + TorchNPU 桥 | Ascend910B/Ascend910C/Ascend950 各三项；各自固定支持域 |
+| `ascendc` | 10 | 本仓 v2 op-package，ACLNN + TorchNPU 桥 | Ascend910B/Ascend910C 各三项；Ascend950 四项；各自固定支持域 |
 | `triton` | 2 | 后端目录内的 Triton kernel，首次需要时 JIT | Matmul 与 Gemma fused Add RMSNorm |
 | `reference` | 38 | 显式参考计算 | 不作为默认 auto 的运行失败兜底 |
 
@@ -27,6 +27,7 @@
 | 算子族 | CANN | Ascend C | Triton | reference |
 | --- | --- | --- | --- | --- |
 | Attention | Partial (6) | Partial (5) | Not supported | Partial (3) |
+| Sparse Indexer | Not supported | Partial (1) | Not supported | Not supported |
 | GEMM | Partial (6) | Partial (4) | Partial (1) | Partial (5) |
 | MoE | Partial (3) | Not supported | Not supported | Partial (3) |
 | Norm | Supported (4) | Not supported | Supported (1) | Partial (5) |
@@ -36,7 +37,7 @@
 | KV cache | Partial (1) | Not supported | Not supported | Partial (1) |
 | State merge | Supported (2) | Not supported | Not supported | Partial (2) |
 
-族级标签覆盖该族的现有登记项，不能外推为整个上游算子族。以下逐项表列出源码全部 90 个 Descriptor 对应的 op × backend。
+族级标签覆盖该族的现有登记项，不能外推为整个上游算子族。以下逐项表列出源码全部 91 个 Descriptor 对应的 op × backend。
 
 ## 算子登记矩阵
 
@@ -134,20 +135,21 @@
 | `sampling.top_p_renorm_probs` | `reference` | bfloat16, float16, float32 | 未按 SoC 限制（仍受执行实现约束） | **Partial** — logical=ND；显式参考；Host/数值对照测试不覆盖所有登记组合 | [test_sampling.py](../../tests/test_sampling.py) |
 | <a id="op-sampling-top-p-sampling-from-probs"></a>`sampling.top_p_sampling_from_probs` | `cann` | bfloat16, float16, float32 | Ascend950 | **Supported** — logical=ND | [test_sampling.py](../../tests/test_sampling.py) |
 | `sampling.top_p_sampling_from_probs` | `reference` | bfloat16, float16, float32 | 未按 SoC 限制（仍受执行实现约束） | **Partial** — logical=ND；显式参考；Host/数值对照测试不覆盖所有登记组合 | [test_sampling.py](../../tests/test_sampling.py) |
+| <a id="op-sparse-indexer-quant-lightning-indexer"></a>`sparse_indexer.quant_lightning_indexer` | `ascendc` | bfloat16, float32, float8_e4m3fn, int32 | Ascend950 | **Partial** — 首期热点格契约已登记（quant_mode=1、TND/PA_BBND、mask_mode=3、cmp_ratio=4、D=128）；AOT-only；设备 kernel 与 QLIv2 对拍未验证；原生 dtype 组合数=1 | [test_quant_lightning_indexer.py](../../tests/test_quant_lightning_indexer.py) |
 
 上述限制来自每个后端的 `implementation.py`、Support/NativeBinding 与 runner，而非旧文档计数。入口：[discover_implementations](../../flashinfer/operators/authoring.py#L53)、[get_global_registry](../../flashinfer/runtime/registry.py#L290)；独立精确预期为 [tests/production_inventory.py](../../tests/production_inventory.py)。测试定义存在不表示执行过当前 dtype × shape × 设备矩阵。
 
 ## 图与实验实现
 
-图能力枚举中，`cann/attention/single_decode_fia_v1` 为 `needs_param_update`，其余 89 条为 `not_capturable`。类名中的 `CUDAGraph`、固定 buffer 或 FakeTensor 不增加这个范围。9 条生产 Ascend C 均为 `not_capturable`。
+图能力枚举中，`cann/attention/single_decode_fia_v1` 为 `needs_param_update`，其余 90 条为 `not_capturable`。类名中的 `CUDAGraph`、固定 buffer 或 FakeTensor 不增加这个范围。10 条生产 Ascend C 均为 `not_capturable`。
 
-实验 Triton FA 的作者记录采用独立 scope；它不进入源码默认 90 项。其支持域与默认 CATLASS FA 的同名公共入口仍须分别核对。代码：[IMPLEMENTATION](../../flashinfer/triton/attention/single_prefill_catlass/implementation.py)、[tests/test_single_decode_graph_real.py](../../tests/test_single_decode_graph_real.py)。
+实验 Triton FA 的作者记录采用独立 scope；它不进入源码默认 91 项。其支持域与默认 CATLASS FA 的同名公共入口仍须分别核对。代码：[IMPLEMENTATION](../../flashinfer/triton/attention/single_prefill_catlass/implementation.py)、[tests/test_single_decode_graph_real.py](../../tests/test_single_decode_graph_real.py)。
 
 ## 安装与构建边界
 
 包的声明版本为 `0.1.0.dev0`、Python `>=3.9`。`environment-a5.yml` 指定 Python 3.11、Torch `2.10.0+cpu`、torch-npu `2.10.0.post7`、triton-ascend `3.6.0`；它是 A5 环境模板，不构成其他产品或版本组合的验证。
 
-普通 wheel 按本地芯片选择交付分组；910B 包含 A2/A3 各三项、共六项，950 包含 A5 三项，包名分别为 `flashinfer_ascend910b`、`flashinfer_ascend950`。`FLASHINFER_AOT_ALL=1`、`FLASHINFER_AOT_CONFIG`、`FLASHINFER_AOT_PREBUILT` 互斥；`FLASHINFER_AOT_ALL=0` 是源码模式。源码模式不提供 AOT-only 二进制。PREBUILT 仍校验产物和桥的身份，原生登记仅保留实际交付项。
+普通 wheel 按本地芯片选择交付分组；910B 包含 A2/A3 各三项、共六项，950 包含 A5 四项，包名分别为 `flashinfer_ascend910b`、`flashinfer_ascend950`。`FLASHINFER_AOT_ALL=1`、`FLASHINFER_AOT_CONFIG`、`FLASHINFER_AOT_PREBUILT` 互斥；`FLASHINFER_AOT_ALL=0` 是源码模式。源码模式不提供 AOT-only 二进制。PREBUILT 仍校验产物和桥的身份，原生登记仅保留实际交付项。
 
 构建依赖包括匹配的 CANN/Torch/TorchNPU 头文件与库、编译器及 libffi；CATLASS 声明钉定 revision，头树由构建方提供。安装后执行仍需要相应运行栈，框架不隐式安装依赖。代码：[aot_mode](../../setup.py#L20)、[BuildPy](../../setup.py#L90)、[pyproject.toml](../../pyproject.toml)。
 

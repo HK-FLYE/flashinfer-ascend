@@ -71,6 +71,20 @@ def test_existing_85_and_reviewed_arch22_capabilities_match_exactly():
     ):
         expected[kernel_id.rsplit("/", 1)[0] + "/Ascend910C"] = dict(
             expected[kernel_id], soc_models=["Ascend910C"])
+    expected["ascendc/sparse_indexer/quant_lightning_indexer/catlass/op_package/Ascend950"] = CapabilitySpec(
+        op="sparse_indexer.quant_lightning_indexer",
+        soc_models=("Ascend950",),
+        cases=(
+            CapabilityCase(
+                name="ascend950_quant_lightning_indexer",
+                compute_dtypes=("float8_e4m3fn",),
+                accumulator_dtypes=("float32",),
+                attention_variants=("quant_lightning_indexer",),
+                kv_cache_types=("paged",),
+                causal_values=(True,),
+            ),
+        ),
+    ).to_dict()
     assert actual == expected
 
 
@@ -79,8 +93,8 @@ def test_all_existing_implementations_have_one_authority_and_a_bound_runner():
     production = [d for _, _, d in declarations if d.scope == 'global']
     registry = get_global_registry()
     assert {d.kernel_id for d in production} == {d.kernel_id for d in registry.descriptors()}
-    assert len(production) == 90
-    assert len(discover(ROOT)) == 48
+    assert len(production) == 91
+    assert len(discover(ROOT)) == 49
     assert len([d for _, _, d in declarations if d.scope == 'experimental']) == 1
     for directory, _, declaration in declarations:
         assert directory.parent.parent.name == declaration.backend.value
