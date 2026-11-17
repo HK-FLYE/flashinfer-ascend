@@ -331,40 +331,27 @@ def _require_npu():
     torch.npu.set_device(0)
 
 
-@pytest.mark.real_compile
-def test_cpu_golden_and_qli_v2_share_index_set_on_smoke_tiny():
-    """Document current QLIv2 vs CPU-golden relationship on smoke_tiny.
+def _qli_v2_indices_sorted_by_values(torch, tensors):
+    """Normalize QLIv2 device TopK the same way ops-transformer pytest does.
 
-    Observed 2026-11-17: same valid index *set*, different order, even though
-    bf16 scores are clearly separated. Strict order equality is therefore not
-    claimed; do not loosen the planned strict QLIv2 rule without explicit auth.
+    QLIv2 NPU emits the TopK *set* but not score-descending order in the index
+    slots. With ``return_value=1``, their tests re-sort indices by the returned
+    values before comparing. That is the semantic order we match.
     """
-    _require_npu()
-    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
-    tensors = make_cpu_inputs(torch, case)
-    expected, _ = golden(torch, **tensors)
-    ref, _ = qli_v2_oracle(torch, tensors)
-    assert ref.shape == expected.shape
-    exp_set = set(expected[expected >= 0].tolist())
-    ref_set = set(ref[ref >= 0].tolist())
-    assert exp_set == ref_set, (expected, ref)
-    # Keep a visible signal that strict order still diverges.
-    assert not torch.equal(ref, expected), (
-        "QLIv2 order unexpectedly matches golden; revisit the documented mismatch"
-    )
+    ref, values = qli_v2_oracle(torch, {**tensors, "return_value": 1})
+    assert values is not None and values.numel() == ref.numel(), (ref.shape, getattr(values, "shape", None))
+    _, order = values.float().sort(dim=-1, descending=True)
+    return torch.gather(ref, dim=-1, index=order)
 
 
 @pytest.mark.real_compile
-@pytest.mark.xfail(
-    reason=(
-        "QLIv2 index *order* differs from CPU golden/NPU on smoke_tiny despite "
-        "identical index set and separated bf16 scores; strict vs-QLIv2 rule "
-        "pending root-cause + auth before any判据 change"
-    ),
-    strict=True,
-)
-def test_npu_kernel_matches_qli_v2_order_on_smoke_tiny():
-    """Strict order vs QLIv2 — currently xfail until root cause is settled."""
+def test_smoke_tiny_matches_qli_v2_score_order():
+    """NPU + CPU golden vs QLIv2 after value-resort (ops-transformer protocol).
+
+    Single process: run our kernel *before* cann_ops_transformer. Their JIT
+    extension links with our AOT ``op_api`` search path and can break a later
+    ``FiQuantLightningIndexer`` GetWorkspaceSize (161001).
+    """
     import os
 
     _require_npu()
@@ -378,7 +365,17 @@ def test_npu_kernel_matches_qli_v2_order_on_smoke_tiny():
 
     case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
     args, options, _ = sample(torch, torch_npu, **case)
-    tensors = make_cpu_inputs(torch, case)
-    ref, _ = qli_v2_oracle(torch, tensors)
     out_idx, _ = flashinfer.quant_lightning_indexer(*args, **options)
-    assert torch.equal(out_idx.cpu(), ref), (out_idx.cpu(), ref)
+    tensors = make_cpu_inputs(torch, case)
+    expected, _ = golden(torch, **tensors)
+    assert torch.equal(out_idx.cpu(), expected), (out_idx.cpu(), expected)
+
+    raw, _ = qli_v2_oracle(torch, tensors)
+    # Raw device slot order is not score-sorted (documented, not a pass criterion).
+    assert not torch.equal(raw, expected), (raw, expected)
+    ordered = _qli_v2_indices_sorted_by_values(torch, tensors)
+    assert torch.equal(ordered.to(expected.dtype), expected), (ordered, expected)
+    assert torch.equal(out_idx.cpu().to(ordered.dtype), ordered.cpu()), (
+        out_idx.cpu(),
+        ordered.cpu(),
+    )
