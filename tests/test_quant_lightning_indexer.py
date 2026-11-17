@@ -226,3 +226,64 @@ def test_mask3_visible_len_formula():
     # early query sees fewer keys
     assert _mask3_visible_len(0, 8, 48, 4, 0) == math.floor((192 - 8 + 0 + 1) / 4)
     assert _mask3_visible_len(0, 8, 8, 4, 0) < 8
+    # residual expands the compressed window
+    assert _mask3_visible_len(0, 4, 16, 4, 3) > _mask3_visible_len(0, 4, 16, 4, 0)
+
+
+def test_cpu_golden_all_masked_fills_minus_one():
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "all_masked_empty_visible")
+    tensors = sample(torch, case)
+    indices, _ = golden(torch, **tensors)
+    assert (indices == -1).all()
+
+
+def test_cpu_golden_residual_changes_selected_prefix():
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "residual_boundary")
+    base = sample(torch, case)
+    with_res = dict(base)
+    with_res["cmp_residual_k"] = torch.tensor([3], dtype=torch.int32)
+    without = dict(base)
+    without["cmp_residual_k"] = torch.tensor([0], dtype=torch.int32)
+    idx_r, _ = golden(torch, **with_res)
+    idx_0, _ = golden(torch, **without)
+    # Larger residual must not shrink the visible prefix of any row.
+    for local_q in range(case["tq"]):
+        vis_r = _mask3_visible_len(local_q, case["tq"], 16, 4, 3)
+        vis_0 = _mask3_visible_len(local_q, case["tq"], 16, 4, 0)
+        assert vis_r >= vis_0
+        chosen_r = idx_r[local_q, 0]
+        chosen_0 = idx_0[local_q, 0]
+        assert (chosen_r[chosen_r >= 0] < vis_r).all()
+        assert (chosen_0[chosen_0 >= 0] < vis_0).all()
+
+
+def test_cpu_golden_stable_topk_prefers_lower_index_on_ties():
+    # Hand-built equal scores via identical dequantized Q/K rows and constant W.
+    tq, n1, d, topk = 1, 2, 128, 3
+    query = torch.ones((tq, n1, d), dtype=torch.float8_e4m3fn)
+    key = torch.ones((1, 16, 1, d), dtype=torch.float8_e4m3fn)
+    weights = torch.ones((tq, n1), dtype=torch.float32)
+    q_scale = torch.ones((tq, n1), dtype=torch.float32)
+    k_scale = torch.ones((1, 16, 1), dtype=torch.float32)
+    indices, _ = golden(
+        torch,
+        query,
+        key,
+        weights,
+        q_scale,
+        k_scale,
+        topk,
+        quant_mode=1,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=3,
+        cmp_ratio=4,
+        max_seq_len_k=4,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32),
+        seqused_k=torch.tensor([4], dtype=torch.int32),
+        cmp_residual_k=torch.tensor([0], dtype=torch.int32),
+        block_table=torch.tensor([[0]], dtype=torch.int32),
+        return_value=0,
+    )
+    # With equal scores, stable TopK must pick the lowest indices first.
+    assert indices[0, 0].tolist() == [0, 1, 2]
