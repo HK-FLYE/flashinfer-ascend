@@ -91,8 +91,13 @@ ge::graphStatus FiQuantLightningIndexerTiling(gert::TilingContext* context)
             return ge::GRAPH_FAILED;
         }
         context->SetBlockDim(cores);
+        // Single compiled binary (no template tiling keys yet).
         context->SetTilingKey(0);
-        context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize();
+        // User workspace: FP32 score grid + FP32 TopK value scratch + FP8 zero page.
+        context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize() +
+            static_cast<uint64_t>(params.tq) * params.maxSeqLenK * sizeof(float) +
+            static_cast<uint64_t>(params.tq) * params.topk * sizeof(float) +
+            static_cast<uint64_t>(params.blockSize) * params.d;
         return ge::GRAPH_SUCCESS;
     } catch (const std::exception&) {
         return ge::GRAPH_FAILED;

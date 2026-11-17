@@ -56,15 +56,33 @@ def prepare_native(root, directory, native):
     native_files = [
         p
         for p in sorted(source_dir.rglob("*"))
-        if p.is_file() and p.suffix in {".cpp", ".h", ".inc"}
+        if p.is_file() and p.suffix in {".cpp", ".h", ".inc", ".hpp"}
     ]
+    shared_roots = tuple(root / _path(p) for p in build.shared_native_roots)
+    if any(
+        p.is_symlink() or not p.resolve().is_relative_to(root) or not p.is_dir()
+        for p in shared_roots
+    ):
+        raise SchemaError("shared native root must be an in-repository regular directory")
+    shared_files = []
+    for shared_root in shared_roots:
+        for path in sorted(shared_root.rglob("*")):
+            if not path.is_file():
+                continue
+            if path.suffix == ".cpp":
+                raise SchemaError(
+                    "shared native roots currently support headers only; declare translation "
+                    "units in the operator directory: " + path.relative_to(root).as_posix()
+                )
+            if path.suffix in {".h", ".inc", ".hpp"}:
+                shared_files.append(path)
     headers = tuple(
         reference(p)
-        for p in native_files
+        for p in native_files + shared_files
         if p.relative_to(root).as_posix() not in selected
     )
     extra = []
-    native_paths = {p.resolve() for p in native_files}
+    native_paths = {p.resolve() for p in native_files} | {p.resolve() for p in shared_files}
     for path in sorted(source_dir.rglob("*")):
         if (
             not path.is_file()
@@ -107,7 +125,7 @@ def prepare_native(root, directory, native):
         headers=headers,
         include_dirs=tuple(
             local(p).relative_to(root).as_posix() for p in build.includes
-        ),
+        ) + tuple(_path(p) for p in build.shared_includes),
         dependencies=build.dependencies,
         definitions=build.definitions,
         compile_options=build.compile_options,

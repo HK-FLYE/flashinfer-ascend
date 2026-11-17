@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "quant_lightning_indexer_tiling_data.h"
+#include "sparse_indexer_common.hpp"
 
 namespace QuantLightningIndexerTiling {
 
@@ -64,10 +65,42 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     tilingData.d = params.d;
     tilingData.topk = params.topk;
     tilingData.batch = params.batch;
-    // Conservative first-grid tiles: keep one request-friendly schedule until
-    // the device path measures real UB/L1 pressure for FP8.
-    tilingData.s1Tile = params.tq < 8 ? params.tq : 8;
-    tilingData.s2Tile = params.maxSeqLenK < 256 ? params.maxSeqLenK : 256;
+    constexpr uint32_t kS2TileCap = 256;
+    constexpr uint32_t kUbSize = 248 * 1024;
+    constexpr uint32_t kL1Size = 512 * 1024;
+    constexpr uint32_t kL0cSize = 256 * 1024;
+    constexpr uint32_t kQkElemBytes = 1;
+    constexpr uint32_t kWElemBytes = 4;
+    constexpr uint32_t kAivPerAic = 2;
+    constexpr uint32_t kCubeFractal = 16;
+    constexpr uint32_t kS1Align = 8;
+    const uint32_t s2Tile = params.maxSeqLenK <= kS2TileCap
+        ? SparseIndexer::Common::AlignUp(params.maxSeqLenK, kCubeFractal)
+        : kS2TileCap;
+    const uint32_t s2Split = SparseIndexer::Common::AlignUp(s2Tile, kCubeFractal * kAivPerAic);
+    const uint32_t wStride = SparseIndexer::Common::AlignUp(params.n1, 32 / kWElemBytes);
+    // Score UB, float W/q-scale tiles, and vector temporaries in BlockReduceQuantHead.
+    const uint64_t ubBytesPerS1 = sizeof(float) * (s2Split / kAivPerAic) * (params.n1 + 1) +
+        sizeof(float) * wStride * 3 + 32 + 256;
+    const uint32_t l0cRows = kL0cSize / (s2Split * sizeof(float));
+    uint32_t s1Tile = static_cast<uint32_t>(kUbSize / ubBytesPerS1);
+    while (s1Tile > 0 &&
+        SparseIndexer::Common::AlignUp(s1Tile * params.n1, kCubeFractal) > l0cRows) {
+        --s1Tile;
+    }
+    const uint32_t l1BBytes = s2Tile * params.d * kQkElemBytes;
+    const uint64_t l1Budget = l1BBytes < kL1Size ? kL1Size - l1BBytes : 0;
+    while (s1Tile > 0 &&
+        static_cast<uint64_t>(SparseIndexer::Common::AlignUp(s1Tile * params.n1, kCubeFractal)) *
+            params.d * kQkElemBytes > l1Budget) {
+        --s1Tile;
+    }
+    if (s1Tile >= kS1Align) s1Tile = s1Tile / kS1Align * kS1Align;
+    if (s1Tile == 0) {
+        throw std::invalid_argument("QuantLightningIndexerTiling: s1Tile is zero under resource limits");
+    }
+    tilingData.s1Tile = s1Tile;
+    tilingData.s2Tile = s2Tile;
     tilingData.blockSize = params.blockSize;
     tilingData.maxBlocksPerBatch = params.maxBlocksPerBatch;
     tilingData.numPages = params.numPages;

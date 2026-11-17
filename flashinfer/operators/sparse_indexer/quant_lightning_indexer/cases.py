@@ -27,8 +27,9 @@ CASE_PARAMETERS = (
         "seed": 3,
     },
     {
-        # Production geometry minus N1=64: scalar AIV path is too slow for 64 heads.
-        # Full N1=64 remains a cube/FP8-schedule milestone (see landing plan).
+        # N1=8 cube-path matrix member. N1=64 (`hot_path_anchor`) still diverges
+        # on device (index max_abs≈37 vs CPU golden) and stays out of this matrix
+        # until the large-head tile/UB path is fixed.
         "name": "hot_path_lite",
         "tq": 8,
         "n1": 8,

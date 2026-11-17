@@ -101,6 +101,11 @@ IMPLEMENTATION = AscendCImplementation(
         op_type="FiQuantLightningIndexer",
         tiling="FiQuantLightningIndexerTiling",
         includes=("op_kernel", "op_host", "include"),
+        shared_native_roots=("csrc/kernels/sparse_indexer/common",),
+        shared_includes=(
+            "csrc/kernels/sparse_indexer/common/include",
+            "csrc/kernels/sparse_indexer/common/op_kernel",
+        ),
         implementation="catlass",
         dependencies=(BuildDependency(name="catlass", revision=CATLASS_REVISION),),
         definitions=("CATLASS_ARCH=3510",),

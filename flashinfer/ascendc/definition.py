@@ -14,6 +14,8 @@ class BuildConfig:
     op_type: str
     tiling: str
     includes: tuple = ("op_kernel", "op_host")
+    shared_native_roots: tuple = ()
+    shared_includes: tuple = ()
     cmake: object = None
     implementation: str = "native"
     dependencies: tuple = ()

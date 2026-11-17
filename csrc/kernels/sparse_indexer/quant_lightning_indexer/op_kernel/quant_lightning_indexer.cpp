@@ -8,7 +8,7 @@
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_tiling_data.h"
 #if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
-#include "arch35/quant_lightning_indexer_kernel.h"
+#include "arch35/quant_lightning_indexer.h"
 #else
 #error "quant_lightning_indexer requires arch35 (__CCE_AICORE__ == 310)"
 #endif
@@ -25,20 +25,19 @@ extern "C" __global__ __aicore__ void fi_quant_lightning_indexer(
     AscendC::SetSysWorkspace(workspace);
     (void)cu_seqlens_k;
     (void)seqused_q;
-    (void)values;
+    (void)values; // public bf16 values unused when return_value=0; TopK uses float scratch
 
     auto const* tilingData =
         reinterpret_cast<__gm__ QuantLightningIndexerTilingData const*>(tiling);
-    if ASCEND_IS_AIC {
-        return;
-    }
-    if ASCEND_IS_AIV {
-        // First green: one AIV owns the whole first-grid case.
-        if (AscendC::GetBlockIdx() != 0) {
-            return;
-        }
-        QuantLightningIndexerKernel::RunFirstGrid(
-            query, key, weights, query_dequant_scale, key_dequant_scale, block_table,
-            cu_seqlens_q, seqused_k, cmp_residual_k, indices, tilingData);
-    }
+    GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
+    const uint64_t scoreBytes =
+        static_cast<uint64_t>(tilingData->tq) * tilingData->maxSeqLenK * sizeof(float);
+    const uint64_t valueBytes =
+        static_cast<uint64_t>(tilingData->tq) * tilingData->topk * sizeof(float);
+    GM_ADDR scores = userWorkspace;
+    GM_ADDR valuesScratch = userWorkspace + scoreBytes;
+    GM_ADDR zeroPage = userWorkspace + scoreBytes + valueBytes;
+    QuantLightningIndexerKernelDetail::RunKernel(
+        query, key, weights, query_dequant_scale, key_dequant_scale, block_table, cu_seqlens_q, seqused_k,
+        cmp_residual_k, indices, valuesScratch, scores, zeroPage, tiling);
 }
