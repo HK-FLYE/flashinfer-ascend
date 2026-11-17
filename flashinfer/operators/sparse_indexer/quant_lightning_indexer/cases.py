@@ -27,12 +27,29 @@ CASE_PARAMETERS = (
         "seed": 3,
     },
     {
-        # N1=8 cube-path matrix member. N1=64 (`hot_path_anchor`) still diverges
-        # on device (index max_abs≈37 vs CPU golden) and stays out of this matrix
-        # until the large-head tile/UB path is fixed.
+        # N1=8 cube-path matrix member (kept for a smaller-head regression).
         "name": "hot_path_lite",
         "tq": 8,
         "n1": 8,
+        "d": 128,
+        "topk": 4,
+        "pages": 4,
+        "block": 16,
+        "batch": 1,
+        "max_seq_len_k": 64,
+        "seqused_k": 48,
+        "residual": 0,
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 7,
+    },
+    {
+        # Production-ish N1=64 anchor. Fixed by capping s2Tile so ScaleHead
+        # stays on the multi-row vector path (srcRep<=255) plus Muls/Add fallback.
+        "name": "hot_path_anchor",
+        "tq": 8,
+        "n1": 64,
         "d": 128,
         "topk": 4,
         "pages": 4,

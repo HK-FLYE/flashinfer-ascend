@@ -8,7 +8,7 @@
 
 | logical op | public API | 状态 |
 | --- | --- | --- |
-| `sparse_indexer.quant_lightning_indexer` | `flashinfer.quant_lightning_indexer` | Ascend950 首期热点格：CPU golden + cube/vector 路径已对拍当前 sample 矩阵 indices；N1=64 锚点与 QLIv2 严次序对拍未完成 |
+| `sparse_indexer.quant_lightning_indexer` | `flashinfer.quant_lightning_indexer` | Ascend950 首期热点格：CPU golden + cube/vector 路径已对拍当前 sample 矩阵 indices（含 N1=64 锚点）；QLIv2 严次序对拍未完成 |
 
 `sparse_indexer.lightning_indexer` / `general_indexer` 未在本分支创建。独立 metadata 产品算子首期不做；分核调度内嵌 tiling/kernel。
 
@@ -38,7 +38,7 @@ indices = stable_topk(score, topk)
 
 必选运行时输入：`cu_seqlens_q`、`seqused_k`、`block_table`、`cmp_residual_k`、`max_seq_len_k>0`。TND 下 `indices` 形状为 `[Tq, Nk, topk]`；无效位填 `-1`。
 
-正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`（默认严相等）。**不声称性能优势；N1=64 与 QLIv2 严次序仍未验证通过。**
+正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`（默认严相等）。**不声称性能优势；QLIv2 严次序仍未验证通过。**
 
 源码：[公共定义](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/operator.py)、[CPU golden / sample](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/cases.py)、[AOT/runner](../../flashinfer/ascendc/sparse_indexer/quant_lightning_indexer/)、[设备桩](../../csrc/kernels/sparse_indexer/quant_lightning_indexer/)、[契约与 CPU 语义测试](../../tests/test_quant_lightning_indexer.py)。
 
@@ -49,4 +49,4 @@ Indexer 与 sparse attention 是两个 domain。本算子输出 token 级 TopK�
 ## 验证与限制
 
 - 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden 边界矩阵；host OpDef/InferShape/Tiling 可 AOT 编译；GI 风格 cube（FP8 BlockMmad）+ vector quant reduce + TopK 路径在全部当前 sample 矩阵上与 CPU golden `indices` 严相等（本机 NPU，`matrix` PASS）；与 QLIv2 在 `smoke_tiny` 上有效 index **集合**相同。
-- 未验证：与 QLIv2 的 **严次序**对拍（已知次序分叉，判据未放宽）、N1=64 生产锚点真机（已观测 indices 偏离）、图 capture/replay、性能、非首期 `quant_mode`/布局。
+- 未验证：与 QLIv2 的 **严次序**对拍（已知次序分叉，判据未放宽）、图 capture/replay、性能、非首期 `quant_mode`/布局。

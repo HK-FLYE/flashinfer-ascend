@@ -93,6 +93,9 @@ public:
     {
         uint32_t dstRep = colPerAiv / kFloatBlock;
         uint32_t srcRep = n1_ * colPerAiv / kFloatBlock;
+        // srcRep = n1*colPerAiv/8; when it exceeds 255 the multi-row vector
+        // path is illegal. Prefer per-token Muls/Add over Axpy (Axpy on this
+        // path diverged from CPU golden for n1=64 / colPerAiv=32).
         if (dstRep > kMaxRepeat || srcRep > kMaxRepeat) {
             for (uint32_t token = 0; token < actualS1; ++token) {
                 auto score = ubScore_[(token * n1_ + head) * colPerAiv];
@@ -101,9 +104,12 @@ public:
                 if (first) {
                     AscendC::Muls(out, score, weight, cols);
                 } else {
-                    AscendC::Axpy(out, score, weight, cols);
+                    AscendC::Muls(ubTmp_, score, weight, cols);
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Add(out, out, ubTmp_, cols);
                 }
             }
+            AscendC::PipeBarrier<PIPE_V>();
             return;
         }
 

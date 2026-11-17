@@ -74,14 +74,29 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     constexpr uint32_t kAivPerAic = 2;
     constexpr uint32_t kCubeFractal = 16;
     constexpr uint32_t kS1Align = 8;
-    const uint32_t s2Tile = params.maxSeqLenK <= kS2TileCap
+    // Keep ScaleHead on the multi-row vector path: srcRep = n1*colPerAiv/8 <= 255
+    // with colPerAiv = AlignUp(s2Tile, 32)/2. Cap s2Tile when n1 is large.
+    uint32_t s2Tile = params.maxSeqLenK <= kS2TileCap
         ? SparseIndexer::Common::AlignUp(params.maxSeqLenK, kCubeFractal)
         : kS2TileCap;
+    auto srcRepFor = [&](uint32_t tile) -> uint32_t {
+        const uint32_t col = SparseIndexer::Common::AlignUp(tile, kCubeFractal * kAivPerAic) / kAivPerAic;
+        return params.n1 * col / 8U;
+    };
+    while (s2Tile > kCubeFractal && srcRepFor(s2Tile) > 255U) {
+        s2Tile -= kCubeFractal;
+    }
+    if (srcRepFor(s2Tile) > 255U) {
+        throw std::invalid_argument(
+            "QuantLightningIndexerTiling: cannot keep ScaleHead srcRep<=255");
+    }
     const uint32_t s2Split = SparseIndexer::Common::AlignUp(s2Tile, kCubeFractal * kAivPerAic);
     const uint32_t wStride = SparseIndexer::Common::AlignUp(params.n1, 32 / kWElemBytes);
-    // Score UB, float W/q-scale tiles, and vector temporaries in BlockReduceQuantHead.
+    // Score + out + W/qScale tiles + wCol/wBrcb + ubTmp(kFloatVec) + ubKScale pad.
+    constexpr uint32_t kFloatVec = 64;
     const uint64_t ubBytesPerS1 = sizeof(float) * (s2Split / kAivPerAic) * (params.n1 + 1) +
-        sizeof(float) * wStride * 3 + 32 + 256;
+        sizeof(float) * wStride * 3 + sizeof(float) * (1 + 8 + kFloatVec) +
+        sizeof(float) * (s2Split / kAivPerAic);
     const uint32_t l0cRows = kL0cSize / (s2Split * sizeof(float));
     uint32_t s1Tile = static_cast<uint32_t>(kUbSize / ubBytesPerS1);
     while (s1Tile > 0 &&
