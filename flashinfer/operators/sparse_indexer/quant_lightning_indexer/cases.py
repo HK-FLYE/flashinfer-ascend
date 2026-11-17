@@ -27,9 +27,11 @@ CASE_PARAMETERS = (
         "seed": 3,
     },
     {
-        "name": "hot_path_anchor",
+        # Production geometry minus N1=64: scalar AIV path is too slow for 64 heads.
+        # Full N1=64 remains a cube/FP8-schedule milestone (see landing plan).
+        "name": "hot_path_lite",
         "tq": 8,
-        "n1": 64,
+        "n1": 8,
         "d": 128,
         "topk": 4,
         "pages": 4,
@@ -392,3 +394,71 @@ def sample(torch, torch_npu, **configuration):
 
 # Exact indices match for the correctness-first kernel; empty values shape is trivial.
 TOLERANCES = ((0.0, 0.0), (0.0, 0.0))
+
+
+def qli_v2_oracle(torch, tensors):
+    """Run ops-transformer QLIv2 on the same semantic inputs (NPU).
+
+    Requires ``cann_ops_transformer`` and a live NPU. Builds the companion
+    metadata tensor on the QLIv2 side; this repo does not expose metadata.
+    """
+    import cann_ops_transformer as cot
+
+    def to_npu(value):
+        if not hasattr(value, "device"):
+            return value
+        return value.contiguous().npu()
+
+    query = to_npu(tensors["query"])
+    key = to_npu(tensors["key"])
+    weights = to_npu(tensors["weights"])
+    q_scale = to_npu(tensors["query_dequant_scale"])
+    k_scale = to_npu(tensors["key_dequant_scale"])
+    cu = to_npu(tensors["cu_seqlens_q"])
+    seqused = to_npu(tensors["seqused_k"])
+    residual = to_npu(tensors["cmp_residual_k"])
+    table = to_npu(tensors["block_table"])
+    topk = int(tensors["topk"])
+    n1 = int(query.shape[1])
+    d = int(query.shape[2])
+    tq = int(query.shape[0])
+    batch = int(seqused.shape[0])
+    max_seq = int(tensors["max_seq_len_k"])
+    metadata = cot.quant_lightning_indexer_metadata(
+        n1,
+        1,
+        d,
+        topk,
+        int(tensors["quant_mode"]),
+        cu_seqlens_q=cu,
+        seqused_k=seqused,
+        cmp_residual_k=residual,
+        batch_size=batch,
+        max_seqlen_q=tq,
+        max_seqlen_k=max_seq,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=int(tensors["mask_mode"]),
+        cmp_ratio=int(tensors["cmp_ratio"]),
+    )
+    indices, values = cot.quant_lightning_indexer(
+        query,
+        key,
+        weights,
+        q_scale,
+        k_scale,
+        topk,
+        int(tensors["quant_mode"]),
+        cu_seqlens_q=cu,
+        seqused_k=seqused,
+        cmp_residual_k=residual,
+        block_table=table,
+        metadata=metadata,
+        max_seqlen_q=tq,
+        layout_q="TND",
+        layout_k="PA_BBND",
+        mask_mode=int(tensors["mask_mode"]),
+        cmp_ratio=int(tensors["cmp_ratio"]),
+        return_value=int(tensors.get("return_value", 0)),
+    )
+    return indices.cpu(), values.cpu()

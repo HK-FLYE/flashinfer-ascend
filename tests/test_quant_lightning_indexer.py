@@ -17,6 +17,7 @@ from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import (
     _mask3_visible_len,
     golden,
     make_cpu_inputs,
+    qli_v2_oracle,
 )
 from flashinfer.operators.sparse_indexer.quant_lightning_indexer.operator import OPERATOR
 
@@ -181,7 +182,7 @@ def test_cpu_golden_indices_shape_and_padding(case):
 
 
 def test_cpu_golden_mask3_respects_visibility_window():
-    case = next(c for c in CASE_PARAMETERS if c["name"] == "hot_path_anchor")
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "hot_path_lite")
     tensors = make_cpu_inputs(torch, case)
     # Force residual=0 so the closed-form window is easy to check.
     tensors["cmp_residual_k"] = torch.zeros_like(tensors["cmp_residual_k"])
@@ -319,3 +320,65 @@ def test_cpu_golden_negative_qk_masked_by_relu_still_fills():
     key = (-torch.ones((1, 16, 1, 128))).to(torch.float8_e4m3fn)
     indices, _ = golden(torch, **_hand_built_inputs(key_vals=key))
     assert indices[0, 0].tolist() == [0, 1, 2]
+
+
+def _require_npu():
+    import torch_npu  # noqa: F401
+
+    assert torch.npu.is_available() and torch.npu.device_count() > 0, (
+        "NPU required; do not treat skip as pass"
+    )
+    torch.npu.set_device(0)
+
+
+@pytest.mark.real_compile
+def test_cpu_golden_and_qli_v2_share_index_set_on_smoke_tiny():
+    """Document current QLIv2 vs CPU-golden relationship on smoke_tiny.
+
+    Observed 2026-11-17: same valid index *set*, different order, even though
+    bf16 scores are clearly separated. Strict order equality is therefore not
+    claimed; do not loosen the planned strict QLIv2 rule without explicit auth.
+    """
+    _require_npu()
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
+    tensors = make_cpu_inputs(torch, case)
+    expected, _ = golden(torch, **tensors)
+    ref, _ = qli_v2_oracle(torch, tensors)
+    assert ref.shape == expected.shape
+    exp_set = set(expected[expected >= 0].tolist())
+    ref_set = set(ref[ref >= 0].tolist())
+    assert exp_set == ref_set, (expected, ref)
+    # Keep a visible signal that strict order still diverges.
+    assert not torch.equal(ref, expected), (
+        "QLIv2 order unexpectedly matches golden; revisit the documented mismatch"
+    )
+
+
+@pytest.mark.real_compile
+@pytest.mark.xfail(
+    reason=(
+        "QLIv2 index *order* differs from CPU golden/NPU on smoke_tiny despite "
+        "identical index set and separated bf16 scores; strict vs-QLIv2 rule "
+        "pending root-cause + auth before any判据 change"
+    ),
+    strict=True,
+)
+def test_npu_kernel_matches_qli_v2_order_on_smoke_tiny():
+    """Strict order vs QLIv2 — currently xfail until root cause is settled."""
+    import os
+
+    _require_npu()
+    if not os.environ.get("FLASHINFER_AOT_PATHS"):
+        raise AssertionError(
+            "FLASHINFER_AOT_PATHS is required for NPU vs QLIv2; missing package is a failure"
+        )
+    import torch_npu
+    import flashinfer
+    from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import sample
+
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
+    args, options, _ = sample(torch, torch_npu, **case)
+    tensors = make_cpu_inputs(torch, case)
+    ref, _ = qli_v2_oracle(torch, tensors)
+    out_idx, _ = flashinfer.quant_lightning_indexer(*args, **options)
+    assert torch.equal(out_idx.cpu(), ref), (out_idx.cpu(), ref)
