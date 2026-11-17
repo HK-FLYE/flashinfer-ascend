@@ -138,6 +138,19 @@ def test_v2_contract_is_round_trippable_and_identity_binds_every_new_field(v1, v
     assert replace(v2, workspace_bytes=0, workspace_host_entry=None).workspace_bytes == 0
 
 
+def test_strided_nd_storage_is_opt_in_per_input_and_changes_identity(v2):
+    parameter = replace(v2.tensor_parameters[0], allow_strided=True)
+    changed = replace(v2, tensor_parameters=(parameter,) + v2.tensor_parameters[1:])
+    assert changed.tensor_parameters[0].allow_strided is True
+    assert changed.extended_aclnn is True
+    assert changed.fingerprint != v2.fingerprint
+    assert BuildRecipe.from_dict(json.loads(json.dumps(changed.to_dict()))) == changed
+    with pytest.raises(SchemaError, match="input"):
+        replace(v2.tensor_parameters[-1], allow_strided=True)
+    with pytest.raises(SchemaError, match="ND"):
+        replace(v2.tensor_parameters[0], physical_layouts=("NZ",), allow_strided=True)
+
+
 def test_dispatch_metadata_validation_checks_cross_tensor_dimensions_dtype_and_bounds(v2):
     assert v2.validate_tensor_metadata(**metadata()) == dict(M=16, K=64, N=32)
     assert v2.validate_tensor_metadata(**metadata(256, 256, 256))["M"] == 256

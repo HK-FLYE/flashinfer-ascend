@@ -80,7 +80,8 @@ class TorchOpPackageRunner:
             if tensor is None:
                 continue
             layout = {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(tensor))
-            if not tensor.is_contiguous() or layout not in parameter.physical_layouts:
+            if ((not tensor.is_contiguous() and not parameter.allow_strided)
+                    or layout not in parameter.physical_layouts):
                 raise ValueError("Ascend C tensor adapter requires contiguous %s tensors for %s"
                                  % ("/".join(parameter.physical_layouts), parameter.name))
         _reject_output_overlap(self.recipe.tensor_parameters, tensors)

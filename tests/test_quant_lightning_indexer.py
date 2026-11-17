@@ -162,6 +162,97 @@ def test_native_recipe_declares_ordered_abi():
     )
 
 
+def test_native_recipe_marks_only_pa_storage_for_strided_views():
+    from flashinfer.ascendc.sparse_indexer.quant_lightning_indexer.implementation import (
+        NATIVE,
+    )
+
+    parameters = {parameter.name: parameter for parameter in NATIVE.tensors}
+    assert parameters["key"].allow_strided is True
+    assert parameters["key_dequant_scale"].allow_strided is True
+    assert all(
+        parameter.allow_strided is False
+        for name, parameter in parameters.items()
+        if name not in {"key", "key_dequant_scale"}
+    )
+
+
+def test_runner_preserves_page_axis_stride_without_host_copy():
+    from flashinfer.ascendc.sparse_indexer.quant_lightning_indexer.runner import (
+        QuantLightningIndexerRunner,
+    )
+
+    pages, block, d = 4, 16, 128
+    key_storage = torch.empty((pages * 2, block, 1, d), dtype=torch.float8_e4m3fn)
+    scale_storage = torch.empty((pages * 2, block, 1), dtype=torch.float32)
+    key = key_storage[::2]
+    k_scale = scale_storage[::2]
+    assert not key.is_contiguous()
+    assert not k_scale.is_contiguous()
+
+    captured = {}
+
+    def native(*args, **attributes):
+        captured["args"] = args
+        captured["attributes"] = attributes
+
+    runner = QuantLightningIndexerRunner(native)
+    query = torch.empty((1, 2, d), dtype=torch.float8_e4m3fn)
+    runner(
+        query,
+        key,
+        torch.empty((1, 2), dtype=torch.float32),
+        torch.empty((1, 2), dtype=torch.float32),
+        k_scale,
+        torch.empty((1, 1), dtype=torch.int32),
+        torch.tensor([0, 1], dtype=torch.int32),
+        None,
+        None,
+        torch.tensor([block], dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.empty((1, 1, 4), dtype=torch.int32),
+        torch.empty((0,), dtype=torch.bfloat16),
+        quant_mode=1,
+        mask_mode=3,
+        cmp_ratio=4,
+        max_seq_len_k=block,
+        max_seqlen_q=1,
+        return_value=0,
+    )
+
+    native_key = captured["args"][1]
+    native_scale = captured["args"][4]
+    assert native_key.stride() == (block * d * 2, d, 1)
+    assert native_scale.stride() == (block * 2, 1)
+    assert native_key.data_ptr() == key.squeeze(2).data_ptr()
+    assert native_scale.data_ptr() == k_scale.squeeze(-1).data_ptr()
+
+
+def test_nd_page_view_keeps_storage_and_stride_on_npu():
+    _require_npu()
+    import torch_npu
+
+    from flashinfer.ascendc.sparse_indexer.quant_lightning_indexer.runner import (
+        _nd_page_view,
+    )
+    from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import sample
+
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "pa_page_axis_noncontig")
+    args, _, _ = sample(torch, torch_npu, **case)
+    key = args[1]
+    k_scale = args[4]
+    key_flat = _nd_page_view(key, torch_npu)
+    scale_flat = _nd_page_view(k_scale, torch_npu)
+    assert torch_npu.get_npu_format(key_flat) == torch_npu.Format.ND
+    assert torch_npu.get_npu_format(scale_flat) == torch_npu.Format.ND
+    assert key_flat.data_ptr() == key.squeeze(2).data_ptr()
+    assert scale_flat.data_ptr() == k_scale.squeeze(-1).data_ptr()
+    assert key_flat.stride() == (case["block"] * case["d"] * 2, case["d"], 1)
+    assert scale_flat.stride() == (case["block"] * 2, 1)
+    assert not key_flat.is_contiguous()
+    assert not scale_flat.is_contiguous()
+
+
 @pytest.mark.parametrize("case", CASE_PARAMETERS, ids=lambda c: c["name"])
 def test_cpu_golden_indices_shape_and_padding(case):
     tensors = make_cpu_inputs(torch, case)
@@ -368,6 +459,32 @@ def _qli_v2_indices_sorted_by_values(torch, tensors):
     assert values is not None and values.numel() == ref.numel(), (ref.shape, getattr(values, "shape", None))
     _, order = values.float().sort(dim=-1, descending=True)
     return torch.gather(ref, dim=-1, index=order)
+
+
+@pytest.mark.real_compile
+def test_npu_rejects_non_dense_pa_inner_axis():
+    """Only the page axis may be strided; padded block rows are rejected."""
+    import os
+
+    _require_npu()
+    if not os.environ.get("FLASHINFER_AOT_PATHS"):
+        raise AssertionError(
+            "FLASHINFER_AOT_PATHS is required for the PA stride contract; missing package is a failure"
+        )
+    import torch_npu
+    import flashinfer
+    from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import sample
+
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
+    args, options, _ = sample(torch, torch_npu, **case)
+    key = args[1]
+    pages, block, nk, d = key.shape
+    padded = torch.empty((pages, block * 2, nk, d), dtype=key.dtype, device=key.device)
+    padded[:, ::2].copy_(key)
+    bad_key = torch_npu.npu_format_cast(padded[:, ::2], 2)
+    args = (args[0], bad_key) + args[2:]
+    with pytest.raises(RuntimeError):
+        flashinfer.quant_lightning_indexer(*args, **options)
 
 
 @pytest.mark.real_compile

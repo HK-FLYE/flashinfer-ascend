@@ -94,6 +94,7 @@ public:
         uint32_t blockSize{0};
         uint32_t maxBlocksPerBatch{0};
         uint32_t numPages{0};
+        uint64_t keyStride0{0};
     };
 
     static constexpr bool kPaged = true;
@@ -118,6 +119,9 @@ public:
         maxBlocks_ = params.maxBlocksPerBatch;
         numPages_ = params.numPages;
         d_ = params.d;
+        keyStride0_ = params.keyStride0 != 0
+            ? params.keyStride0
+            : static_cast<uint64_t>(blockSize_) * d_;
         gmTable_ = gmTable;
         gmZero_ = gmZero;
     }
@@ -146,7 +150,8 @@ public:
 
             AscendC::GlobalTensor<DtypeB> src;
             if (pageId >= 0 && static_cast<uint32_t>(pageId) < numPages_) {
-                int64_t srcOff = (static_cast<int64_t>(pageId) * blockSize_ + offInPage) * d_ + kPartStart;
+                int64_t srcOff = static_cast<int64_t>(pageId) * static_cast<int64_t>(keyStride0_) +
+                    static_cast<int64_t>(offInPage) * d_ + kPartStart;
                 src = gmPages_[srcOff];
             } else {
                 // Illegal page → zeros (zero page is ColumnMajor(d, blockSize) starting at 0).
@@ -171,6 +176,7 @@ private:
     uint32_t maxBlocks_{0};
     uint32_t numPages_{0};
     uint32_t d_{0};
+    uint64_t keyStride0_{0};
 };
 
 } // namespace SparseIndexer::Common::Block

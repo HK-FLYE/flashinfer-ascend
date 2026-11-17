@@ -49,6 +49,7 @@ class QuantLightningIndexerKernel {
         params.blockSize = tiling->blockSize;
         params.maxBlocksPerBatch = tiling->maxBlocksPerBatch;
         params.numPages = tiling->numPages;
+        params.keyStride0 = tiling->keyStride0;
         return params;
     }
 
@@ -98,6 +99,7 @@ public:
             params.blockSize = tiling->blockSize;
             params.maxBlocksPerBatch = tiling->maxBlocksPerBatch;
             params.numPages = tiling->numPages;
+            params.kScaleStride0 = tiling->kScaleStride0;
             BlockReduceHead reducer(ubC_, resource_, gmW, gmQScale, gmKScale, gmBlockTable, scores, params);
             asc_sync_block_arrive(PIPE_MTE3, kVecToCube);
             SparseIndexer::Common::Block::ScheduleCoord coord{};

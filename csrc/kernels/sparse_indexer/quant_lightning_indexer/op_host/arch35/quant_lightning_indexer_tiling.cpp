@@ -44,6 +44,44 @@ ge::graphStatus FiQuantLightningIndexerTiling(gert::TilingContext* context)
         if (ks.GetDim(ks.GetDimNum() - 1) != d) {
             return ge::GRAPH_FAILED;
         }
+        const int64_t blockSize = ks.GetDim(1);
+        if (blockSize <= 0) {
+            return ge::GRAPH_FAILED;
+        }
+
+        uint64_t keyStride0 = static_cast<uint64_t>(blockSize) * static_cast<uint64_t>(d);
+        uint64_t kScaleStride0 = static_cast<uint64_t>(blockSize);
+        const auto* keyStrides = context->GetInputStride(KEY);
+        if (keyStrides != nullptr) {
+            const size_t rank = ks.GetDimNum();
+            if (keyStrides->GetDimNum() != rank ||
+                keyStrides->GetStride(rank - 1) != 1 ||
+                keyStrides->GetStride(rank - 2) != d ||
+                (rank == 4 && keyStrides->GetStride(rank - 3) != d)) {
+                return ge::GRAPH_FAILED;
+            }
+            const int64_t stride0 = keyStrides->GetStride(0);
+            if (stride0 < 0) {
+                return ge::GRAPH_FAILED;
+            }
+            keyStride0 = static_cast<uint64_t>(stride0);
+        }
+
+        const auto* kScaleStrides = context->GetInputStride(K_SCALE);
+        if (kScaleStrides != nullptr) {
+            const auto& kScaleShape = kScaleTensor->GetStorageShape();
+            const size_t rank = kScaleShape.GetDimNum();
+            if ((rank != 2 && rank != 3) || kScaleStrides->GetDimNum() != rank ||
+                kScaleStrides->GetStride(rank - 1) != 1 ||
+                (rank == 3 && kScaleStrides->GetStride(rank - 2) != 1)) {
+                return ge::GRAPH_FAILED;
+            }
+            const int64_t stride0 = kScaleStrides->GetStride(0);
+            if (stride0 < 0) {
+                return ge::GRAPH_FAILED;
+            }
+            kScaleStride0 = static_cast<uint64_t>(stride0);
+        }
 
         const int64_t topk = Attr<int64_t>(context, ATTR_TOPK, 0);
         const int64_t quantMode = Attr<int64_t>(context, ATTR_QUANT_MODE, 1);
@@ -66,10 +104,12 @@ ge::graphStatus FiQuantLightningIndexerTiling(gert::TilingContext* context)
         params.d = static_cast<uint32_t>(d);
         params.topk = static_cast<uint32_t>(topk);
         params.batch = static_cast<uint32_t>(batch);
-        params.blockSize = static_cast<uint32_t>(ks.GetDim(1));
+        params.blockSize = static_cast<uint32_t>(blockSize);
         params.numPages = static_cast<uint32_t>(ks.GetDim(0));
         params.maxBlocksPerBatch = static_cast<uint32_t>(tableTensor->GetStorageShape().GetDim(1));
         params.maxSeqLenK = static_cast<uint32_t>(maxSeq);
+        params.keyStride0 = keyStride0;
+        params.kScaleStride0 = kScaleStride0;
         params.quantMode = static_cast<int32_t>(quantMode);
         params.maskMode = static_cast<int32_t>(maskMode);
         params.cmpRatio = static_cast<int32_t>(cmpRatio);

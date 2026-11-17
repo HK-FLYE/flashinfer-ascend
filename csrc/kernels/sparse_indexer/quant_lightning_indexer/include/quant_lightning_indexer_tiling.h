@@ -24,6 +24,8 @@ struct Params {
     uint32_t maxBlocksPerBatch{0};
     uint32_t numPages{0};
     uint32_t maxSeqLenK{0};
+    uint64_t keyStride0{0};
+    uint64_t kScaleStride0{0};
     int32_t quantMode{1};
     int32_t maskMode{3};
     int32_t cmpRatio{4};
@@ -51,6 +53,10 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     if (params.blockSize == 0 || params.numPages == 0 || params.maxBlocksPerBatch == 0 ||
         params.maxSeqLenK == 0) {
         throw std::invalid_argument("QuantLightningIndexerTiling: incomplete PA geometry");
+    }
+    if (params.keyStride0 < static_cast<uint64_t>(params.blockSize) * params.d ||
+        params.kScaleStride0 < params.blockSize) {
+        throw std::invalid_argument("QuantLightningIndexerTiling: invalid PA page stride");
     }
     if (params.quantMode != 1 || params.maskMode != 3 || params.cmpRatio != 4) {
         throw std::invalid_argument("QuantLightningIndexerTiling: attrs outside first grid");
@@ -120,6 +126,8 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     tilingData.maxBlocksPerBatch = params.maxBlocksPerBatch;
     tilingData.numPages = params.numPages;
     tilingData.maxSeqLenK = params.maxSeqLenK;
+    tilingData.keyStride0 = params.keyStride0;
+    tilingData.kScaleStride0 = params.kScaleStride0;
     tilingData.quantMode = params.quantMode;
     tilingData.maskMode = params.maskMode;
     tilingData.cmpRatio = params.cmpRatio;

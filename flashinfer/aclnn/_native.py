@@ -125,6 +125,7 @@ def prepare(module, recipe):
                 formats = array(
                     [
                         sum({"ND": 1, "NZ": 2}[f] for f in p.physical_layouts)
+                        + (4 if p.allow_strided else 0)
                         for p in recipe.tensor_parameters
                     ]
                 )

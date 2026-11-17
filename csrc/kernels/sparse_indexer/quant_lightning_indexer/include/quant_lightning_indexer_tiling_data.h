@@ -36,6 +36,8 @@ struct QuantLightningIndexerTilingData {
     uint32_t maxBlocksPerBatch{0};
     uint32_t numPages{0};
     uint32_t maxSeqLenK{0};
+    uint64_t keyStride0{0};
+    uint64_t kScaleStride0{0};
 
     int32_t quantMode{1};
     int32_t maskMode{3};

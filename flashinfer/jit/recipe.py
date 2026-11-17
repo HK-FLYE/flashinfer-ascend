@@ -80,6 +80,7 @@ class TensorParameter:
     shape_alternatives: Tuple[Tuple[Union[str, int], ...], ...] = ()
     native_conversions: Tuple[TensorDtypeConversion, ...] = ()
     optional_for_dtypes: Tuple[Tuple[int, str], ...] = ()
+    allow_strided: bool = False
 
     def __post_init__(self):
         if (not isinstance(self.name, str) or not _SYMBOL.fullmatch(self.name)
@@ -96,9 +97,13 @@ class TensorParameter:
         object.__setattr__(self, "shape", tuple(self.shape))
         if type(self.optional) is not bool or self.optional and self.role != "input":
             raise SchemaError("only input Tensor parameters may be optional")
+        if type(self.allow_strided) is not bool or (self.allow_strided and self.role != "input"):
+            raise SchemaError("only input Tensor parameters may allow strided storage")
         layouts = tuple(self.physical_layouts)
         if not layouts or len(set(layouts)) != len(layouts) or set(layouts) - {"ND", "NZ"}:
             raise SchemaError("Tensor physical_layouts must explicitly declare ND/NZ")
+        if self.allow_strided and layouts != ("ND",):
+            raise SchemaError("strided storage is supported only for ND Tensor parameters")
         object.__setattr__(self, "physical_layouts", layouts)
         alternatives = tuple(tuple(s) for s in self.shape_alternatives)
         if len({len(s) for s in alternatives + (self.shape,)}) != len(alternatives) + 1:
@@ -125,7 +130,7 @@ class TensorParameter:
         value = asdict(self)
         for name, default in (("optional", False), ("physical_layouts", ("ND",)),
                               ("shape_alternatives", ()), ("native_conversions", ()),
-                              ("optional_for_dtypes", ())):
+                              ("optional_for_dtypes", ()), ("allow_strided", False)):
             if getattr(self, name) == default:
                 value.pop(name)
         return value
@@ -351,7 +356,8 @@ class _Recipe:
     @property
     def extended_aclnn(self):
         return bool(self.attributes or any(p.optional or p.physical_layouts != ("ND",)
-                                         or p.native_conversions for p in self.tensor_parameters))
+                                         or p.native_conversions or p.allow_strided
+                                         for p in self.tensor_parameters))
 
     def validate_attributes(self, values=None):
         values = {} if values is None else dict(values)

@@ -36,7 +36,9 @@ def metadata(name, arguments, *, check_layouts=False):
             if isinstance(tensor, torch.Tensor):
                 if tensor.device.type == torch._C._get_privateuse1_backend_name():
                     import torch_npu
-                    layouts[key] = {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(tensor), "unknown")
+                    layouts[key] = {0: "NCHW", 2: "ND", 29: "NZ"}.get(
+                        torch_npu.get_npu_format(tensor), "unknown"
+                    )
                 else:
                     layouts[key] = "ND" if tensor.is_contiguous() else "strided"
     invocation = operator.infer(arguments, layouts)

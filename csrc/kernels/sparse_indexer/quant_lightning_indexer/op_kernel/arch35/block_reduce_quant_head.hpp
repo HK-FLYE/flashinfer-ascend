@@ -44,6 +44,7 @@ public:
         uint32_t blockSize{0};
         uint32_t maxBlocksPerBatch{0};
         uint32_t numPages{0};
+        uint64_t kScaleStride0{0};
     };
 
     CATLASS_DEVICE
@@ -225,7 +226,8 @@ public:
             }
             const float kScale =
                 (page >= 0 && static_cast<uint32_t>(page) < params_.numPages)
-                    ? gmKScale_.GetValue(static_cast<uint32_t>(page) * params_.blockSize + off)
+                    ? gmKScale_.GetValue(
+                          static_cast<uint32_t>(page) * params_.kScaleStride0 + off)
                     : 0.0f;
             ubKScale_.SetValue(col, kScale);
         }

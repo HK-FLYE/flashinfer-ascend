@@ -179,34 +179,29 @@ def _meta(arguments):
 def infer(arguments, layouts):
     meta = _meta(arguments)
     # Page-axis tensors may arrive as a non-contiguous view (production PA).
-    # Runner contig-copies them before the kernel; other operands stay ND-only.
+    # The runner preserves that storage and tags it ND; the native tiling carries
+    # the page stride so the kernel gathers without a host copy.
     if layouts is not None:
         allow_strided = {"key", "key_dequant_scale"}
         bad = [
             name
             for name, layout in layouts.items()
-            if layout != "ND" and name not in allow_strided
+            if (layout != "ND" and name not in allow_strided)
+            or (name in allow_strided and layout not in {"ND", "NCHW"})
         ]
         if bad:
             raise ValueError(
-                "quant_lightning_indexer requires contiguous ND tensors"
+                "quant_lightning_indexer requires ND tensors, with strided storage "
+                "supported only for paged key/key_dequant_scale"
                 + f" (non-ND: {bad})"
             )
     device = arguments["query"].device
-    # Contig-copy page tensors here so Ascend C dispatch (which requires
-    # contiguous operands) accepts production non-contiguous PA views.
-    key = arguments["key"]
-    k_scale = arguments["key_dequant_scale"]
-    if hasattr(key, "is_contiguous") and not key.is_contiguous():
-        key = key.contiguous()
-    if hasattr(k_scale, "is_contiguous") and not k_scale.is_contiguous():
-        k_scale = k_scale.contiguous()
     inputs = (
         arguments["query"],
-        key,
+        arguments["key"],
         arguments["weights"],
         arguments["query_dequant_scale"],
-        k_scale,
+        arguments["key_dequant_scale"],
         arguments["block_table"],
         arguments["cu_seqlens_q"],
         arguments["cu_seqlens_k"],

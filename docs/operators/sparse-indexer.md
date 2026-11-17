@@ -40,7 +40,7 @@ indices = stable_topk(score, topk)
 
 正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`。QLIv2 设备侧 TopK **槽位次序非分值降序**；对拍时按 ops-transformer 自测惯例，用 `return_value=1` 的 values 重排后再严相等。**不声称性能优势。**
 
-源码：[公共定义](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/operator.py)、[CPU golden / sample](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/cases.py)、[AOT/runner](../../flashinfer/ascendc/sparse_indexer/quant_lightning_indexer/)、[设备桩](../../csrc/kernels/sparse_indexer/quant_lightning_indexer/)、[契约与 CPU 语义测试](../../tests/test_quant_lightning_indexer.py)。
+源码：[公共定义](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/operator.py)、[CPU golden / sample](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/cases.py)、[AOT/runner](../../flashinfer/ascendc/sparse_indexer/quant_lightning_indexer/)、[设备实现](../../csrc/kernels/sparse_indexer/quant_lightning_indexer/)、[契约与 CPU 语义测试](../../tests/test_quant_lightning_indexer.py)。
 
 ## 与 Sparse Attention 的契约
 
@@ -48,5 +48,5 @@ Indexer 与 sparse attention 是两个 domain。本算子输出 token 级 TopK�
 
 ## 验证与限制
 
-- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden 边界矩阵；host OpDef/InferShape/Tiling 可 AOT 编译；GI 风格 cube（FP8 BlockMmad）+ vector quant reduce + TopK 路径在全部当前 sample 矩阵上与 CPU golden `indices` 严相等（本机 NPU，`matrix` PASS，含 N1=64 / decode+topk=2048 / PA page 轴非连续经 runner contig 拷贝 / 越界 page 当零页）；与 QLIv2 在 `smoke_tiny` 上 value-resort 后 `indices` 严相等（原始槽位次序不同属 QLIv2 设备排放）。
-- 未验证：图 capture/replay、性能、非首期 `quant_mode`/布局、kernel 内原生非连续 stride（首期由 host contig 承担）。
+- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden 边界矩阵；host OpDef/InferShape/Tiling 可 AOT 编译；GI 风格 cube（FP8 BlockMmad）+ vector quant reduce + TopK 路径在全部当前 sample 矩阵上与 CPU golden `indices` 严相等（本机 NPU，`matrix` PASS，含 N1=64 / decode+topk=2048 / PA page 轴非连续由设备内 `keyStride0` 寻址 / 越界 page 当零页）；与 QLIv2 在 `smoke_tiny` 上 value-resort 后 `indices` 严相等（原始槽位次序不同属 QLIv2 设备排放）。
+- 未验证：图 capture/replay、性能、非首期 `quant_mode`/布局、PA 页内其它轴非连续（当前要求页内轴密排，不合法 stride 由 host tiling 拒绝）、任意轴乱 stride。

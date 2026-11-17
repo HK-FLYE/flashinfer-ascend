@@ -24,7 +24,8 @@ public:
         Input("key")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT8_E4M3FN})
-            .Format({ge::FORMAT_ND});
+            .Format({ge::FORMAT_ND})
+            .IgnoreContiguous();
         Input("weights")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
@@ -36,7 +37,8 @@ public:
         Input("key_dequant_scale")
             .ParamType(REQUIRED)
             .DataType({ge::DT_FLOAT})
-            .Format({ge::FORMAT_ND});
+            .Format({ge::FORMAT_ND})
+            .IgnoreContiguous();
         Input("block_table")
             .ParamType(OPTIONAL)
             .DataType({ge::DT_INT32})

@@ -52,6 +52,18 @@ def _squeeze_nk(tensor):
     return tensor
 
 
+def _nd_page_view(tensor, torch_npu):
+    """Flatten singleton Nk while preserving the page-axis storage stride."""
+    import torch
+
+    flat = _squeeze_nk(tensor)
+    if flat.device.type == torch._C._get_privateuse1_backend_name():
+        # Format tagging is metadata-only for the strided ND view; it must not
+        # materialize a contiguous copy or the device-side stride is lost.
+        flat = torch_npu.npu_format_cast(flat, 2)
+    return flat
+
+
 @dataclass(frozen=True)
 class QuantLightningIndexerRunner:
     native: object
@@ -84,10 +96,9 @@ class QuantLightningIndexerRunner:
                 out = torch_npu.npu_format_cast(out, 2)
             return out
 
-        # First grid: kernel PA gather assumes contiguous [PAGES,BLOCK,D] storage.
-        # Production may pass a non-contiguous page-0 view; host contig-copies here.
-        key_flat = _nd_contig(_squeeze_nk(key))
-        k_scale = _nd_contig(_squeeze_nk(key_dequant_scale))
+        # PA key/scales keep their page-axis stride; native tiling forwards it.
+        key_flat = _nd_page_view(key, torch_npu)
+        k_scale = _nd_page_view(key_dequant_scale, torch_npu)
         query_flat = _nd_contig(query)
         weights_flat = _nd_contig(weights)
         q_scale = _nd_contig(query_dequant_scale)

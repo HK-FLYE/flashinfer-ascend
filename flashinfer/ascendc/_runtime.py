@@ -93,7 +93,9 @@ def native_admission(recipe, signature):
             return (
                 "Tensor format violates declared physical_layouts: " + parameter.name,
             )
-    if "0" in dict(signature.specializations).get("tensor_contiguity", ""):
+    contiguity = dict(signature.specializations).get("tensor_contiguity", "")
+    if any(flag == "0" and not parameter.allow_strided
+           for parameter, flag in zip(recipe.tensor_parameters, contiguity)):
         return ("Ascend C implementation requires contiguous Tensors",)
     return ()
 

@@ -28,7 +28,7 @@ from .runner import admission, make_runner
 KERNEL_ID = "ascendc/sparse_indexer/quant_lightning_indexer/catlass/op_package/Ascend950"
 
 
-def _tensor(name, role, dtype, shape, *, alternative=(), optional=False):
+def _tensor(name, role, dtype, shape, *, alternative=(), optional=False, allow_strided=False):
     return TensorParameter(
         name=name,
         role=role,
@@ -36,17 +36,18 @@ def _tensor(name, role, dtype, shape, *, alternative=(), optional=False):
         shape=shape,
         shape_alternatives=alternative,
         optional=optional,
+        allow_strided=allow_strided,
     )
 
 
 _TENSORS = (
     _tensor("query", "input", "float8_e4m3fn", ("TQ", "N1", "D")),
     _tensor("key", "input", "float8_e4m3fn", ("PAGES", "BLOCK", "D"),
-            alternative=(("PAGES", "BLOCK", "NK", "D"),)),
+            alternative=(("PAGES", "BLOCK", "NK", "D"),), allow_strided=True),
     _tensor("weights", "input", "float32", ("TQ", "N1")),
     _tensor("query_dequant_scale", "input", "float32", ("TQ", "N1")),
     _tensor("key_dequant_scale", "input", "float32", ("PAGES", "BLOCK"),
-            alternative=(("PAGES", "BLOCK", "NK"),)),
+            alternative=(("PAGES", "BLOCK", "NK"),), allow_strided=True),
     _tensor("block_table", "input", "int32", ("B", "MB"), optional=True),
     _tensor("cu_seqlens_q", "input", "int32", ("BC",), optional=True),
     _tensor("cu_seqlens_k", "input", "int32", ("BC",), optional=True),

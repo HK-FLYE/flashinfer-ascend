@@ -228,7 +228,8 @@ void execute_attributes(const std::string& token,
         const auto& tensor = *arguments[i];
         const auto format = at_npu::native::get_npu_format(tensor);
         const int64_t mask = format == ACL_FORMAT_ND ? 1 : format == ACL_FORMAT_FRACTAL_NZ ? 2 : 0;
-        TORCH_CHECK(tensor.device() == device && tensor.is_contiguous() &&
+        const bool allow_strided_nd = (binding->formats[i] & 4) != 0;
+        TORCH_CHECK(tensor.device() == device && (tensor.is_contiguous() || allow_strided_nd) &&
                     (binding->formats[i] & mask), "ACLNN Tensor violates its declared device/format");
         c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
     }
@@ -390,7 +391,10 @@ extern "C" __attribute__((visibility("default"))) int fi_aclnn_register_extended
         if (attribute_count) binding->attributes.assign(attributes, attributes + attribute_count);
         binding->argument_types.clear();
         for (size_t i = 0; i < inputs + outputs; ++i) {
-            TORCH_CHECK(formats[i] >= 1 && formats[i] <= 3 && conversions[i] >= 0 && conversions[i] <= 2 &&
+            const int64_t physical = formats[i] & 3;
+            const int64_t strided = formats[i] & 4;
+            TORCH_CHECK(physical >= 1 && physical <= 3 && (formats[i] & ~int64_t{7}) == 0 &&
+                        (!strided || physical == 1) && conversions[i] >= 0 && conversions[i] <= 2 &&
                         (optional[i] == 0 || optional[i] == 1) && (i < inputs || !optional[i]),
                         "Invalid extended ACLNN Tensor declaration");
         }
