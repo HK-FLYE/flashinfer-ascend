@@ -16,7 +16,7 @@ from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import (
     CASE_PARAMETERS,
     _mask3_visible_len,
     golden,
-    sample,
+    make_cpu_inputs,
 )
 from flashinfer.operators.sparse_indexer.quant_lightning_indexer.operator import OPERATOR
 
@@ -163,7 +163,7 @@ def test_native_recipe_declares_ordered_abi():
 
 @pytest.mark.parametrize("case", CASE_PARAMETERS, ids=lambda c: c["name"])
 def test_cpu_golden_indices_shape_and_padding(case):
-    tensors = sample(torch, case)
+    tensors = make_cpu_inputs(torch, case)
     indices, values = golden(torch, **tensors)
     tq = case["tq"]
     topk = case["topk"]
@@ -182,7 +182,7 @@ def test_cpu_golden_indices_shape_and_padding(case):
 
 def test_cpu_golden_mask3_respects_visibility_window():
     case = next(c for c in CASE_PARAMETERS if c["name"] == "hot_path_anchor")
-    tensors = sample(torch, case)
+    tensors = make_cpu_inputs(torch, case)
     # Force residual=0 so the closed-form window is easy to check.
     tensors["cmp_residual_k"] = torch.zeros_like(tensors["cmp_residual_k"])
     indices, _ = golden(torch, **tensors)
@@ -201,7 +201,7 @@ def test_cpu_golden_mask3_respects_visibility_window():
 
 def test_cpu_golden_return_value_matches_score_gather():
     case = next(c for c in CASE_PARAMETERS if c["name"] == "short_query_topk_overflow")
-    tensors = sample(torch, case)
+    tensors = make_cpu_inputs(torch, case)
     tensors["return_value"] = 1
     indices, values = golden(torch, **tensors)
     assert values.shape == indices.shape
@@ -213,8 +213,8 @@ def test_cpu_golden_return_value_matches_score_gather():
 
 def test_cpu_golden_is_deterministic():
     case = CASE_PARAMETERS[0]
-    a = sample(torch, case)
-    b = sample(torch, case)
+    a = make_cpu_inputs(torch, case)
+    b = make_cpu_inputs(torch, case)
     ia, _ = golden(torch, **a)
     ib, _ = golden(torch, **b)
     assert torch.equal(ia, ib)
@@ -232,14 +232,14 @@ def test_mask3_visible_len_formula():
 
 def test_cpu_golden_all_masked_fills_minus_one():
     case = next(c for c in CASE_PARAMETERS if c["name"] == "all_masked_empty_visible")
-    tensors = sample(torch, case)
+    tensors = make_cpu_inputs(torch, case)
     indices, _ = golden(torch, **tensors)
     assert (indices == -1).all()
 
 
 def test_cpu_golden_residual_changes_selected_prefix():
     case = next(c for c in CASE_PARAMETERS if c["name"] == "residual_boundary")
-    base = sample(torch, case)
+    base = make_cpu_inputs(torch, case)
     with_res = dict(base)
     with_res["cmp_residual_k"] = torch.tensor([3], dtype=torch.int32)
     without = dict(base)

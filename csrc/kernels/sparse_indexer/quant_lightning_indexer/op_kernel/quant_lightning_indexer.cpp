@@ -1,16 +1,15 @@
 /**
  * Copyright (c) 2026 Huawei Technologies Co., Ltd.
  * Licensed under CANN Open Software License Agreement Version 2.0.
- *
- * P2 stub: ABI-shaped device entry. Numeric path lands in a later slice.
  */
 #ifndef K_MAX_SHAPE_DIM
 #define K_MAX_SHAPE_DIM 0
 #endif
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_tiling_data.h"
-
-#if !(defined(__CCE_AICORE__) && __CCE_AICORE__ == 310)
+#if defined(__CCE_AICORE__) && __CCE_AICORE__ == 310
+#include "arch35/quant_lightning_indexer_kernel.h"
+#else
 #error "quant_lightning_indexer requires arch35 (__CCE_AICORE__ == 310)"
 #endif
 
@@ -24,18 +23,22 @@ extern "C" __global__ __aicore__ void fi_quant_lightning_indexer(
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     REGISTER_TILING_DEFAULT(QuantLightningIndexerTilingData);
     AscendC::SetSysWorkspace(workspace);
-    (void)query;
-    (void)key;
-    (void)weights;
-    (void)query_dequant_scale;
-    (void)key_dequant_scale;
-    (void)block_table;
-    (void)cu_seqlens_q;
     (void)cu_seqlens_k;
     (void)seqused_q;
-    (void)seqused_k;
-    (void)cmp_residual_k;
-    (void)indices;
     (void)values;
-    (void)tiling;
+
+    auto const* tilingData =
+        reinterpret_cast<__gm__ QuantLightningIndexerTilingData const*>(tiling);
+    if ASCEND_IS_AIC {
+        return;
+    }
+    if ASCEND_IS_AIV {
+        // First green: one AIV owns the whole first-grid case.
+        if (AscendC::GetBlockIdx() != 0) {
+            return;
+        }
+        QuantLightningIndexerKernel::RunFirstGrid(
+            query, key, weights, query_dequant_scale, key_dequant_scale, block_table,
+            cu_seqlens_q, seqused_k, cmp_residual_k, indices, tilingData);
+    }
 }

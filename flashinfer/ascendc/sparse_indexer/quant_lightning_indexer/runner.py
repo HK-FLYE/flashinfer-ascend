@@ -1,8 +1,4 @@
-"""Native admission and runner stub for quant_lightning_indexer.
-
-P0 only validates the public→native shape contract. Launch is intentionally
-unimplemented until the AOT package exists.
-"""
+"""Native admission and runner for quant_lightning_indexer first grid."""
 
 from dataclasses import dataclass, replace
 
@@ -33,8 +29,6 @@ def admission(recipe, signature):
         topk = shapes[positions["indices"]][-1]
         nk = shapes[positions["indices"]][1] if len(shapes[positions["indices"]]) == 3 else 1
         native_shapes = list(shapes)
-        # Public may expose empty values when return_value=0; native ABI keeps a
-        # full [TQ,NK,K] buffer like general_indexer.
         native_shapes[positions["indices"]] = (tq, nk, topk)
         native_shapes[positions["values"]] = (tq, nk, topk)
         signature = replace(signature, shapes=tuple(native_shapes))
@@ -48,14 +42,81 @@ def admission(recipe, signature):
     return tuple(reasons)
 
 
+def _squeeze_nk(tensor):
+    if tensor is None:
+        return None
+    if tensor.dim() == 4 and tensor.size(2) == 1:
+        return tensor.squeeze(2)
+    if tensor.dim() == 3 and tensor.size(-1) == 1:
+        return tensor.squeeze(-1)
+    return tensor
+
+
 @dataclass(frozen=True)
 class QuantLightningIndexerRunner:
     native: object
 
-    def __call__(self, *tensors, **attributes):
-        raise NotImplementedError(
-            "quant_lightning_indexer AOT package is not built yet (P0 stub)"
+    def __call__(
+        self,
+        query,
+        key,
+        weights,
+        query_dequant_scale,
+        key_dequant_scale,
+        block_table,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        cmp_residual_k,
+        indices,
+        values,
+        **attributes,
+    ):
+        import torch
+
+        key_flat = _squeeze_nk(key).contiguous()
+        k_scale = _squeeze_nk(key_dequant_scale).contiguous()
+        query_flat = query.contiguous()
+        weights_flat = weights.contiguous()
+        q_scale = query_dequant_scale.contiguous()
+
+        # Native values buffer is always full-shaped even when public return_value=0.
+        if values.numel() == 0:
+            values_work = torch.empty(
+                indices.shape, dtype=torch.bfloat16, device=query.device
+            )
+        else:
+            values_work = values
+
+        if query.device.type == torch._C._get_privateuse1_backend_name():
+            torch.npu.current_stream().synchronize()
+
+        self.native(
+            query_flat,
+            key_flat,
+            weights_flat,
+            q_scale,
+            k_scale,
+            block_table,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            cmp_residual_k,
+            indices,
+            values_work,
+            topk=int(indices.shape[-1]),
+            quant_mode=int(attributes["quant_mode"]),
+            mask_mode=int(attributes["mask_mode"]),
+            cmp_ratio=int(attributes["cmp_ratio"]),
+            max_seq_len_k=int(attributes["max_seq_len_k"]),
+            max_seqlen_q=int(attributes.get("max_seqlen_q", -1)),
+            return_value=int(attributes.get("return_value", 0)),
         )
+
+        if query.device.type == torch._C._get_privateuse1_backend_name():
+            torch.npu.current_stream().synchronize()
 
 
 def make_runner(module, spec, recipe):

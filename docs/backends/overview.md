@@ -135,7 +135,7 @@
 | `sampling.top_p_renorm_probs` | `reference` | bfloat16, float16, float32 | 未按 SoC 限制（仍受执行实现约束） | **Partial** — logical=ND；显式参考；Host/数值对照测试不覆盖所有登记组合 | [test_sampling.py](../../tests/test_sampling.py) |
 | <a id="op-sampling-top-p-sampling-from-probs"></a>`sampling.top_p_sampling_from_probs` | `cann` | bfloat16, float16, float32 | Ascend950 | **Supported** — logical=ND | [test_sampling.py](../../tests/test_sampling.py) |
 | `sampling.top_p_sampling_from_probs` | `reference` | bfloat16, float16, float32 | 未按 SoC 限制（仍受执行实现约束） | **Partial** — logical=ND；显式参考；Host/数值对照测试不覆盖所有登记组合 | [test_sampling.py](../../tests/test_sampling.py) |
-| <a id="op-sparse-indexer-quant-lightning-indexer"></a>`sparse_indexer.quant_lightning_indexer` | `ascendc` | bfloat16, float32, float8_e4m3fn, int32 | Ascend950 | **Partial** — 首期热点格契约、CPU golden 与 host/ABI 桩可 AOT 编译（quant_mode=1、TND/PA_BBND、mask_mode=3、cmp_ratio=4、D=128）；AOT-only；设备数值与 QLIv2 对拍未验证；原生 dtype 组合数=1 | [test_quant_lightning_indexer.py](../../tests/test_quant_lightning_indexer.py) |
+| <a id="op-sparse-indexer-quant-lightning-indexer"></a>`sparse_indexer.quant_lightning_indexer` | `ascendc` | bfloat16, float32, float8_e4m3fn, int32 | Ascend950 | **Partial** — 首期热点格契约/CPU golden 已登记；正确性优先 AIV 路径小形状 vs CPU golden 已过；生产调度与 QLIv2 对拍未验证；AOT-only；原生 dtype 组合数=1 | [test_quant_lightning_indexer.py](../../tests/test_quant_lightning_indexer.py) |
 
 上述限制来自每个后端的 `implementation.py`、Support/NativeBinding 与 runner，而非旧文档计数。入口：[discover_implementations](../../flashinfer/operators/authoring.py#L53)、[get_global_registry](../../flashinfer/runtime/registry.py#L290)；独立精确预期为 [tests/production_inventory.py](../../tests/production_inventory.py)。测试定义存在不表示执行过当前 dtype × shape × 设备矩阵。
 

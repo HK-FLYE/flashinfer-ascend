@@ -9,6 +9,24 @@ import math
 
 CASE_PARAMETERS = (
     {
+        # First acceptance case: tiny so the scalar AIV path finishes quickly.
+        "name": "smoke_tiny",
+        "tq": 1,
+        "n1": 4,
+        "d": 128,
+        "topk": 4,
+        "pages": 1,
+        "block": 16,
+        "batch": 1,
+        "max_seq_len_k": 8,
+        "seqused_k": 8,
+        "residual": 0,
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 3,
+    },
+    {
         "name": "hot_path_anchor",
         "tq": 8,
         "n1": 64,
@@ -263,8 +281,9 @@ def golden(
     return indices, values
 
 
-def sample(torch, case=None):
+def make_cpu_inputs(torch, case=None):
     case = dict(CASE_PARAMETERS[0] if case is None else case)
+    case.pop("name", None)
     rng = torch.Generator().manual_seed(int(case.get("seed", 7)))
     tq = case["tq"]
     n1 = case["n1"]
@@ -328,5 +347,48 @@ def sample(torch, case=None):
         "seqused_k": seqused_k,
         "cmp_residual_k": residual,
         "block_table": table,
-        "return_value": 0,
+        "return_value": int(case.get("return_value", 0)),
     }
+
+
+def sample(torch, torch_npu, **configuration):
+    """Framework acceptance sample: device args/options + CPU golden expected."""
+    tensors = make_cpu_inputs(torch, configuration or None)
+    expected = golden(torch, **tensors)
+
+    def to_device(value):
+        if not hasattr(value, "device"):
+            return value
+        tensor = value.contiguous().npu()
+        # Keep ND storage for ND-declared tensors (avoid NCHW default on 4D).
+        if tensor.dim() >= 4:
+            return torch_npu.npu_format_cast(tensor, 2)
+        return tensor
+
+    args = (
+        to_device(tensors["query"]),
+        to_device(tensors["key"]),
+        to_device(tensors["weights"]),
+        to_device(tensors["query_dequant_scale"]),
+        to_device(tensors["key_dequant_scale"]),
+        int(tensors["topk"]),
+        int(tensors["quant_mode"]),
+    )
+    options = dict(
+        layout_q=tensors["layout_q"],
+        layout_k=tensors["layout_k"],
+        mask_mode=int(tensors["mask_mode"]),
+        cmp_ratio=int(tensors["cmp_ratio"]),
+        max_seq_len_k=int(tensors["max_seq_len_k"]),
+        cu_seqlens_q=to_device(tensors["cu_seqlens_q"]),
+        seqused_k=to_device(tensors["seqused_k"]),
+        cmp_residual_k=to_device(tensors["cmp_residual_k"]),
+        block_table=to_device(tensors["block_table"]),
+        return_value=int(tensors["return_value"]),
+        backend="ascendc",
+    )
+    return args, options, expected
+
+
+# Exact indices match for the correctness-first kernel; empty values shape is trivial.
+TOLERANCES = ((0.0, 0.0), (0.0, 0.0))

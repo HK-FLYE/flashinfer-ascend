@@ -81,6 +81,8 @@ aclDataType acl_dtype(at::ScalarType dtype) {
         case at::kInt: return ACL_INT32;
         case at::kLong: return ACL_INT64;
         case at::kBool: return ACL_BOOL;
+        case at::kFloat8_e4m3fn: return ACL_FLOAT8_E4M3FN;
+        case at::kFloat8_e5m2: return ACL_FLOAT8_E5M2;
         default: TORCH_CHECK(false, "Unsupported ACLNN tensor dtype: ", dtype);
     }
 }
