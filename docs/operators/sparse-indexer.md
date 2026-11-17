@@ -8,7 +8,7 @@
 
 | logical op | public API | 状态 |
 | --- | --- | --- |
-| `sparse_indexer.quant_lightning_indexer` | `flashinfer.quant_lightning_indexer` | Ascend950 首期热点格：公共契约、AOT 声明与 CPU golden 已登记；设备 kernel 仍为桩，QLIv2 对拍未完成 |
+| `sparse_indexer.quant_lightning_indexer` | `flashinfer.quant_lightning_indexer` | Ascend950 首期热点格：公共契约、CPU golden、host OpDef/tiling 与空数值设备入口已可 AOT 编译；数值路径与 QLIv2 对拍未完成 |
 
 `sparse_indexer.lightning_indexer` / `general_indexer` 未在本分支创建。独立 metadata 产品算子首期不做；分核调度内嵌 tiling/kernel。
 
@@ -48,5 +48,5 @@ Indexer 与 sparse attention 是两个 domain。本算子输出 token 级 TopK�
 
 ## 验证与限制
 
-- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden（FP8 反量化 + ReLU + 加权 + mask_mode=3 + stable TopK）在首期 sample 矩阵上的形状/填充/可见窗边界。
-- 未验证：设备 kernel 数值、相对 QLIv2 的 indices 对拍、图 capture/replay、性能、非首期 `quant_mode`/布局。
+- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden（FP8 反量化 + ReLU + 加权 + mask_mode=3 + stable TopK）在首期 sample 矩阵上的形状/填充/可见窗边界；host OpDef/InferShape/Tiling + ABI 形设备入口可 AOT 编译（Ascend950）。
+- 未验证：设备 kernel 数值正确性、runner 真机启动、相对 QLIv2 的 indices 对拍、图 capture/replay、性能、非首期 `quant_mode`/布局。
