@@ -178,24 +178,41 @@ def _meta(arguments):
 
 def infer(arguments, layouts):
     meta = _meta(arguments)
-    if layouts is not None and any(value != "ND" for value in layouts.values()):
-        raise ValueError("quant_lightning_indexer requires contiguous ND tensors")
+    # Page-axis tensors may arrive as a non-contiguous view (production PA).
+    # Runner contig-copies them before the kernel; other operands stay ND-only.
+    if layouts is not None:
+        allow_strided = {"key", "key_dequant_scale"}
+        bad = [
+            name
+            for name, layout in layouts.items()
+            if layout != "ND" and name not in allow_strided
+        ]
+        if bad:
+            raise ValueError(
+                "quant_lightning_indexer requires contiguous ND tensors"
+                + f" (non-ND: {bad})"
+            )
     device = arguments["query"].device
-    inputs = tuple(
-        arguments[name]
-        for name in (
-            "query",
-            "key",
-            "weights",
-            "query_dequant_scale",
-            "key_dequant_scale",
-            "block_table",
-            "cu_seqlens_q",
-            "cu_seqlens_k",
-            "seqused_q",
-            "seqused_k",
-            "cmp_residual_k",
-        )
+    # Contig-copy page tensors here so Ascend C dispatch (which requires
+    # contiguous operands) accepts production non-contiguous PA views.
+    key = arguments["key"]
+    k_scale = arguments["key_dequant_scale"]
+    if hasattr(key, "is_contiguous") and not key.is_contiguous():
+        key = key.contiguous()
+    if hasattr(k_scale, "is_contiguous") and not k_scale.is_contiguous():
+        k_scale = k_scale.contiguous()
+    inputs = (
+        arguments["query"],
+        key,
+        arguments["weights"],
+        arguments["query_dequant_scale"],
+        k_scale,
+        arguments["block_table"],
+        arguments["cu_seqlens_q"],
+        arguments["cu_seqlens_k"],
+        arguments["seqused_q"],
+        arguments["seqused_k"],
+        arguments["cmp_residual_k"],
     )
     return Invocation(
         inputs,

@@ -75,11 +75,22 @@ class QuantLightningIndexerRunner:
     ):
         import torch
 
-        key_flat = _squeeze_nk(key).contiguous()
-        k_scale = _squeeze_nk(key_dequant_scale).contiguous()
-        query_flat = query.contiguous()
-        weights_flat = weights.contiguous()
-        q_scale = query_dequant_scale.contiguous()
+        import torch_npu
+
+        def _nd_contig(tensor):
+            out = tensor.contiguous()
+            # Strided PA views can leave a non-ND acl format after contiguous().
+            if out.device.type == torch._C._get_privateuse1_backend_name():
+                out = torch_npu.npu_format_cast(out, 2)
+            return out
+
+        # First grid: kernel PA gather assumes contiguous [PAGES,BLOCK,D] storage.
+        # Production may pass a non-contiguous page-0 view; host contig-copies here.
+        key_flat = _nd_contig(_squeeze_nk(key))
+        k_scale = _nd_contig(_squeeze_nk(key_dequant_scale))
+        query_flat = _nd_contig(query)
+        weights_flat = _nd_contig(weights)
+        q_scale = _nd_contig(query_dequant_scale)
 
         # Native values buffer is always full-shaped even when public return_value=0.
         if values.numel() == 0:

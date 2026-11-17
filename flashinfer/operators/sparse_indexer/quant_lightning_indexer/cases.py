@@ -149,6 +149,62 @@ CASE_PARAMETERS = (
         "cmp_ratio": 4,
         "seed": 23,
     },
+    {
+        # Production-like: page-0 axis non-contiguous; runner contig-copies before kernel.
+        "name": "pa_page_axis_noncontig",
+        "tq": 4,
+        "n1": 8,
+        "d": 128,
+        "topk": 4,
+        "pages": 4,
+        "block": 16,
+        "batch": 1,
+        "max_seq_len_k": 32,
+        "seqused_k": 24,
+        "residual": 0,
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 29,
+        "noncontig_page_axis": True,
+    },
+    {
+        # Used block_table slot is -1 / OOB → gather as zero page (matches kernel zero page).
+        "name": "oob_page_in_used_slot",
+        "tq": 2,
+        "n1": 4,
+        "d": 128,
+        "topk": 4,
+        "pages": 2,
+        "block": 16,
+        "batch": 1,
+        "max_seq_len_k": 16,
+        "seqused_k": 12,
+        "residual": 0,
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 31,
+        "invalid_used_page": "neg",
+    },
+    {
+        # Decode-ish: Tq=1, N1=64, topk at first-grid cap (mostly -1 pad vs short K).
+        "name": "decode_n64_topk2048",
+        "tq": 1,
+        "n1": 64,
+        "d": 128,
+        "topk": 2048,
+        "pages": 2,
+        "block": 16,
+        "batch": 1,
+        "max_seq_len_k": 32,
+        "seqused_k": 24,
+        "residual": 1,
+        "quant_mode": 1,
+        "mask_mode": 3,
+        "cmp_ratio": 4,
+        "seed": 37,
+    },
 )
 
 
@@ -301,6 +357,21 @@ def golden(
     return indices, values
 
 
+def _as_noncontig_page_axis(torch, pages_tensor):
+    """Return a [::2] view so dim-0 (page) is non-contiguous; other axes stay dense."""
+    pages = pages_tensor.shape[0]
+    padded = torch.empty(
+        (pages * 2,) + tuple(pages_tensor.shape[1:]),
+        dtype=pages_tensor.dtype,
+    )
+    padded.zero_()
+    padded[::2].copy_(pages_tensor)
+    view = padded[::2]
+    if view.is_contiguous():
+        raise RuntimeError("failed to materialize non-contiguous page axis")
+    return view
+
+
 def make_cpu_inputs(torch, case=None):
     case = dict(CASE_PARAMETERS[0] if case is None else case)
     case.pop("name", None)
@@ -323,6 +394,9 @@ def make_cpu_inputs(torch, case=None):
     k_scale = (torch.randn((pages, block, 1), generator=rng).abs() * 0.05 + 0.01).to(
         torch.float32
     )
+    if case.get("noncontig_page_axis"):
+        key = _as_noncontig_page_axis(torch, key)
+        k_scale = _as_noncontig_page_axis(torch, k_scale)
 
     if "cu_q" in case:
         cu = torch.tensor(list(case["cu_q"]), dtype=torch.int32)
@@ -350,6 +424,14 @@ def make_cpu_inputs(torch, case=None):
             if cursor >= pages:
                 cursor = pages - 1
 
+    invalid = case.get("invalid_used_page")
+    if invalid == "neg":
+        table[0, 0] = -1
+    elif invalid == "oob":
+        table[0, 0] = pages + 7
+    elif invalid not in (None, False):
+        raise ValueError("invalid_used_page must be 'neg', 'oob', or unset")
+
     return {
         "query": query,
         "key": key,
@@ -371,9 +453,34 @@ def make_cpu_inputs(torch, case=None):
     }
 
 
+def _to_npu_page_tensor(torch, torch_npu, value, *, preserve_noncontig):
+    """Upload key/scale; optionally rebuild a non-contiguous page-0 view on device."""
+    if not preserve_noncontig or value.is_contiguous():
+        tensor = value.contiguous().npu()
+        if tensor.dim() >= 4:
+            return torch_npu.npu_format_cast(tensor, 2)
+        return tensor
+    pages = value.shape[0]
+    contig = value.contiguous()
+    padded = torch.empty(
+        (pages * 2,) + tuple(contig.shape[1:]),
+        dtype=contig.dtype,
+        device="npu",
+    )
+    padded.zero_()
+    padded[::2].copy_(contig.npu())
+    view = padded[::2]
+    if view.dim() >= 4:
+        # Format-cast would re-pack; keep ND strided storage for this boundary case.
+        return view
+    return view
+
+
 def sample(torch, torch_npu, **configuration):
     """Framework acceptance sample: device args/options + CPU golden expected."""
-    tensors = make_cpu_inputs(torch, configuration or None)
+    cfg = dict(configuration or {})
+    preserve = bool(cfg.get("noncontig_page_axis"))
+    tensors = make_cpu_inputs(torch, cfg or None)
     expected = golden(torch, **tensors)
 
     def to_device(value):
@@ -387,10 +494,12 @@ def sample(torch, torch_npu, **configuration):
 
     args = (
         to_device(tensors["query"]),
-        to_device(tensors["key"]),
+        _to_npu_page_tensor(torch, torch_npu, tensors["key"], preserve_noncontig=preserve),
         to_device(tensors["weights"]),
         to_device(tensors["query_dequant_scale"]),
-        to_device(tensors["key_dequant_scale"]),
+        _to_npu_page_tensor(
+            torch, torch_npu, tensors["key_dequant_scale"], preserve_noncontig=preserve
+        ),
         int(tensors["topk"]),
         int(tensors["quant_mode"]),
     )

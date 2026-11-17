@@ -48,5 +48,5 @@ Indexer 与 sparse attention 是两个 domain。本算子输出 token 级 TopK�
 
 ## 验证与限制
 
-- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden 边界矩阵；host OpDef/InferShape/Tiling 可 AOT 编译；GI 风格 cube（FP8 BlockMmad）+ vector quant reduce + TopK 路径在全部当前 sample 矩阵上与 CPU golden `indices` 严相等（本机 NPU，`matrix` PASS，含 N1=64）；与 QLIv2 在 `smoke_tiny` 上 value-resort 后 `indices` 严相等（原始槽位次序不同属 QLIv2 设备排放）。
-- 未验证：图 capture/replay、性能、非首期 `quant_mode`/布局、PA 非连续 / OOB 等其余边界族。
+- 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden 边界矩阵；host OpDef/InferShape/Tiling 可 AOT 编译；GI 风格 cube（FP8 BlockMmad）+ vector quant reduce + TopK 路径在全部当前 sample 矩阵上与 CPU golden `indices` 严相等（本机 NPU，`matrix` PASS，含 N1=64 / decode+topk=2048 / PA page 轴非连续经 runner contig 拷贝 / 越界 page 当零页）；与 QLIv2 在 `smoke_tiny` 上 value-resort 后 `indices` 严相等（原始槽位次序不同属 QLIv2 设备排放）。
+- 未验证：图 capture/replay、性能、非首期 `quant_mode`/布局、kernel 内原生非连续 stride（首期由 host contig 承担）。

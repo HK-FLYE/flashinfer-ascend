@@ -258,6 +258,32 @@ def test_cpu_golden_residual_changes_selected_prefix():
         assert (chosen_0[chosen_0 >= 0] < vis_0).all()
 
 
+def test_cpu_golden_noncontig_page_axis_matches_contiguous():
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "pa_page_axis_noncontig")
+    noncontig = make_cpu_inputs(torch, case)
+    assert not noncontig["key"].is_contiguous()
+    assert not noncontig["key_dequant_scale"].is_contiguous()
+    contig = make_cpu_inputs(torch, dict(case, noncontig_page_axis=False))
+    assert torch.equal(noncontig["key"].contiguous(), contig["key"].contiguous())
+    ia, _ = golden(torch, **noncontig)
+    ib, _ = golden(torch, **contig)
+    assert torch.equal(ia, ib)
+
+
+def test_cpu_golden_invalid_used_page_treated_as_zero():
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "oob_page_in_used_slot")
+    tensors = make_cpu_inputs(torch, case)
+    assert int(tensors["block_table"][0, 0]) < 0
+    indices, _ = golden(torch, **tensors)
+    assert indices.shape == (case["tq"], 1, case["topk"])
+    assert ((indices >= 0) | (indices == -1)).all()
+    fixed = dict(tensors)
+    fixed["block_table"] = tensors["block_table"].clone()
+    fixed["block_table"][0, 0] = 0
+    idx_fixed, _ = golden(torch, **fixed)
+    assert (idx_fixed[idx_fixed >= 0] < case["max_seq_len_k"]).all()
+
+
 def _hand_built_inputs(*, weights=None, q_scale=None, k_scale=None, key_vals=None):
     tq, n1, d, topk = 1, 2, 128, 3
     query = torch.ones((tq, n1, d), dtype=torch.float8_e4m3fn)
