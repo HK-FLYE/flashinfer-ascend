@@ -257,22 +257,26 @@ def test_cpu_golden_residual_changes_selected_prefix():
         assert (chosen_0[chosen_0 >= 0] < vis_0).all()
 
 
-def test_cpu_golden_stable_topk_prefers_lower_index_on_ties():
-    # Hand-built equal scores via identical dequantized Q/K rows and constant W.
+def _hand_built_inputs(*, weights=None, q_scale=None, k_scale=None, key_vals=None):
     tq, n1, d, topk = 1, 2, 128, 3
     query = torch.ones((tq, n1, d), dtype=torch.float8_e4m3fn)
-    key = torch.ones((1, 16, 1, d), dtype=torch.float8_e4m3fn)
-    weights = torch.ones((tq, n1), dtype=torch.float32)
-    q_scale = torch.ones((tq, n1), dtype=torch.float32)
-    k_scale = torch.ones((1, 16, 1), dtype=torch.float32)
-    indices, _ = golden(
-        torch,
-        query,
-        key,
-        weights,
-        q_scale,
-        k_scale,
-        topk,
+    if key_vals is None:
+        key = torch.ones((1, 16, 1, d), dtype=torch.float8_e4m3fn)
+    else:
+        key = key_vals
+    if weights is None:
+        weights = torch.ones((tq, n1), dtype=torch.float32)
+    if q_scale is None:
+        q_scale = torch.ones((tq, n1), dtype=torch.float32)
+    if k_scale is None:
+        k_scale = torch.ones((1, 16, 1), dtype=torch.float32)
+    return dict(
+        query=query,
+        key=key,
+        weights=weights,
+        query_dequant_scale=q_scale,
+        key_dequant_scale=k_scale,
+        topk=topk,
         quant_mode=1,
         layout_q="TND",
         layout_k="PA_BBND",
@@ -285,5 +289,33 @@ def test_cpu_golden_stable_topk_prefers_lower_index_on_ties():
         block_table=torch.tensor([[0]], dtype=torch.int32),
         return_value=0,
     )
+
+
+def test_cpu_golden_stable_topk_prefers_lower_index_on_ties():
+    indices, _ = golden(torch, **_hand_built_inputs())
     # With equal scores, stable TopK must pick the lowest indices first.
+    assert indices[0, 0].tolist() == [0, 1, 2]
+
+
+def test_cpu_golden_zero_weights_still_topk_by_index():
+    weights = torch.zeros((1, 2), dtype=torch.float32)
+    indices, _ = golden(torch, **_hand_built_inputs(weights=weights))
+    # All scores zero → still stable by index among visible keys.
+    assert indices[0, 0].tolist() == [0, 1, 2]
+
+
+def test_cpu_golden_extreme_scales_finite_indices():
+    q_scale = torch.full((1, 2), 1e-6, dtype=torch.float32)
+    k_scale = torch.full((1, 16, 1), 1e4, dtype=torch.float32)
+    indices, values = golden(
+        torch, **{**_hand_built_inputs(q_scale=q_scale, k_scale=k_scale), "return_value": 1}
+    )
+    assert ((indices >= 0) | (indices == -1)).all()
+    assert torch.isfinite(values[indices >= 0]).all()
+
+
+def test_cpu_golden_negative_qk_masked_by_relu_still_fills():
+    # Opposite-sign Q/K → ReLU zeros all scores; TopK still fills by stable order.
+    key = (-torch.ones((1, 16, 1, 128))).to(torch.float8_e4m3fn)
+    indices, _ = golden(torch, **_hand_built_inputs(key_vals=key))
     assert indices[0, 0].tolist() == [0, 1, 2]
