@@ -22,6 +22,10 @@
 #include "block/key_loader.hpp"
 #include "quant_lightning_indexer_source.h"
 #include "quant_lightning_indexer_task.h"
+#include "policy/core/problem.hpp"
+#include "policy/core/resource_plan.hpp"
+#include "policy/core/tile.hpp"
+#include "policy/core/traits.hpp"
 
 template <class BlockScheduler_, class BlockMmad_, class BlockReduceHead_, class BlockTopK_, class BlockTopKVector_>
 class QuantLightningIndexerKernel {
