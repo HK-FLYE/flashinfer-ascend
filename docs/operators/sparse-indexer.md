@@ -51,4 +51,4 @@ Indexer 与 sparse attention 是两个 domain。本算子输出 token 级 TopK�
 - 已验证：首期格公共 schema / infer 拒绝用例；Ascend C NativeBinding 与 production inventory 精确登记；CPU golden 边界矩阵；host OpDef/InferShape/Tiling 可 AOT 编译；GI 风格 cube（FP8 BlockMmad）+ vector quant reduce + TopK 路径在全部当前 sample 矩阵上与 CPU golden `indices` 严相等（本机 NPU，`matrix` PASS，含 N1=64 / decode+topk=2048 / PA page 轴非连续由设备内 `keyStride0` 寻址 / 越界 page 当零页）；与 QLIv2 在 `smoke_tiny` 上 value-resort 后 `indices` 严相等（原始槽位次序不同属 QLIv2 设备排放）。
 - 未验证：图 capture/replay、隔离环境产品性能基线、非首期 `quant_mode`/布局、PA 页内其它轴非连续（当前要求页内轴密排，不合法 stride 由 host tiling 拒绝）、任意轴乱 stride。
 
-性能记录：[1000 条 QLIv2 对比报告](../reports/quant-lightning-indexer-vs-qli-v2-production-1000.md)。报告记录的是本机共享环境测量；当前实现明显慢于 QLIv2，不构成产品性能声明或性能优势。
+性能记录：[1000 条 QLIv2 功能对比](../reports/quant-lightning-indexer-vs-qli-v2-production-1000.md)、[最差可采集 case 的 msprof 分析](../reports/quant-lightning-indexer-worst-case-msprof.md)。当前实现的 AIV TopK 标量路径明显慢于 QLIv2，不构成产品性能声明或性能优势。
