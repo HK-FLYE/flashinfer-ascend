@@ -129,7 +129,10 @@ public:
                 params.hasOutputIdxOffset = false;
                 BlockTopKVector topk(resource_, scores, outIndices, params, dummyOffset, outValues);
                 while (blockScheduler.GetNextTopKCoord(coord)) {
-                    topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK);
+                    const auto task = QuantLightningIndexerKernelDetail::MakeQuantLightningIndexerTask(
+                        coord, blockScheduler.source());
+                    topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK, coord.localQStart,
+                        task.activeQ, task.activeK, task.residual);
                 }
             } else {
                 typename BlockTopK::Params params{};

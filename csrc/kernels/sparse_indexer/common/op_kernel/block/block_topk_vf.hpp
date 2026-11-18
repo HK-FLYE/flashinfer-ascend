@@ -74,7 +74,17 @@ public:
         tmpIndex_ = nk_[64].template ReinterpretCast<uint16_t>();
     }
 
-    CATLASS_DEVICE void operator()(uint32_t s1Start, uint32_t actualS1, uint32_t kStart, uint32_t kLen)
+    CATLASS_DEVICE static uint32_t VisibleLen(uint32_t localQ, uint32_t qLen, uint32_t kLen, int32_t residual)
+    {
+        const int64_t raw = static_cast<int64_t>(kLen) * 4 + residual - static_cast<int64_t>(qLen) + localQ + 1;
+        if (raw <= 0) {
+            return 0;
+        }
+        return AscendC::Std::min(kLen, static_cast<uint32_t>(raw / 4));
+    }
+
+    CATLASS_DEVICE void operator()(uint32_t s1Start, uint32_t actualS1, uint32_t kStart, uint32_t kLen,
+        uint32_t localQStart, uint32_t qLen, uint32_t requestKLen, int32_t residual)
     {
         if (actualS1 == 0) {
             return;
@@ -94,6 +104,15 @@ public:
 
         for (uint32_t ri = 0; ri < rowCount; ++ri) {
             const uint32_t s1Row = s1Start + rowBegin + ri;
+            const uint32_t visibleLen = VisibleLen(localQStart + rowBegin + ri, qLen, requestKLen, residual);
+            if (visibleLen < topK_) {
+                AscendC::CreateVecIndex(outIdx, static_cast<DtypeOut>(kStart), topK_);
+                for (uint32_t i = visibleLen; i < topK_; ++i) {
+                    outIdx.SetValue(i, static_cast<DtypeOut>(-1));
+                }
+                storeRow(outIdx, s1Row, copyOut);
+                continue;
+            }
             if (kLen == 0) {
                 for (uint32_t i = 0; i < topK_; ++i) {
                     outIdx.SetValue(i, static_cast<DtypeOut>(-1));
@@ -114,21 +133,18 @@ public:
                 const float value = scoreUb_.GetValue(i);
                 if (!IsNegInfFloat(value)) {
                     ++finiteLen;
-                    inputUb_.SetValue(i, FloatToSortableU16(value));
-                } else {
+                }
+            }
+
+            if (finiteLen >= topK_) {
+                for (uint32_t i = 0; i < kLen; ++i) {
+                    const float value = scoreUb_.GetValue(i);
+                    inputUb_.SetValue(i, IsNegInfFloat(value) ? 0U : FloatToSortableU16(value));
+                }
+                for (uint32_t i = kLen; i < alignedLen; ++i) {
                     inputUb_.SetValue(i, 0U);
                 }
-            }
-            for (uint32_t i = kLen; i < alignedLen; ++i) {
-                inputUb_.SetValue(i, 0U);
-            }
-            AscendC::PipeBarrier<PIPE_V>();
-
-            if (finiteLen < topK_) {
-                for (uint32_t i = 0; i < topK_; ++i) {
-                    outIdx.SetValue(i, i < finiteLen ? static_cast<DtypeOut>(kStart + i) : static_cast<DtypeOut>(-1));
-                }
-            } else {
+                AscendC::PipeBarrier<PIPE_V>();
                 topkb16gather::LiTopKVF<false>(tmpIndex_, outValueUb_, inputUb_, hist_, idxHigh_, idxLow_, nk_, topK_,
                     alignedLen);
                 AscendC::PipeBarrier<PIPE_V>();
