@@ -1,0 +1,30 @@
+/**
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ * Licensed under CANN Open Software License Agreement Version 2.0.
+ */
+
+#ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_RESOURCE_CURRENT_HPP
+#define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_RESOURCE_CURRENT_HPP
+
+#include "catlass/arch/resource.hpp"
+#include "catlass/detail/macros.hpp"
+#include "kernel_operator.h"
+
+namespace SparseIndexer::QuantLightningIndexer::Policy {
+
+/** C0 resource policy: the existing blocks allocate from one Catlass UB arena. */
+template <class ArchTag_>
+struct CurrentResourcePolicy {
+    using ArchTag = ArchTag_;
+    using Resource = Catlass::Arch::Resource<ArchTag>;
+
+    template <class Dtype_>
+    CATLASS_DEVICE static AscendC::LocalTensor<Dtype_> GetUbC(Resource& resource)
+    {
+        return resource.ubBuf.template GetBufferByByte<Dtype_>(0);
+    }
+};
+
+} // namespace SparseIndexer::QuantLightningIndexer::Policy
+
+#endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_RESOURCE_CURRENT_HPP

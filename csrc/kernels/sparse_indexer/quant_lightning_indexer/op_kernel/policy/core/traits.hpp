@@ -12,22 +12,6 @@
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 
-struct PolicyBundleTag {};
-
-template <class Schedule_, class Load_, class Mmad_, class Reduce_, class TopK_, class Sync_, class Resource_>
-struct PolicyBundle : PolicyBundleTag {
-    using Schedule = Schedule_;
-    using Load = Load_;
-    using Mmad = Mmad_;
-    using Reduce = Reduce_;
-    using TopK = TopK_;
-    using Sync = Sync_;
-    using Resource = Resource_;
-};
-
-template <class T>
-struct IsPolicyBundle : std::is_base_of<PolicyBundleTag, T> {};
-
 struct CurrentPerformanceTraits {
     static constexpr bool kSplitAivByRow = false;
     static constexpr bool kS2InnerLoop = false;
@@ -43,6 +27,24 @@ struct QliV2PerformanceTraits {
     static constexpr bool kUseMetadataBalance = true;
     static constexpr uint32_t kS2Base = 128;
 };
+
+struct PolicyBundleTag {};
+
+template <class Schedule_, class Load_, class Mmad_, class Reduce_, class TopK_, class Sync_, class Resource_,
+    class Traits_ = CurrentPerformanceTraits>
+struct PolicyBundle : PolicyBundleTag {
+    using Schedule = Schedule_;
+    using Load = Load_;
+    using Mmad = Mmad_;
+    using Reduce = Reduce_;
+    using TopK = TopK_;
+    using Sync = Sync_;
+    using Resource = Resource_;
+    using Traits = Traits_;
+};
+
+template <class T>
+struct IsPolicyBundle : std::is_base_of<PolicyBundleTag, T> {};
 
 } // namespace SparseIndexer::QuantLightningIndexer::Policy
 

@@ -8,28 +8,14 @@
 
 #include "kernel_operator.h"
 
-#include "block/block_mmad.hpp"
-#include "block/block_scheduler.hpp"
-#include "block/block_topk.hpp"
-#include "block/block_topk_vf.hpp"
-#include "block/key_loader.hpp"
-#include "block/mask_policy.hpp"
-#include "block_reduce_quant_head.hpp"
-#include "quant_lightning_indexer_kernel.h"
+#include "policy/current.hpp"
+#include "policy/kernel.hpp"
 
 namespace QuantLightningIndexerKernelDetail {
 
-using QkDtype = fp8_e4m3fn_t;
-using RequestSource = QuantLightningIndexerRequestSource;
-using BlockScheduler = SparseIndexer::Common::Block::BlockScheduler<
-    RequestSource, SparseIndexer::Common::Block::RequestBlockDiagonalPolicy>;
-using PagedKeyLoader = SparseIndexer::Common::Block::PagedKeyLoader<
-    Catlass::Arch::Ascend950, Catlass::Gemm::GemmType<QkDtype, Catlass::layout::ColumnMajor>>;
-using BlockMmad = SparseIndexer::Common::Block::BlockMmad<QkDtype, QkDtype, PagedKeyLoader>;
-using BlockReduceHead = BlockReduceQuantHead<>;
-using BlockTopK = SparseIndexer::Common::Block::BlockTopK<float, int32_t>;
-using BlockTopKVector = SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>;
-using Kernel = QuantLightningIndexerKernel<BlockScheduler, BlockMmad, BlockReduceHead, BlockTopK, BlockTopKVector>;
+using QkDtype = SparseIndexer::QuantLightningIndexer::Policy::QkDtype;
+using CurrentPolicy = SparseIndexer::QuantLightningIndexer::Policy::CurrentPolicy;
+using Kernel = QuantLightningIndexerKernel<CurrentPolicy>;
 
 CATLASS_DEVICE inline void RunKernel(
     GM_ADDR query, GM_ADDR key, GM_ADDR weights, GM_ADDR qScale, GM_ADDR kScale, GM_ADDR blockTable,
