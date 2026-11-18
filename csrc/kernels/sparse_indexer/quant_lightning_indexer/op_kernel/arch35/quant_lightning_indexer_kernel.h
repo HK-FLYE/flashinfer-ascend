@@ -18,16 +18,18 @@
 #include "block/block_mmad.hpp"
 #include "block/block_scheduler.hpp"
 #include "block/block_topk.hpp"
+#include "block/block_topk_vf.hpp"
 #include "block/key_loader.hpp"
 #include "quant_lightning_indexer_source.h"
 #include "quant_lightning_indexer_task.h"
 
-template <class BlockScheduler_, class BlockMmad_, class BlockReduceHead_, class BlockTopK_>
+template <class BlockScheduler_, class BlockMmad_, class BlockReduceHead_, class BlockTopK_, class BlockTopKVector_>
 class QuantLightningIndexerKernel {
     using BlockScheduler = BlockScheduler_;
     using BlockMmad = BlockMmad_;
     using BlockReduceHead = BlockReduceHead_;
     using BlockTopK = BlockTopK_;
+    using BlockTopKVector = BlockTopKVector_;
     using InputType = typename BlockMmad::DtypeA;
 
     CATLASS_DEVICE static typename BlockScheduler::Params MakeSchedulerParams(
@@ -117,17 +119,29 @@ public:
         }
         AscendC::SyncAll<false>();
         if ASCEND_IS_AIV {
-            typename BlockTopK::Params params{};
-            params.topK = tiling->topk;
-            params.s2Stride = tiling->maxSeqLenK;
-            params.s2Tile = tiling->topkS2Tile;
-            params.hasOutputIdxOffset = false;
-            params.writeValues = tiling->returnValue != 0;
             AscendC::GlobalTensor<int32_t> dummyOffset;
-            BlockTopK topk(resource_, scores, outIndices, params, dummyOffset, outValues);
             SparseIndexer::Common::Block::ScheduleCoord coord{};
-            while (blockScheduler.GetNextTopKCoord(coord)) {
-                topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK);
+            if (tiling->returnValue == 0 && tiling->topk == 2048 && tiling->maxSeqLenK < tiling->topk) {
+                typename BlockTopKVector::Params params{};
+                params.topK = tiling->topk;
+                params.s2Stride = tiling->maxSeqLenK;
+                params.s2Tile = tiling->topkS2Tile;
+                params.hasOutputIdxOffset = false;
+                BlockTopKVector topk(resource_, scores, outIndices, params, dummyOffset, outValues);
+                while (blockScheduler.GetNextTopKCoord(coord)) {
+                    topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK);
+                }
+            } else {
+                typename BlockTopK::Params params{};
+                params.topK = tiling->topk;
+                params.s2Stride = tiling->maxSeqLenK;
+                params.s2Tile = tiling->topkS2Tile;
+                params.hasOutputIdxOffset = false;
+                params.writeValues = tiling->returnValue != 0;
+                BlockTopK topk(resource_, scores, outIndices, params, dummyOffset, outValues);
+                while (blockScheduler.GetNextTopKCoord(coord)) {
+                    topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK);
+                }
             }
         }
     }

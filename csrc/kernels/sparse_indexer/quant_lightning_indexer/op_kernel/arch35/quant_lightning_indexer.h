@@ -11,6 +11,7 @@
 #include "block/block_mmad.hpp"
 #include "block/block_scheduler.hpp"
 #include "block/block_topk.hpp"
+#include "block/block_topk_vf.hpp"
 #include "block/key_loader.hpp"
 #include "block/mask_policy.hpp"
 #include "block_reduce_quant_head.hpp"
@@ -27,7 +28,8 @@ using PagedKeyLoader = SparseIndexer::Common::Block::PagedKeyLoader<
 using BlockMmad = SparseIndexer::Common::Block::BlockMmad<QkDtype, QkDtype, PagedKeyLoader>;
 using BlockReduceHead = BlockReduceQuantHead<>;
 using BlockTopK = SparseIndexer::Common::Block::BlockTopK<float, int32_t>;
-using Kernel = QuantLightningIndexerKernel<BlockScheduler, BlockMmad, BlockReduceHead, BlockTopK>;
+using BlockTopKVector = SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>;
+using Kernel = QuantLightningIndexerKernel<BlockScheduler, BlockMmad, BlockReduceHead, BlockTopK, BlockTopKVector>;
 
 CATLASS_DEVICE inline void RunKernel(
     GM_ADDR query, GM_ADDR key, GM_ADDR weights, GM_ADDR qScale, GM_ADDR kScale, GM_ADDR blockTable,
