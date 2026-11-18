@@ -19,6 +19,77 @@
 
 namespace SparseIndexer::Common::Block {
 
+namespace Reg = AscendC::Reg;
+using AscendC::CMPMODE;
+using AscendC::RoundMode;
+
+__simd_vf__ void Bf16KeysToSortableVF(__ubuf__ uint16_t *keys, uint32_t visibleLen, uint32_t paddedLen)
+{
+    constexpr uint32_t kKeysPerBlock = 128;
+    Reg::MaskReg maskAllB16 = Reg::CreateMask<uint16_t, Reg::MaskPattern::ALL>();
+    Reg::MaskReg validMask;
+    Reg::MaskReg invalidMask;
+    Reg::RegTensor<uint16_t> bf16Bits;
+    Reg::RegTensor<uint16_t> keyReg;
+    Reg::RegTensor<uint16_t> zeroReg;
+    Reg::RegTensor<int16_t> laneIdx;
+    liV2TopkCommon::Bf16SortConstCtx ctx;
+    liV2TopkCommon::InitBf16SortConstCtx(ctx, maskAllB16);
+    Reg::Duplicate(zeroReg, static_cast<uint16_t>(0), maskAllB16);
+
+    for (uint32_t off = 0; off < paddedLen; off += kKeysPerBlock) {
+        Reg::LoadAlign<uint16_t, Reg::LoadDist::DIST_NORM>(bf16Bits, keys + off);
+        liV2TopkCommon::Bf16ToSortableKey(keyReg, (Reg::RegTensor<bfloat16_t> &)bf16Bits, ctx, maskAllB16);
+        Reg::Arange(laneIdx, static_cast<int16_t>(off));
+        Reg::Compares<int16_t, CMPMODE::LT>(validMask, laneIdx, static_cast<int16_t>(visibleLen), maskAllB16);
+        Reg::Not(invalidMask, validMask, maskAllB16);
+        Reg::Select(keyReg, zeroReg, keyReg, invalidMask);
+        Reg::StoreAlign<uint16_t, Reg::StoreDist::DIST_NORM>(keys + off, keyReg, maskAllB16);
+    }
+}
+
+__simd_vf__ void BuildPrefixIndexVF(__ubuf__ uint16_t *indices, uint32_t visibleLen, uint32_t topK)
+{
+    constexpr uint32_t kU16Lanes = 128;
+    Reg::MaskReg maskAllB16 = Reg::CreateMask<uint16_t, Reg::MaskPattern::ALL>();
+    Reg::MaskReg validMask;
+    Reg::RegTensor<int16_t> laneIdx;
+    Reg::RegTensor<uint16_t> indexReg;
+    Reg::RegTensor<uint16_t> sentinel;
+    Reg::Duplicate(sentinel, static_cast<uint16_t>(0xffff), maskAllB16);
+
+    const uint32_t paddedTopK = SparseIndexer::Common::AlignUp(topK, kU16Lanes);
+    for (uint32_t off = 0; off < paddedTopK; off += kU16Lanes) {
+        Reg::Arange(laneIdx, static_cast<int16_t>(off));
+        Reg::Compares<int16_t, CMPMODE::LT>(validMask, laneIdx, static_cast<int16_t>(visibleLen), maskAllB16);
+        Reg::Select(indexReg, (Reg::RegTensor<uint16_t> &)laneIdx, sentinel, validMask);
+        Reg::StoreAlign<uint16_t, Reg::StoreDist::DIST_NORM>(indices + off, indexReg, maskAllB16);
+    }
+}
+
+__simd_vf__ void FinalizeIndexVF(__ubuf__ int32_t *out, __ubuf__ uint16_t *indices, uint32_t validLen,
+                                 uint32_t topK, int32_t base)
+{
+    Reg::MaskReg maskAllB32 = Reg::CreateMask<uint32_t, Reg::MaskPattern::ALL>();
+    Reg::MaskReg validMask;
+    Reg::RegTensor<uint16_t> index16;
+    Reg::RegTensor<uint32_t> index32;
+    Reg::RegTensor<int32_t> result;
+    Reg::RegTensor<int32_t> negativeOne;
+    Reg::Duplicate(negativeOne, static_cast<int32_t>(-1), maskAllB32);
+
+    const uint32_t topKBlocks = SparseIndexer::Common::CeilDiv(topK, 64U);
+    for (uint32_t block = 0; block < topKBlocks; ++block) {
+        const uint32_t off = block * 64U;
+        Reg::LoadAlign<uint16_t, Reg::LoadDist::DIST_UNPACK_B16>(index16, indices + off);
+        index32 = (Reg::RegTensor<uint32_t> &)index16;
+        Reg::Compares<uint32_t, CMPMODE::LT>(validMask, index32, validLen, maskAllB32);
+        Reg::Adds(index32, index32, static_cast<uint32_t>(base), maskAllB32);
+        Reg::Select(result, (Reg::RegTensor<int32_t> &)index32, negativeOne, validMask);
+        Reg::StoreAlign<int32_t, Reg::StoreDist::DIST_NORM>(out + off, result, maskAllB32);
+    }
+}
+
 template <class DtypeScore_, class DtypeOut_>
 class BlockTopKVector {
 public:
@@ -57,7 +128,8 @@ public:
         scoreUb_ = resource.ubBuf.template GetBufferByByte<DtypeScore>(byteOffset);
         byteOffset += SparseIndexer::Common::AlignUp(tileColAlign_ * sizeof(DtypeScore), 256U);
         inputUb_ = resource.ubBuf.template GetBufferByByte<uint16_t>(byteOffset);
-        byteOffset += SparseIndexer::Common::AlignUp(tileColAlign_ * sizeof(uint16_t), 256U);
+        const uint32_t inputCols = AscendC::Std::max(tileColAlign_, topKAlign_);
+        byteOffset += SparseIndexer::Common::AlignUp(inputCols * sizeof(uint16_t), 256U);
         outIdxUb_ = resource.ubBuf.template GetBufferByByte<uint32_t>(byteOffset);
         byteOffset += outWords * sizeof(uint32_t);
         outValueUb_ = resource.ubBuf.template GetBufferByByte<uint16_t>(byteOffset);
@@ -96,7 +168,6 @@ public:
             return;
         }
         const uint32_t rowCount = AscendC::Std::min(rowsPerSub, actualS1 - rowBegin);
-        const uint32_t alignedLen = SparseIndexer::Common::AlignUp(kLen, 256U);
 
         AscendC::DataCopyExtParams copyIn{1, 0, 0, 0, 0};
         AscendC::DataCopyExtParams copyOut{1, static_cast<uint32_t>(topK_ * sizeof(DtypeOut)), 0, 0, 0};
@@ -106,71 +177,30 @@ public:
             const uint32_t s1Row = s1Start + rowBegin + ri;
             const uint32_t visibleLen = VisibleLen(localQStart + rowBegin + ri, qLen, requestKLen, residual);
             if (visibleLen < topK_) {
-                AscendC::CreateVecIndex(outIdx, static_cast<DtypeOut>(kStart), topK_);
+                BuildPrefixIndexVF((__ubuf__ uint16_t *)tmpIndex_.GetPhyAddr(), visibleLen, topK_);
+            } else {
+                copyIn.blockLen = kLen * sizeof(DtypeScore);
+                AscendC::DataCopyPadExtParams<DtypeScore> padParams{false, 0, 0, static_cast<DtypeScore>(0)};
+                AscendC::DataCopyPad(scoreUb_, gmScores_[s1Row * s2Stride_ + kStart], copyIn, padParams);
+                AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
                 AscendC::PipeBarrier<PIPE_V>();
-                // Duplicate requires a 256B-aligned destination. Fill at most the
-                // first 64-element head with scalar stores, then vector-fill the
-                // aligned remainder.
-                const uint32_t tailVecStart = SparseIndexer::Common::AlignUp(visibleLen, 64U);
-                const uint32_t scalarTailEnd = AscendC::Std::min(tailVecStart, topK_);
-                for (uint32_t i = visibleLen; i < scalarTailEnd; ++i) {
-                    outIdx.SetValue(i, static_cast<DtypeOut>(-1));
-                }
-                if (tailVecStart < topK_) {
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Duplicate(
-                        outIdx[tailVecStart], static_cast<DtypeOut>(-1), topK_ - tailVecStart);
-                }
-                storeRow(outIdx, s1Row, copyOut);
-                continue;
-            }
-            if (kLen == 0) {
-                AscendC::Duplicate(outIdx, static_cast<DtypeOut>(-1), topK_);
-                storeRow(outIdx, s1Row, copyOut);
-                continue;
-            }
 
-            copyIn.blockLen = kLen * sizeof(DtypeScore);
-            AscendC::DataCopyPadExtParams<DtypeScore> padParams{false, 0, 0, static_cast<DtypeScore>(0)};
-            AscendC::DataCopyPad(scoreUb_, gmScores_[s1Row * s2Stride_ + kStart], copyIn, padParams);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            AscendC::PipeBarrier<PIPE_V>();
-
-            uint32_t finiteLen = 0;
-            for (uint32_t i = 0; i < kLen; ++i) {
-                const float value = scoreUb_.GetValue(i);
-                if (!IsNegInfFloat(value)) {
-                    ++finiteLen;
-                }
-            }
-
-            if (finiteLen >= topK_) {
-                for (uint32_t i = 0; i < kLen; ++i) {
-                    const float value = scoreUb_.GetValue(i);
-                    inputUb_.SetValue(i, IsNegInfFloat(value) ? 0U : FloatToSortableU16(value));
-                }
-                for (uint32_t i = kLen; i < alignedLen; ++i) {
-                    inputUb_.SetValue(i, 0U);
-                }
+                const uint32_t paddedLen =
+                    SparseIndexer::Common::AlignUp(AscendC::Std::max(visibleLen, topK_), 256U);
+                AscendC::Cast(inputUb_.template ReinterpretCast<bfloat16_t>(), scoreUb_, RoundMode::CAST_RINT,
+                    paddedLen);
+                AscendC::PipeBarrier<PIPE_V>();
+                Bf16KeysToSortableVF((__ubuf__ uint16_t *)inputUb_.GetPhyAddr(), visibleLen, paddedLen);
                 AscendC::PipeBarrier<PIPE_V>();
                 topkb16gather::LiTopKVF<false>(tmpIndex_, outValueUb_, inputUb_, hist_, idxHigh_, idxLow_, nk_, topK_,
-                    alignedLen);
-                AscendC::PipeBarrier<PIPE_V>();
-                for (uint32_t i = 0; i < topK_; ++i) {
-                    outIdx.SetValue(i, static_cast<DtypeOut>(tmpIndex_.GetValue(i)));
-                }
-                liV2TopkCommon::IndicesAddOffset(outIdxUb_, kStart, topK_);
+                    paddedLen);
             }
 
             int32_t rowOff = hasOutputIdxOffset_ ? gmOutputIdxOffset_.GetValue(s1Row) : 0;
-            if (rowOff != 0) {
-                for (uint32_t i = 0; i < topK_; ++i) {
-                    if (outIdx.GetValue(i) >= 0) {
-                        outIdx.SetValue(i, outIdx.GetValue(i) + rowOff);
-                    }
-                }
-            }
+            AscendC::PipeBarrier<PIPE_V>();
+            FinalizeIndexVF((__ubuf__ int32_t *)outIdx.GetPhyAddr(), (__ubuf__ uint16_t *)tmpIndex_.GetPhyAddr(),
+                visibleLen, topK_, static_cast<int32_t>(kStart) + rowOff);
             storeRow(outIdx, s1Row, copyOut);
         }
     }
@@ -183,18 +213,6 @@ private:
         const uint32_t bytes2 = (alignedTopK + trunkLen) * sizeof(uint16_t);
         const uint32_t reuse = alignedTopK * sizeof(uint32_t);
         return bytes1 + bytes2 - reuse;
-    }
-
-    CATLASS_DEVICE static uint16_t FloatToSortableU16(float value)
-    {
-        union {
-            float f;
-            uint32_t u;
-        } bits;
-        bits.f = value;
-        const uint32_t lsb = (bits.u >> 16U) & 1U;
-        uint16_t bf = static_cast<uint16_t>((bits.u + 0x7fffu + lsb) >> 16U);
-        return (bf & 0x8000U) ? static_cast<uint16_t>(~bf) : static_cast<uint16_t>(bf ^ 0x8000U);
     }
 
     CATLASS_DEVICE void storeRow(AscendC::LocalTensor<DtypeOut> const& outIdx,

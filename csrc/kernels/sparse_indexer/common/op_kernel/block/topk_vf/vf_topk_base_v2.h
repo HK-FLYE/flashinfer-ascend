@@ -29,6 +29,39 @@ using AscendC::CMPMODE;
 using AscendC::LocalTensor;
 using AscendC::RoundMode;
 
+struct Bf16SortConstCtx {
+    Reg::RegTensor<uint16_t> zeros;
+    Reg::RegTensor<uint16_t> allOne;
+    Reg::RegTensor<uint16_t> signMask;
+    Reg::RegTensor<uint16_t> nan;
+};
+
+__simd_callee__ inline void InitBf16SortConstCtx(Bf16SortConstCtx &ctx, Reg::MaskReg &maskAll)
+{
+    Reg::Duplicate(ctx.zeros, static_cast<uint16_t>(0x0000), maskAll);
+    Reg::Duplicate(ctx.allOne, static_cast<uint16_t>(0xffff), maskAll);
+    Reg::Duplicate(ctx.signMask, static_cast<uint16_t>(0x8000), maskAll);
+    Reg::Duplicate(ctx.nan, static_cast<uint16_t>(0x7fc0), maskAll);
+}
+
+__simd_callee__ inline void Bf16ToSortableKey(Reg::RegTensor<uint16_t> &outKey,
+                                               Reg::RegTensor<bfloat16_t> &inVal, Bf16SortConstCtx &ctx,
+                                               Reg::MaskReg &maskAll)
+{
+    Reg::RegTensor<uint16_t> regTemp;
+    Reg::RegTensor<uint16_t> regMask;
+    Reg::MaskReg selectNan;
+    Reg::MaskReg selectSign;
+    auto &inBits = (Reg::RegTensor<uint16_t> &)inVal;
+
+    Reg::Compare<uint16_t, CMPMODE::EQ>(selectNan, inBits, ctx.nan, maskAll);
+    Reg::Select(outKey, ctx.allOne, inBits, selectNan);
+    Reg::And(regTemp, outKey, ctx.signMask, maskAll);
+    Reg::Compare<uint16_t, CMPMODE::GT>(selectSign, regTemp, ctx.zeros, maskAll);
+    Reg::Select(regMask, ctx.allOne, ctx.signMask, selectSign);
+    Reg::Xor(outKey, outKey, regMask, maskAll);
+}
+
 __simd_callee__ inline void StoreHistogramResult(__ubuf__ uint32_t *histogramsBuf, Reg::RegTensor<uint16_t> &cout0,
                                                  Reg::RegTensor<uint16_t> &cout1, Reg::MaskReg &pregB16,
                                                  Reg::MaskReg &pregB32)
