@@ -121,7 +121,7 @@ public:
         if ASCEND_IS_AIV {
             AscendC::GlobalTensor<int32_t> dummyOffset;
             SparseIndexer::Common::Block::ScheduleCoord coord{};
-            if (tiling->returnValue == 0 && tiling->topk == 2048 && tiling->maxSeqLenK < tiling->topk) {
+            if (tiling->returnValue == 0) {
                 typename BlockTopKVector::Params params{};
                 params.topK = tiling->topk;
                 params.s2Stride = tiling->maxSeqLenK;

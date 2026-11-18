@@ -357,6 +357,94 @@ def golden(
     return indices, values
 
 
+def qli_v2_raw_golden(
+    torch,
+    query,
+    key,
+    weights,
+    query_dequant_scale,
+    key_dequant_scale,
+    topk,
+    *,
+    quant_mode=1,
+    layout_q="TND",
+    layout_k="PA_BBND",
+    mask_mode=3,
+    cmp_ratio=4,
+    max_seq_len_k=0,
+    cu_seqlens_q=None,
+    seqused_k=None,
+    cmp_residual_k=None,
+    block_table=None,
+    return_value=0,
+):
+    """CPU model of QLIv2 raw threshold/filter slot order.
+
+    QLIv2 first returns indices whose BF16 sortable key is above the k-th
+    threshold in input order, then fills the remaining slots from the equal-key
+    group. When the visible prefix is shorter than topk it returns that prefix
+    directly. This is intentionally separate from ``golden``, which stays a
+    stable score-descending semantic oracle for CPU unit tests.
+    """
+    if quant_mode != 1 or layout_q != "TND" or layout_k != "PA_BBND":
+        raise NotImplementedError("QLIv2 raw golden currently covers the first grid only")
+    if block_table is None or seqused_k is None or cu_seqlens_q is None:
+        raise ValueError("first-grid golden requires cu_seqlens_q, seqused_k and block_table")
+
+    q = query.cpu()
+    w = weights.float().cpu()
+    qs = query_dequant_scale.float().cpu()
+    pages = key.cpu()
+    ks = key_dequant_scale.cpu()
+    table = block_table.cpu()
+    used = seqused_k.cpu()
+    residual = cmp_residual_k.cpu().tolist() if cmp_residual_k is not None else [0] * table.shape[0]
+    ql = cu_seqlens_q.cpu().tolist()
+    logical_k, logical_s = _gather_paged(torch, pages, ks, table, used, max_seq_len_k)
+
+    rows_i = []
+    rows_v = []
+    for batch in range(len(ql) - 1):
+        q0, q1 = ql[batch], ql[batch + 1]
+        q_len = q1 - q0
+        score = _reduce_quant(
+            torch, q[q0:q1], logical_k[batch], w[q0:q1], qs[q0:q1], logical_s[batch]
+        )
+        _apply_mask(
+            torch,
+            score,
+            q_len,
+            int(used[batch]),
+            mask_mode=mask_mode,
+            cmp_ratio=cmp_ratio,
+            residual=residual[batch],
+        )
+        for local_q in range(q_len):
+            visible = _mask3_visible_len(
+                local_q, q_len, int(used[batch]), cmp_ratio, residual[batch]
+            )
+            row = torch.full((topk,), -1, dtype=torch.int32)
+            if visible < topk:
+                if visible:
+                    row[:visible] = torch.arange(visible, dtype=torch.int32)
+            else:
+                keys = score[local_q, :visible].to(torch.bfloat16).float()
+                threshold = torch.sort(keys, descending=True).values[topk - 1]
+                gt = torch.nonzero(keys > threshold, as_tuple=False).flatten()
+                eq = torch.nonzero(keys == threshold, as_tuple=False).flatten()
+                selected = torch.cat((gt, eq[: topk - gt.numel()])).to(torch.int32)
+                row[: selected.numel()] = selected
+            rows_i.append(row.unsqueeze(0))
+            if return_value:
+                safe = row.long().clamp_min(0)
+                vals = score[local_q].gather(0, safe).to(torch.bfloat16)
+                rows_v.append(vals.masked_fill(row < 0, float("-inf")).unsqueeze(0))
+
+    indices = torch.stack(rows_i)
+    values = torch.stack(rows_v) if return_value else torch.empty((0,), dtype=torch.bfloat16)
+    return indices, values
+
+
 def _as_noncontig_page_axis(torch, pages_tensor):
     """Return a [::2] view so dim-0 (page) is non-contiguous; other axes stay dense."""
     pages = pages_tensor.shape[0]
@@ -481,18 +569,7 @@ def sample(torch, torch_npu, **configuration):
     cfg = dict(configuration or {})
     preserve = bool(cfg.get("noncontig_page_axis"))
     tensors = make_cpu_inputs(torch, cfg or None)
-    expected = golden(torch, **tensors)
-    # The vector QLIv2-style path returns the visible prefix in its original
-    # index order when topk exceeds the maximum K. Its semantic content matches
-    # the sorted CPU golden after value re-sort.
-    if int(tensors["topk"]) == 2048 and int(tensors["max_seq_len_k"]) < 2048:
-        raw_indices = []
-        for row in expected[0][:, 0, :]:
-            valid = int((row >= 0).sum())
-            raw = torch.full_like(row, -1)
-            raw[:valid] = torch.arange(valid, dtype=raw.dtype)
-            raw_indices.append(raw.unsqueeze(0))
-        expected = (torch.stack(raw_indices), expected[1])
+    expected = qli_v2_raw_golden(torch, **tensors)
 
     def to_device(value):
         if not hasattr(value, "device"):

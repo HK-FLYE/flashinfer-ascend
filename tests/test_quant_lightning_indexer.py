@@ -18,6 +18,7 @@ from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import (
     golden,
     make_cpu_inputs,
     qli_v2_oracle,
+    qli_v2_raw_golden,
 )
 from flashinfer.operators.sparse_indexer.quant_lightning_indexer.operator import OPERATOR
 
@@ -312,6 +313,19 @@ def test_cpu_golden_is_deterministic():
     assert torch.equal(ia, ib)
 
 
+@pytest.mark.parametrize("case", CASE_PARAMETERS, ids=lambda c: c["name"])
+def test_qli_v2_raw_golden_preserves_semantics(case):
+    tensors = make_cpu_inputs(torch, case)
+    raw, _ = qli_v2_raw_golden(torch, **tensors)
+    ordered, _ = golden(torch, **tensors)
+    assert raw.shape == ordered.shape
+    assert torch.equal(raw < 0, ordered < 0)
+    for raw_row, ordered_row in zip(raw[:, 0, :], ordered[:, 0, :]):
+        assert sorted(raw_row[raw_row >= 0].tolist()) == sorted(
+            ordered_row[ordered_row >= 0].tolist()
+        )
+
+
 def test_mask3_visible_len_formula():
     # q_len=8, k_act=48, cmp=4, residual=0, local_q=7 → floor((192-8+7+1)/4)=48
     assert _mask3_visible_len(7, 8, 48, 4, 0) == 48
@@ -489,7 +503,7 @@ def test_npu_rejects_non_dense_pa_inner_axis():
 
 @pytest.mark.real_compile
 def test_smoke_tiny_matches_qli_v2_score_order():
-    """NPU + CPU golden vs QLIv2 after value-resort (ops-transformer protocol).
+    """NPU matches QLIv2 raw slots and remains equal after value-resort.
 
     Single process: run our kernel *before* cann_ops_transformer. Their JIT
     extension links with our AOT ``op_api`` search path and can break a later
@@ -510,15 +524,16 @@ def test_smoke_tiny_matches_qli_v2_score_order():
     args, options, _ = sample(torch, torch_npu, **case)
     out_idx, _ = flashinfer.quant_lightning_indexer(*args, **options)
     tensors = make_cpu_inputs(torch, case)
-    expected, _ = golden(torch, **tensors)
-    assert torch.equal(out_idx.cpu(), expected), (out_idx.cpu(), expected)
+    expected_raw, _ = qli_v2_raw_golden(torch, **tensors)
+    assert torch.equal(out_idx.cpu(), expected_raw), (out_idx.cpu(), expected_raw)
 
     raw, _ = qli_v2_oracle(torch, tensors)
-    # Raw device slot order is not score-sorted (documented, not a pass criterion).
-    assert not torch.equal(raw, expected), (raw, expected)
+    assert torch.equal(raw, expected_raw), (raw, expected_raw)
+    expected, _ = golden(torch, **tensors)
     ordered = _qli_v2_indices_sorted_by_values(torch, tensors)
     assert torch.equal(ordered.to(expected.dtype), expected), (ordered, expected)
-    assert torch.equal(out_idx.cpu().to(ordered.dtype), ordered.cpu()), (
-        out_idx.cpu(),
-        ordered.cpu(),
-    )
+    ref, values = qli_v2_oracle(torch, {**tensors, "return_value": 1})
+    assert torch.equal(ref, raw), (ref, raw)
+    _, order = values.float().sort(dim=-1, descending=True)
+    ours_ordered = torch.gather(out_idx.cpu(), dim=-1, index=order)
+    assert torch.equal(ours_ordered.to(expected.dtype), expected), (ours_ordered, expected)
