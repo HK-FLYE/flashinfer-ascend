@@ -112,6 +112,14 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     if (s1Tile == 0) {
         throw std::invalid_argument("QuantLightningIndexerTiling: s1Tile is zero under resource limits");
     }
+    // The 2D qTile x s2Tile scheduler must produce enough independent reduce
+    // tasks. Resource-max s1Tile collapses short-K requests onto one or two
+    // AIC blocks. Eight rows is the smallest block that passes the current
+    // matrix anchors; the four-row SPLIT_M path remains a separate follow-up.
+    constexpr uint32_t kS1TileCap = 8;
+    if (s1Tile > kS1TileCap) {
+        s1Tile = kS1TileCap;
+    }
     tilingData.s1Tile = s1Tile;
     tilingData.s2Tile = s2Tile;
     tilingData.topkS2Tile = SparseIndexer::Common::AlignUp(

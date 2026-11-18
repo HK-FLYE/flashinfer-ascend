@@ -33,8 +33,11 @@ __simd_vf__ void ScaleHeadRowVF(__ubuf__ float *out, __ubuf__ float *score, __ub
     Reg::RegTensor<float> scale;
 
     Reg::Duplicate(sum, 0.0f, mask);
+    Reg::UnalignRegForLoad qkLoad;
     for (uint32_t head = 0; head < n1; ++head) {
-        Reg::LoadAlign<float>(qk, score + head * headStride);
+        auto qkSrc = score + head * headStride;
+        Reg::LoadUnAlignPre(qkLoad, qkSrc);
+        Reg::LoadUnAlign(qk, qkLoad, qkSrc);
         Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight + head);
         Reg::Relu(qk, qk, mask);
         Reg::MulAddDst(sum, qk, w, mask);
@@ -116,26 +119,6 @@ public:
     CATLASS_DEVICE
     void ScaleHeadVF(uint32_t actualS1, uint32_t colPerAiv, uint32_t cols)
     {
-        if (colPerAiv % 64U != 0U) {
-            // Unaligned tail tiles cannot use Reg::LoadAlign. Keep an explicit
-            // scalar fallback so these small S2 slices preserve FP32 semantics.
-            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID1);
-            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID1);
-            for (uint32_t row = 0; row < actualS1; ++row) {
-                for (uint32_t col = 0; col < cols; ++col) {
-                    float sum = 0.0f;
-                    for (uint32_t head = 0; head < n1_; ++head) {
-                        const float value = ubScore_.GetValue((row * n1_ + head) * colPerAiv + col);
-                        sum += (value > 0.0f ? value : 0.0f) * ubW_.GetValue(row * wStride_ + head);
-                    }
-                    ubOut_.SetValue(row * colPerAiv + col, sum * ubKScale_.GetValue(col));
-                }
-            }
-            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
-            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
-            AscendC::PipeBarrier<PIPE_V>();
-            return;
-        }
         constexpr uint32_t kBlockFloats = 64;
         for (uint32_t row = 0; row < actualS1; ++row) {
             for (uint32_t off = 0; off < cols; off += kBlockFloats) {
@@ -179,23 +162,36 @@ public:
         AscendC::Mul(ubW_, ubWIn_, ubQScaleIn_, alignedS1 * wStride_);
         AscendC::PipeBarrier<PIPE_V>();
 
-        // Gather PA key scales for this vector's S2 slice, then Mul into scores.
-        for (uint32_t col = 0; col < cols; ++col) {
-            const uint32_t tok = s2Start + colBegin + col;
-            const uint32_t block = params_.blockSize == 0 ? 0U : (tok / params_.blockSize);
-            const uint32_t off = params_.blockSize == 0 ? 0U : (tok % params_.blockSize);
+        // Gather PA key scales per page segment. Only the page-id lookup is
+        // scalar; the scale payload stays on the MTE2 path and is never copied
+        // element-by-element through GetValue/SetValue.
+        uint32_t localCol = 0;
+        while (localCol < cols) {
+            const uint32_t tok = s2Start + colBegin + localCol;
+            const uint32_t block = tok / params_.blockSize;
+            const uint32_t off = tok % params_.blockSize;
+            const uint32_t segCols = AscendC::Std::min(cols - localCol, params_.blockSize - off);
             int32_t page = -1;
             if (block < params_.maxBlocksPerBatch) {
                 page = gmBlockTable_.GetValue(
                     static_cast<int64_t>(batchIdx) * params_.maxBlocksPerBatch + block);
             }
-            const float kScale =
-                (page >= 0 && static_cast<uint32_t>(page) < params_.numPages)
-                    ? gmKScale_.GetValue(
-                          static_cast<uint32_t>(page) * params_.kScaleStride0 + off)
-                    : 0.0f;
-            ubKScale_.SetValue(col, kScale);
+            if (page >= 0 && static_cast<uint32_t>(page) < params_.numPages) {
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
+                AscendC::DataCopyExtParams copyIn{
+                    1, static_cast<uint32_t>(segCols * sizeof(float)), 0, 0, 0};
+                AscendC::DataCopyPadExtParams<float> pad{false, 0, 0, 0.0f};
+                AscendC::DataCopyPad(
+                    ubKScale_[localCol],
+                    gmKScale_[static_cast<uint32_t>(page) * params_.kScaleStride0 + off], copyIn, pad);
+            } else {
+                AscendC::Duplicate(ubKScale_[localCol], 0.0f, segCols);
+            }
+            localCol += segCols;
         }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
         AscendC::PipeBarrier<PIPE_V>();
         ScaleHeadVF(actualS1, colPerAiv, cols);
 
