@@ -107,16 +107,25 @@ public:
             const uint32_t visibleLen = VisibleLen(localQStart + rowBegin + ri, qLen, requestKLen, residual);
             if (visibleLen < topK_) {
                 AscendC::CreateVecIndex(outIdx, static_cast<DtypeOut>(kStart), topK_);
-                for (uint32_t i = visibleLen; i < topK_; ++i) {
+                AscendC::PipeBarrier<PIPE_V>();
+                // Duplicate requires a 256B-aligned destination. Fill at most the
+                // first 64-element head with scalar stores, then vector-fill the
+                // aligned remainder.
+                const uint32_t tailVecStart = SparseIndexer::Common::AlignUp(visibleLen, 64U);
+                const uint32_t scalarTailEnd = AscendC::Std::min(tailVecStart, topK_);
+                for (uint32_t i = visibleLen; i < scalarTailEnd; ++i) {
                     outIdx.SetValue(i, static_cast<DtypeOut>(-1));
+                }
+                if (tailVecStart < topK_) {
+                    AscendC::PipeBarrier<PIPE_V>();
+                    AscendC::Duplicate(
+                        outIdx[tailVecStart], static_cast<DtypeOut>(-1), topK_ - tailVecStart);
                 }
                 storeRow(outIdx, s1Row, copyOut);
                 continue;
             }
             if (kLen == 0) {
-                for (uint32_t i = 0; i < topK_; ++i) {
-                    outIdx.SetValue(i, static_cast<DtypeOut>(-1));
-                }
+                AscendC::Duplicate(outIdx, static_cast<DtypeOut>(-1), topK_);
                 storeRow(outIdx, s1Row, copyOut);
                 continue;
             }
@@ -191,6 +200,8 @@ private:
     CATLASS_DEVICE void storeRow(AscendC::LocalTensor<DtypeOut> const& outIdx,
         uint32_t s1Row, AscendC::DataCopyExtParams const& copyOut)
     {
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
         AscendC::DataCopyPad(gmOut_[s1Row * topK_], outIdx, copyOut);

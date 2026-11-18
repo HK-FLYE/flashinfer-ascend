@@ -21,6 +21,29 @@
 
 namespace QuantLightningIndexerKernelDetail {
 
+namespace Reg = AscendC::Reg;
+
+__simd_vf__ void ScaleHeadRowVF(__ubuf__ float *out, __ubuf__ float *score, __ubuf__ float *weight,
+                                __ubuf__ float *kScale, uint32_t n1, uint32_t headStride, uint32_t cols)
+{
+    Reg::MaskReg mask = Reg::UpdateMask<float>(cols);
+    Reg::RegTensor<float> sum;
+    Reg::RegTensor<float> qk;
+    Reg::RegTensor<float> w;
+    Reg::RegTensor<float> scale;
+
+    Reg::Duplicate(sum, 0.0f, mask);
+    for (uint32_t head = 0; head < n1; ++head) {
+        Reg::LoadAlign<float>(qk, score + head * headStride);
+        Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight + head);
+        Reg::Relu(qk, qk, mask);
+        Reg::MulAddDst(sum, qk, w, mask);
+    }
+    Reg::LoadAlign<float>(scale, kScale);
+    Reg::Mul(sum, sum, scale, mask);
+    Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM>(out, sum, mask);
+}
+
 template <class MaskPolicy_ = SparseIndexer::Common::Block::LiV2MaskPolicy<float>>
 class BlockReduceQuantHead {
 public:
@@ -79,101 +102,51 @@ public:
         offset += s1Tile_ * wStride_ * sizeof(float);
         ubQScaleIn_ = resource.ubBuf.template GetBufferByByte<float>(offset);
         offset += s1Tile_ * wStride_ * sizeof(float);
-        ubWCol_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += s1Tile_ * sizeof(float);
+        offset = SparseIndexer::Common::AlignUp(offset, 32U);
         ubWBrcb_ = resource.ubBuf.template GetBufferByByte<float>(offset);
         offset += s1Tile_ * kFloatBlock * sizeof(float);
-        // ScaleHead's non-first-head path writes up to s1Tile * kFloatVec temps.
+        // MaskPolicy uses up to s1Tile * kFloatVec temporary floats.
+        offset = SparseIndexer::Common::AlignUp(offset, 32U);
         ubTmp_ = resource.ubBuf.template GetBufferByByte<float>(offset);
         offset += s1Tile_ * kFloatVec * sizeof(float);
+        offset = SparseIndexer::Common::AlignUp(offset, 256U);
         ubKScale_ = resource.ubBuf.template GetBufferByByte<float>(offset);
     }
 
     CATLASS_DEVICE
-    void ScaleHead(uint32_t head, uint32_t actualS1, uint32_t colPerAiv, uint32_t cols, bool first)
+    void ScaleHeadVF(uint32_t actualS1, uint32_t colPerAiv, uint32_t cols)
     {
-        uint32_t dstRep = colPerAiv / kFloatBlock;
-        uint32_t srcRep = n1_ * colPerAiv / kFloatBlock;
-        // srcRep = n1*colPerAiv/8; when it exceeds 255 the multi-row vector
-        // path is illegal. Prefer per-token Muls/Add over Axpy (Axpy on this
-        // path diverged from CPU golden for n1=64 / colPerAiv=32).
-        if (dstRep > kMaxRepeat || srcRep > kMaxRepeat) {
-            for (uint32_t token = 0; token < actualS1; ++token) {
-                auto score = ubScore_[(token * n1_ + head) * colPerAiv];
-                auto out = ubOut_[token * colPerAiv];
-                float weight = ubW_.GetValue(token * wStride_ + head);
-                if (first) {
-                    AscendC::Muls(out, score, weight, cols);
-                } else {
-                    AscendC::Muls(ubTmp_, score, weight, cols);
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add(out, out, ubTmp_, cols);
+        if (colPerAiv % 64U != 0U) {
+            // Unaligned tail tiles cannot use Reg::LoadAlign. Keep an explicit
+            // scalar fallback so these small S2 slices preserve FP32 semantics.
+            AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID1);
+            AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID1);
+            for (uint32_t row = 0; row < actualS1; ++row) {
+                for (uint32_t col = 0; col < cols; ++col) {
+                    float sum = 0.0f;
+                    for (uint32_t head = 0; head < n1_; ++head) {
+                        const float value = ubScore_.GetValue((row * n1_ + head) * colPerAiv + col);
+                        sum += (value > 0.0f ? value : 0.0f) * ubW_.GetValue(row * wStride_ + head);
+                    }
+                    ubOut_.SetValue(row * colPerAiv + col, sum * ubKScale_.GetValue(col));
                 }
             }
+            AscendC::SetFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
+            AscendC::WaitFlag<AscendC::HardEvent::S_V>(EVENT_ID1);
             AscendC::PipeBarrier<PIPE_V>();
             return;
         }
-
-        uint32_t packed = SparseIndexer::Common::AlignUp(actualS1, kFloatBlock);
-        for (uint32_t token = 0; token < actualS1; ++token) {
-            ubWCol_.SetValue(token, ubW_.GetValue(token * wStride_ + head));
-        }
-        for (uint32_t token = actualS1; token < packed; ++token) {
-            ubWCol_.SetValue(token, 0.0f);
-        }
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Brcb(
-            ubWBrcb_.template ReinterpretCast<uint32_t>(), ubWCol_.template ReinterpretCast<uint32_t>(),
-            packed / kFloatBlock, AscendC::BrcbRepeatParams(1, 8));
-        AscendC::PipeBarrier<PIPE_V>();
-
-        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
-        for (uint32_t rowBase = 0; rowBase < actualS1; rowBase += kMaxRepeat) {
-            uint32_t rows = AscendC::Std::min(actualS1 - rowBase, kMaxRepeat);
-            auto out = ubOut_[rowBase * colPerAiv];
-            auto score = ubScore_[(rowBase * n1_ + head) * colPerAiv];
-            auto scale = ubWBrcb_[rowBase * kFloatBlock];
-            uint32_t full = cols / kFloatVec;
-            uint32_t remain = cols % kFloatVec;
-            for (uint32_t chunk = 0; chunk < full; ++chunk) {
-                uint32_t off = chunk * kFloatVec;
-                if (first) {
-                    AscendC::Mul<float, false>(
-                        out[off], score[off], scale, (uint64_t)0, rows,
-                        AscendC::BinaryRepeatParams(1, 1, 0, dstRep, srcRep, 1));
-                } else {
-                    AscendC::Mul<float, false>(
-                        ubTmp_, score[off], scale, (uint64_t)0, rows,
-                        AscendC::BinaryRepeatParams(1, 1, 0, kFloatVec / kFloatBlock, srcRep, 1));
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add<float, false>(
-                        out[off], out[off], ubTmp_, (uint64_t)0, rows,
-                        AscendC::BinaryRepeatParams(1, 1, 1, dstRep, dstRep, kFloatVec / kFloatBlock));
-                }
-            }
-            if (remain != 0) {
-                uint64_t mask = 0;
-                for (uint32_t bit = 0; bit < remain; ++bit) {
-                    mask |= (uint64_t)1 << bit;
-                }
-                AscendC::SetVectorMask<int8_t>(0x0, mask);
-                uint32_t off = full * kFloatVec;
-                if (first) {
-                    AscendC::Mul<float, false>(
-                        out[off], score[off], scale, (uint64_t)0, rows,
-                        AscendC::BinaryRepeatParams(1, 1, 0, dstRep, srcRep, 1));
-                } else {
-                    AscendC::Mul<float, false>(
-                        ubTmp_, score[off], scale, (uint64_t)0, rows,
-                        AscendC::BinaryRepeatParams(1, 1, 0, kFloatVec / kFloatBlock, srcRep, 1));
-                    AscendC::PipeBarrier<PIPE_V>();
-                    AscendC::Add<float, false>(
-                        out[off], out[off], ubTmp_, (uint64_t)0, rows,
-                        AscendC::BinaryRepeatParams(1, 1, 1, dstRep, dstRep, kFloatVec / kFloatBlock));
-                }
-                AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        constexpr uint32_t kBlockFloats = 64;
+        for (uint32_t row = 0; row < actualS1; ++row) {
+            for (uint32_t off = 0; off < cols; off += kBlockFloats) {
+                const uint32_t blockCols = AscendC::Std::min(kBlockFloats, cols - off);
+                ScaleHeadRowVF((__ubuf__ float *)ubOut_[row * colPerAiv + off].GetPhyAddr(),
+                    (__ubuf__ float *)ubScore_[(row * n1_) * colPerAiv + off].GetPhyAddr(),
+                    (__ubuf__ float *)ubW_[row * wStride_].GetPhyAddr(),
+                    (__ubuf__ float *)ubKScale_[off].GetPhyAddr(), n1_, colPerAiv, blockCols);
             }
         }
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     CATLASS_DEVICE void operator()(
@@ -190,9 +163,6 @@ public:
         const uint32_t cols = AscendC::Std::min(colPerAiv, actualS2 - colBegin);
         const uint32_t alignedS1 = SparseIndexer::Common::AlignUp(actualS1, kFloatBlock);
 
-        AscendC::Relu(ubScore_, ubScore_, alignedS1 * n1_ * colPerAiv);
-        AscendC::PipeBarrier<PIPE_V>();
-
         const uint32_t rightPad = wStride_ - n1_;
         AscendC::DataCopyExtParams load{
             static_cast<uint16_t>(actualS1), static_cast<uint32_t>(n1_ * sizeof(float)), 0, 0, 0};
@@ -207,11 +177,6 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
         }
         AscendC::Mul(ubW_, ubWIn_, ubQScaleIn_, alignedS1 * wStride_);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        for (uint32_t h = 0; h < n1_; ++h) {
-            ScaleHead(h, actualS1, colPerAiv, cols, h == 0);
-        }
         AscendC::PipeBarrier<PIPE_V>();
 
         // Gather PA key scales for this vector's S2 slice, then Mul into scores.
@@ -232,10 +197,7 @@ public:
             ubKScale_.SetValue(col, kScale);
         }
         AscendC::PipeBarrier<PIPE_V>();
-        for (uint32_t row = 0; row < actualS1; ++row) {
-            AscendC::Mul(ubOut_[row * colPerAiv], ubOut_[row * colPerAiv], ubKScale_, cols);
-        }
-        AscendC::PipeBarrier<PIPE_V>();
+        ScaleHeadVF(actualS1, colPerAiv, cols);
 
         maskPolicy_.Apply(
             actualS1, cols, colPerAiv, colBegin, s2Start, localQStart, qAct, kAct, reqKStart, residual,
@@ -250,7 +212,6 @@ private:
     AscendC::LocalTensor<float> ubW_;
     AscendC::LocalTensor<float> ubWIn_;
     AscendC::LocalTensor<float> ubQScaleIn_;
-    AscendC::LocalTensor<float> ubWCol_;
     AscendC::LocalTensor<float> ubWBrcb_;
     AscendC::LocalTensor<float> ubTmp_;
     AscendC::LocalTensor<float> ubKScale_;

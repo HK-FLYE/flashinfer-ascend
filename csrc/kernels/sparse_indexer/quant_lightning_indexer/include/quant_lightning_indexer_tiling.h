@@ -71,7 +71,7 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     tilingData.d = params.d;
     tilingData.topk = params.topk;
     tilingData.batch = params.batch;
-    constexpr uint32_t kS2TileCap = 256;
+    constexpr uint32_t kS2TileCap = 128;
     constexpr uint32_t kUbSize = 248 * 1024;
     constexpr uint32_t kL1Size = 512 * 1024;
     constexpr uint32_t kL0cSize = 256 * 1024;
@@ -83,29 +83,18 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     constexpr uint32_t kTopkS2TileCap = 2048;
     constexpr uint32_t kTopkS2Align = 16;
     constexpr uint32_t kTopkRowsPerTask = 2;
-    // Keep ScaleHead on the multi-row vector path: srcRep = n1*colPerAiv/8 <= 255
-    // with colPerAiv = AlignUp(s2Tile, 32)/2. Cap s2Tile when n1 is large.
+    // The register-VF head reduction is independent of srcRep, so S2 tiling is
+    // no longer constrained by the legacy multi-row ScaleHead limit.
     uint32_t s2Tile = params.maxSeqLenK <= kS2TileCap
         ? SparseIndexer::Common::AlignUp(params.maxSeqLenK, kCubeFractal)
         : kS2TileCap;
-    auto srcRepFor = [&](uint32_t tile) -> uint32_t {
-        const uint32_t col = SparseIndexer::Common::AlignUp(tile, kCubeFractal * kAivPerAic) / kAivPerAic;
-        return params.n1 * col / 8U;
-    };
-    while (s2Tile > kCubeFractal && srcRepFor(s2Tile) > 255U) {
-        s2Tile -= kCubeFractal;
-    }
-    if (srcRepFor(s2Tile) > 255U) {
-        throw std::invalid_argument(
-            "QuantLightningIndexerTiling: cannot keep ScaleHead srcRep<=255");
-    }
     const uint32_t s2Split = SparseIndexer::Common::AlignUp(s2Tile, kCubeFractal * kAivPerAic);
     const uint32_t wStride = SparseIndexer::Common::AlignUp(params.n1, 32 / kWElemBytes);
-    // Score + out + W/qScale tiles + wCol/wBrcb + ubTmp(kFloatVec) + ubKScale pad.
+    // Score + out + W/qScale tiles + wBrcb/ubTmp(kFloatVec) + ubKScale pad.
     constexpr uint32_t kFloatVec = 64;
     const uint64_t ubBytesPerS1 = sizeof(float) * (s2Split / kAivPerAic) * (params.n1 + 1) +
-        sizeof(float) * wStride * 3 + sizeof(float) * (1 + 8 + kFloatVec) +
-        sizeof(float) * (s2Split / kAivPerAic);
+        sizeof(float) * wStride * 3 + sizeof(float) * (8 + kFloatVec) +
+        sizeof(float) * (s2Split / kAivPerAic) + 256U;
     const uint32_t l0cRows = kL0cSize / (s2Split * sizeof(float));
     uint32_t s1Tile = static_cast<uint32_t>(kUbSize / ubBytesPerS1);
     while (s1Tile > 0 &&
