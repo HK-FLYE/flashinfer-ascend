@@ -80,6 +80,9 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     constexpr uint32_t kAivPerAic = 2;
     constexpr uint32_t kCubeFractal = 16;
     constexpr uint32_t kS1Align = 8;
+    constexpr uint32_t kTopkS2TileCap = 2048;
+    constexpr uint32_t kTopkS2Align = 16;
+    constexpr uint32_t kTopkRowsPerTask = 2;
     // Keep ScaleHead on the multi-row vector path: srcRep = n1*colPerAiv/8 <= 255
     // with colPerAiv = AlignUp(s2Tile, 32)/2. Cap s2Tile when n1 is large.
     uint32_t s2Tile = params.maxSeqLenK <= kS2TileCap
@@ -122,6 +125,9 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     }
     tilingData.s1Tile = s1Tile;
     tilingData.s2Tile = s2Tile;
+    tilingData.topkS2Tile = SparseIndexer::Common::AlignUp(
+        params.maxSeqLenK < kTopkS2TileCap ? params.maxSeqLenK : kTopkS2TileCap, kTopkS2Align);
+    tilingData.topkRowsPerTask = kTopkRowsPerTask;
     tilingData.blockSize = params.blockSize;
     tilingData.maxBlocksPerBatch = params.maxBlocksPerBatch;
     tilingData.numPages = params.numPages;

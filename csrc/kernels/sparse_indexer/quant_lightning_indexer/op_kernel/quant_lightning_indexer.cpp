@@ -32,8 +32,9 @@ extern "C" __global__ __aicore__ void fi_quant_lightning_indexer(
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     const uint64_t scoreBytes =
         static_cast<uint64_t>(tilingData->tq) * tilingData->maxSeqLenK * sizeof(float);
-    const uint64_t valueBytes =
-        static_cast<uint64_t>(tilingData->tq) * tilingData->topk * sizeof(float);
+    const uint64_t valueBytes = tilingData->returnValue == 0
+        ? 0
+        : static_cast<uint64_t>(tilingData->tq) * tilingData->topk * sizeof(float);
     GM_ADDR scores = userWorkspace;
     GM_ADDR valuesScratch = userWorkspace + scoreBytes;
     GM_ADDR zeroPage = userWorkspace + scoreBytes + valueBytes;

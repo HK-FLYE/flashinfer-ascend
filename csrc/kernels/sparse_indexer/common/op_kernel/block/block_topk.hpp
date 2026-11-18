@@ -272,6 +272,7 @@ public:
         uint32_t s2Stride{0};
         uint32_t s2Tile{0};
         bool hasOutputIdxOffset{false};
+        bool writeValues{true};
     };
 
     using DtypeScore = DtypeScore_;
@@ -294,6 +295,7 @@ public:
           s2Stride_(params.s2Stride),
           s2Tile_(params.s2Tile),
           hasOutputIdxOffset_(params.hasOutputIdxOffset),
+          writeValues_(params.writeValues),
           tileColAlign_(SparseIndexer::Common::AlignUp(params.s2Tile, kFloatBlock))
     {
         const uint32_t kTopAlign = SparseIndexer::Common::AlignUp(params.topK, 256u);
@@ -379,19 +381,25 @@ public:
             for (uint32_t i = 0; i < topK_; ++i) {
                 if (i >= stateCount) {
                     outIdxUb.SetValue(i, static_cast<DtypeOut>(-1));
-                    valueUb_.SetValue(i, negInf.f);
+                    if (writeValues_) {
+                        valueUb_.SetValue(i, negInf.f);
+                    }
                 } else {
                     outIdxUb.SetValue(
                         i, static_cast<DtypeOut>(static_cast<int32_t>(stateIdxUb_.GetValue(i)) + rowOff));
-                    valueUb_.SetValue(i, detail::SortableU32ToFloat(stateKeyUb_.GetValue(i)));
+                    if (writeValues_) {
+                        valueUb_.SetValue(i, detail::SortableU32ToFloat(stateKeyUb_.GetValue(i)));
+                    }
                 }
             }
             AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
             AscendC::DataCopyPad(gmOut_[s1Row * topK_], outIdxUb, copyOut);
-            AscendC::DataCopyExtParams copyVal{
-                1, static_cast<uint32_t>(topK_ * sizeof(DtypeScore)), 0, 0, 0};
-            AscendC::DataCopyPad(gmValues_[s1Row * topK_], valueUb_, copyVal);
+            if (writeValues_) {
+                AscendC::DataCopyExtParams copyVal{
+                    1, static_cast<uint32_t>(topK_ * sizeof(DtypeScore)), 0, 0, 0};
+                AscendC::DataCopyPad(gmValues_[s1Row * topK_], valueUb_, copyVal);
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
         }
@@ -414,6 +422,7 @@ private:
     uint32_t s2Stride_{0};
     uint32_t s2Tile_{0};
     bool hasOutputIdxOffset_{false};
+    bool writeValues_{true};
     uint32_t tileColAlign_{0};
 };
 

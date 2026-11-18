@@ -50,6 +50,7 @@ public:
     struct Params {
         uint32_t s1Tile{1};
         uint32_t s2Tile{1};
+        uint32_t topkRowsPerTask{1};
     };
 
     template <class RequestRangeSource>
@@ -73,8 +74,9 @@ public:
     CATLASS_DEVICE static uint64_t CountTopK(RequestRangeSource& source, Params const& params)
     {
         uint64_t total = 0;
+        const uint32_t rowsPerTask = params.topkRowsPerTask == 0 ? 1U : params.topkRowsPerTask;
         for (uint32_t b = 0; b < source.Batch(); ++b) {
-            total += detail::CeilDiv(source.QLen(b), params.s1Tile);
+            total += detail::CeilDiv(source.QLen(b), rowsPerTask);
         }
         return total;
     }
@@ -118,21 +120,22 @@ public:
         RequestRangeSource& source, Params const& params, uint64_t tileId, ScheduleCoord& coord)
     {
         uint64_t accumulated = 0;
+        const uint32_t rowsPerTask = params.topkRowsPerTask == 0 ? 1U : params.topkRowsPerTask;
         for (uint32_t b = 0; b < source.Batch(); ++b) {
             const uint32_t requestQStart = source.QBegin(b);
             const uint32_t qLen = source.QLen(b);
             const uint32_t requestKStart = source.KBegin(b);
             const uint32_t kLen = source.KLen(b);
-            const uint32_t qDim = detail::CeilDiv(qLen, params.s1Tile);
+            const uint32_t qDim = detail::CeilDiv(qLen, rowsPerTask);
             if (tileId >= accumulated + qDim) {
                 accumulated += qDim;
                 continue;
             }
             const uint32_t qBlock = static_cast<uint32_t>(tileId - accumulated);
             coord.batchIdx = b;
-            coord.localQStart = qBlock * params.s1Tile;
+            coord.localQStart = qBlock * rowsPerTask;
             coord.qStart = requestQStart + coord.localQStart;
-            coord.actualQ = (qBlock + 1U == qDim) ? (qLen - coord.localQStart) : params.s1Tile;
+            coord.actualQ = (qBlock + 1U == qDim) ? (qLen - coord.localQStart) : rowsPerTask;
             coord.kStart = requestKStart;
             coord.actualK = kLen;
             return true;

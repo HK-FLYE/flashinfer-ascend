@@ -37,6 +37,7 @@ class QuantLightningIndexerKernel {
         typename BlockScheduler::Params params{};
         params.policy.s1Tile = tiling->s1Tile;
         params.policy.s2Tile = tiling->s2Tile;
+        params.policy.topkRowsPerTask = tiling->topkRowsPerTask;
         params.source.InitFromGm(tiling, cuSeqlensQ, sequsedK, cmpResidualK);
         return params;
     }
@@ -119,8 +120,9 @@ public:
             typename BlockTopK::Params params{};
             params.topK = tiling->topk;
             params.s2Stride = tiling->maxSeqLenK;
-            params.s2Tile = tiling->s2Tile;
+            params.s2Tile = tiling->topkS2Tile;
             params.hasOutputIdxOffset = false;
+            params.writeValues = tiling->returnValue != 0;
             AscendC::GlobalTensor<int32_t> dummyOffset;
             BlockTopK topk(resource_, scores, outIndices, params, dummyOffset, outValues);
             SparseIndexer::Common::Block::ScheduleCoord coord{};

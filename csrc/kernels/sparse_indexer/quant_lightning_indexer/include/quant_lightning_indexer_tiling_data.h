@@ -31,6 +31,8 @@ struct QuantLightningIndexerTilingData {
     uint32_t batch{1};
     uint32_t s1Tile{0};
     uint32_t s2Tile{0};
+    uint32_t topkS2Tile{0};
+    uint32_t topkRowsPerTask{1};
 
     uint32_t blockSize{0};
     uint32_t maxBlocksPerBatch{0};
