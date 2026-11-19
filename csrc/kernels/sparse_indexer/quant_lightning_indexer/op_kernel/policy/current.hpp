@@ -10,8 +10,10 @@
 #include "block/block_topk.hpp"
 #include "block/block_topk_vf.hpp"
 #include "load/paged_key.hpp"
+#include "mmad/split_m.hpp"
 #include "mmad/split_n.hpp"
 #include "reduce/column_split.hpp"
+#include "reduce/row_split.hpp"
 #include "resource/current.hpp"
 #include "schedule/round_robin.hpp"
 #include "sync/block_barrier.hpp"
@@ -21,14 +23,26 @@
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 
 using QkDtype = fp8_e4m3fn_t;
-using C0KeyLoad = PagedKeyLoadPolicy<QkDtype>;
-using C0Mmad = SplitNMmadPolicy<QkDtype, C0KeyLoad>;
-using C0Reduce = ColumnSplitReducePolicy<QuantLightningIndexerKernelDetail::BlockReduceQuantHead<>>;
-using C0TopK = PrefixLiTopKVFPolicy<
+using CommonKeyLoad = PagedKeyLoadPolicy<QkDtype>;
+using CommonTopK = PrefixLiTopKVFPolicy<
     SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>,
     SparseIndexer::Common::Block::BlockTopK<float, int32_t>>;
-using CurrentPolicy = PolicyBundle<RoundRobinSchedulePolicy, C0KeyLoad, C0Mmad, C0Reduce, C0TopK,
-    BlockBarrierSyncPolicy, CurrentResourcePolicy<Catlass::Arch::Ascend950>, CurrentPerformanceTraits>;
+using CommonSync = BlockBarrierSyncPolicy;
+using CommonResource = CurrentResourcePolicy<Catlass::Arch::Ascend950>;
+
+using C0Mmad = SplitNMmadPolicy<QkDtype, CommonKeyLoad>;
+using C0Reduce = ColumnSplitReducePolicy<QuantLightningIndexerKernelDetail::BlockReduceQuantHead<>>;
+using C0Policy = PolicyBundle<RoundRobinSchedulePolicy, CommonKeyLoad, C0Mmad, C0Reduce, CommonTopK,
+    CommonSync, CommonResource, CurrentPerformanceTraits>;
+
+using C1Mmad = SplitMMmadPolicy<QkDtype, CommonKeyLoad>;
+using C1Reduce = RowSplitReducePolicy<
+    QuantLightningIndexerKernelDetail::BlockReduceQuantHead<
+        SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>>;
+using C1Policy = PolicyBundle<RoundRobinSchedulePolicy, CommonKeyLoad, C1Mmad, C1Reduce, CommonTopK,
+    CommonSync, CommonResource, QliV2PerformanceTraits>;
+
+using CurrentPolicy = C1Policy;
 
 } // namespace SparseIndexer::QuantLightningIndexer::Policy
 

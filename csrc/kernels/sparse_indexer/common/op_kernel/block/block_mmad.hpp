@@ -32,14 +32,18 @@
 namespace SparseIndexer::Common::Block {
 
 template <class DtypeA_, class DtypeB_, class KeyLoader_ = ContiguousKeyLoader<Catlass::Arch::Ascend950,
-                                                   Catlass::Gemm::GemmType<DtypeB_, Catlass::layout::ColumnMajor>>>
+                                                   Catlass::Gemm::GemmType<DtypeB_, Catlass::layout::ColumnMajor>>,
+    Catlass::Gemm::Tile::CopyL0CToUBMode CopyMode_ = Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N>
 class BlockMmad {
 public:
     using KeyLoaderParams = typename KeyLoader_::Params;
 
     struct Params {
         KeyLoaderParams keyLoader{};
+        uint32_t mSplitAlignment{0};
     };
+
+    static constexpr auto CopyMode = CopyMode_;
 
     using DtypeA = DtypeA_;
     using DtypeB = DtypeB_;
@@ -69,7 +73,7 @@ public:
         AscendC::LocalTensor<DtypeC>, decltype(tla::MakeLayout<DtypeC, LayoutC>(uint32_t{}, uint32_t{})),
         tla::Coord<tla::_0, tla::_0>, AscendC::TPosition::VECCALC>;
     using CopyL0CToUb = Catlass::Gemm::Tile::CopyL0CToUBTla<
-        ArchTag, TensorL0C, TensorUbC, Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N,
+        ArchTag, TensorL0C, TensorUbC, CopyMode_,
         Catlass::Gemm::Tile::ScaleGranularity::NO_QUANT, false>;
 
     CATLASS_DEVICE
@@ -80,7 +84,8 @@ public:
         Params const& params,
         AscendC::GlobalTensor<int32_t> const& gmTable,
         AscendC::GlobalTensor<DtypeB> const& gmZero)
-        : problemShape_(problemShape), tileShape_(tileShape), resource_(resource), gmA_(gmQ), gmB_(gmK), ubC_(ubC)
+        : problemShape_(problemShape), tileShape_(tileShape), resource_(resource), gmA_(gmQ), gmB_(gmK), ubC_(ubC),
+          mSplitAlignment_(params.mSplitAlignment == 0 ? 1U : params.mSplitAlignment)
     {
         layoutA_ = LayoutA::template MakeLayout<DtypeA>(problemShape_.m(), problemShape_.k());
         layoutB_ = LayoutB::template MakeLayout<DtypeB>(problemShape_.k(), problemShape_.n());
@@ -145,21 +150,42 @@ public:
         }
 
         constexpr uint32_t aivPerAic = 2;
-        constexpr uint32_t l0cFractalN = 16;
-        uint32_t splitNAlign = l0cFractalN * aivPerAic;
-        uint32_t splitN = SparseIndexer::Common::AlignUp(actualN, splitNAlign);
-        auto tensorL0C = tla::MakeTensor(l0C_, tla::MakeLayoutL0C(actualM, splitN), Catlass::Arch::PositionL0C{});
-        auto tensorUbC = tla::MakeTensor(
-            ubC_,
-            tla::MakeLayout(
-                tla::MakeShape(actualM, splitN),
-                tla::MakeStride(static_cast<int64_t>(splitN / aivPerAic), tla::Int<1>{}),
-                tla::MakeShape(actualM, splitN)),
-            Catlass::Arch::PositionUB{});
+        if constexpr (CopyMode_ == Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N) {
+            constexpr uint32_t l0cFractalN = 16;
+            uint32_t splitNAlign = l0cFractalN * aivPerAic;
+            uint32_t splitN = SparseIndexer::Common::AlignUp(actualN, splitNAlign);
+            auto tensorL0C =
+                tla::MakeTensor(l0C_, tla::MakeLayoutL0C(actualM, splitN), Catlass::Arch::PositionL0C{});
+            auto tensorUbC = tla::MakeTensor(
+                ubC_,
+                tla::MakeLayout(
+                    tla::MakeShape(actualM, splitN),
+                    tla::MakeStride(static_cast<int64_t>(splitN / aivPerAic), tla::Int<1>{}),
+                    tla::MakeShape(actualM, splitN)),
+                Catlass::Arch::PositionUB{});
 
-        AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
-        copyL0CToUb_(tensorUbC, tensorL0C);
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+            copyL0CToUb_(tensorUbC, tensorL0C);
+        } else {
+            static_assert(CopyMode_ == Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M,
+                "QLI mmad supports SPLIT_N or SPLIT_M output");
+            const uint32_t splitM = SparseIndexer::Common::AlignUp(actualM, mSplitAlignment_);
+            const uint32_t splitN = SparseIndexer::Common::AlignUp(actualN, 8U);
+            auto tensorL0C =
+                tla::MakeTensor(l0C_, tla::MakeLayoutL0C(splitM, splitN), Catlass::Arch::PositionL0C{});
+            auto tensorUbC = tla::MakeTensor(
+                ubC_,
+                tla::MakeLayout(
+                    tla::MakeShape(splitM, splitN),
+                    tla::MakeStride(static_cast<int64_t>(splitN), tla::Int<1>{}),
+                    tla::MakeShape(splitM, splitN)),
+                Catlass::Arch::PositionUB{});
+
+            AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
+            copyL0CToUb_(tensorUbC, tensorL0C);
+        }
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
     }
 
@@ -170,6 +196,7 @@ private:
     Catlass::GemmCoord problemShape_{};
     Catlass::GemmCoord tileShape_{};
     uint32_t kPart_{0};
+    uint32_t mSplitAlignment_{1};
     LayoutA layoutA_{};
     LayoutB layoutB_{};
     Catlass::Arch::Resource<ArchTag>& resource_;
