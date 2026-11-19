@@ -62,6 +62,36 @@ struct PrefixLiTopKVFPolicy {
     }
 };
 
+
+/**
+ * Inline TopK used after one gS1 has finished all S2 work on the same AIV.
+ * LocalRows disables the generic TopK block's subblock row split, so each AIV
+ * consumes exactly the rows it owns.
+ */
+template <class VectorBlock_>
+struct InlinePrefixLiTopKVFPolicy {
+    using VectorBlock = VectorBlock_;
+
+    CATLASS_DEVICE static void RunLocal(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
+        __gm__ QuantLightningIndexerTilingData const* tiling, AscendC::GlobalTensor<float>& scores,
+        AscendC::GlobalTensor<int32_t> const& outIndices, AscendC::GlobalTensor<float> const& outValues,
+        uint32_t s1Start, uint32_t rows, uint32_t kStart, uint32_t kLen, uint32_t localQStart,
+        uint32_t qLen, int32_t residual)
+    {
+        if (rows == 0 || tiling->returnValue != 0) {
+            return;
+        }
+        AscendC::GlobalTensor<int32_t> dummyOffset;
+        typename VectorBlock::Params params{};
+        params.topK = tiling->topk;
+        params.s2Stride = tiling->maxSeqLenK;
+        params.s2Tile = tiling->topkS2Tile;
+        params.hasOutputIdxOffset = false;
+        VectorBlock topk(resource, scores, outIndices, params, dummyOffset, outValues);
+        topk(s1Start, rows, kStart, kLen, localQStart, qLen, kLen, residual);
+    }
+};
+
 } // namespace SparseIndexer::QuantLightningIndexer::Policy
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_TOPK_PREFIX_LITOPKVF_HPP

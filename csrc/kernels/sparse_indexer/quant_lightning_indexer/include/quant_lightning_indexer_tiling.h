@@ -80,7 +80,7 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     constexpr uint32_t kAivPerAic = 2;
     constexpr uint32_t kCubeFractal = 16;
     constexpr uint32_t kS1Align = 8;
-    constexpr uint32_t kTopkS2TileCap = 2048;
+    constexpr uint32_t kTopkS2TileCap = 16384;
     constexpr uint32_t kTopkS2Align = 16;
     constexpr uint32_t kTopkRowsPerTask = 2;
     // The register-VF head reduction is independent of srcRep, so S2 tiling is

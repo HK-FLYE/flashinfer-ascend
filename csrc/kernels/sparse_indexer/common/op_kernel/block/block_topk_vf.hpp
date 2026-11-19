@@ -90,7 +90,7 @@ __simd_vf__ void FinalizeIndexVF(__ubuf__ int32_t *out, __ubuf__ uint16_t *indic
     }
 }
 
-template <class DtypeScore_, class DtypeOut_>
+template <class DtypeScore_, class DtypeOut_, bool LocalRows_ = false>
 class BlockTopKVector {
 public:
     struct Params {
@@ -104,7 +104,7 @@ public:
     using DtypeOut = DtypeOut_;
     using ArchTag = Catlass::Arch::Ascend950;
 
-    static constexpr uint32_t kSplitS1 = 2;
+    static constexpr uint32_t kSplitS1 = LocalRows_ ? 1U : 2U;
     static constexpr uint32_t kFloatBlock = Catlass::BYTE_PER_BLK / sizeof(DtypeScore);
 
     CATLASS_DEVICE BlockTopKVector(Catlass::Arch::Resource<ArchTag>& resource,
@@ -161,13 +161,17 @@ public:
         if (actualS1 == 0) {
             return;
         }
-        const uint32_t rowsPerSub = SparseIndexer::Common::CeilDiv(actualS1, kSplitS1);
-        const uint32_t sub = AscendC::GetSubBlockIdx();
-        const uint32_t rowBegin = sub * rowsPerSub;
-        if (rowBegin >= actualS1) {
-            return;
+        uint32_t rowBegin = 0;
+        uint32_t rowCount = actualS1;
+        if constexpr (!LocalRows_) {
+            const uint32_t rowsPerSub = SparseIndexer::Common::CeilDiv(actualS1, kSplitS1);
+            const uint32_t sub = AscendC::GetSubBlockIdx();
+            rowBegin = sub * rowsPerSub;
+            if (rowBegin >= actualS1) {
+                return;
+            }
+            rowCount = AscendC::Std::min(rowsPerSub, actualS1 - rowBegin);
         }
-        const uint32_t rowCount = AscendC::Std::min(rowsPerSub, actualS1 - rowBegin);
 
         AscendC::DataCopyExtParams copyIn{1, 0, 0, 0, 0};
         AscendC::DataCopyExtParams copyOut{1, static_cast<uint32_t>(topK_ * sizeof(DtypeOut)), 0, 0, 0};
@@ -185,7 +189,6 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
                 AscendC::PipeBarrier<PIPE_V>();
-
                 const uint32_t paddedLen =
                     SparseIndexer::Common::AlignUp(AscendC::Std::max(visibleLen, topK_), 256U);
                 AscendC::Cast(inputUb_.template ReinterpretCast<bfloat16_t>(), scoreUb_, RoundMode::CAST_RINT,
@@ -201,6 +204,11 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             FinalizeIndexVF((__ubuf__ int32_t *)outIdx.GetPhyAddr(), (__ubuf__ uint16_t *)tmpIndex_.GetPhyAddr(),
                 visibleLen, topK_, static_cast<int32_t>(kStart) + rowOff);
+            // LocalRows processes multiple rows on the same AIV. The VF
+            // finalize store must be visible before the MTE3 output copy.
+            if constexpr (LocalRows_) {
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
             storeRow(outIdx, s1Row, copyOut);
         }
     }

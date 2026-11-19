@@ -25,7 +25,6 @@ extern "C" __global__ __aicore__ void fi_quant_lightning_indexer(
     AscendC::SetSysWorkspace(workspace);
     (void)cu_seqlens_k;
     (void)seqused_q;
-    (void)values; // public bf16 values unused when return_value=0; TopK uses float scratch
 
     auto const* tilingData =
         reinterpret_cast<__gm__ QuantLightningIndexerTilingData const*>(tiling);
@@ -40,5 +39,5 @@ extern "C" __global__ __aicore__ void fi_quant_lightning_indexer(
     GM_ADDR zeroPage = userWorkspace + scoreBytes + valueBytes;
     QuantLightningIndexerKernelDetail::RunKernel(
         query, key, weights, query_dequant_scale, key_dequant_scale, block_table, cu_seqlens_q, seqused_k,
-        cmp_residual_k, indices, valuesScratch, scores, zeroPage, tiling);
+        cmp_residual_k, indices, valuesScratch, values, scores, zeroPage, tiling);
 }

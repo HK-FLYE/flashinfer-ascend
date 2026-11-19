@@ -13,6 +13,7 @@
 #include "mmad/split_m.hpp"
 #include "mmad/split_n.hpp"
 #include "reduce/column_split.hpp"
+#include "reduce/inline_row_split.hpp"
 #include "reduce/row_split.hpp"
 #include "resource/current.hpp"
 #include "schedule/round_robin.hpp"
@@ -29,6 +30,7 @@ using CommonTopK = PrefixLiTopKVFPolicy<
     SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>,
     SparseIndexer::Common::Block::BlockTopK<float, int32_t>>;
 using CommonSync = BlockBarrierSyncPolicy;
+using C2Sync = SubblockPairBlockBarrierSyncPolicy;
 using CommonResource = CurrentResourcePolicy<Catlass::Arch::Ascend950>;
 
 using C0Mmad = SplitNMmadPolicy<QkDtype, CommonKeyLoad>;
@@ -43,13 +45,19 @@ using C1Reduce = RowSplitReducePolicy<
 using C1Policy = PolicyBundle<RoundRobinSchedulePolicy, CommonKeyLoad, C1Mmad, C1Reduce, CommonTopK,
     CommonSync, CommonResource, RowSplitPerformanceTraits>;
 
-// C2 is a compile-time experiment. The naive gS1/S2 inner loop currently
-// re-loads Q for every S2 tile and regresses long-K cases; keep C1 as the
-// production default until the load/pipeline policies are implemented.
-using C2Policy = PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C1Mmad, C1Reduce, CommonTopK,
-    CommonSync, CommonResource, StaticGSA1PerformanceTraits>;
+// C2 keeps one gS1 task on its owning AIC/AIV pair. The last vector-ready
+// signal is deferred until the inline TopK finishes, so the next task cannot
+// overwrite the shared UB before the score hand-off is consumed.
+using InlineVectorTopK = InlinePrefixLiTopKVFPolicy<
+    SparseIndexer::Common::Block::BlockTopKVector<float, int32_t, true>>;
+using C2Reduce = InlineRowSplitReducePolicy<
+    QuantLightningIndexerKernelDetail::BlockReduceQuantHead<
+        SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>,
+    InlineVectorTopK>;
+using C2Policy = PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C1Mmad, C2Reduce, CommonTopK,
+    C2Sync, CommonResource, StaticGSA1PerformanceTraits>;
 
-using CurrentPolicy = C1Policy;
+using CurrentPolicy = C2Policy;
 
 } // namespace SparseIndexer::QuantLightningIndexer::Policy
 

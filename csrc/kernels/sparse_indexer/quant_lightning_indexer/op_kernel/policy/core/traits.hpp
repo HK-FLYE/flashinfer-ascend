@@ -31,7 +31,7 @@ struct RowSplitPerformanceTraits {
 struct StaticGSA1PerformanceTraits {
     static constexpr bool kSplitAivByRow = true;
     static constexpr bool kS2InnerLoop = true;
-    static constexpr bool kTopKPerGSA1 = false;
+    static constexpr bool kTopKPerGSA1 = true;
     static constexpr bool kUseMetadataBalance = false;
     static constexpr uint32_t kS2Base = 128;
 };
