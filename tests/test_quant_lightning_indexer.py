@@ -78,6 +78,24 @@ def test_return_value_one_allocates_values_shape():
     assert [o.shape for o in invocation.outputs] == [(8, 1, 4), (8, 1, 4)]
 
 
+def test_model_perf_suite_keeps_supported_and_blocked_cases_explicit():
+    from tools.qli_v2_whitebox_perf_cases import model_cases
+
+    cases = model_cases()
+    assert len(cases) == 31
+    runnable = {case.name for case in cases if case.supports_ours and case.supports_qli}
+    assert runnable == {
+        "prefill_8k_h1",
+        "prefill_8k_h2",
+        "prefill_8k_h4",
+        "prefill_16k_h4",
+        "decode_8k_h4",
+    }
+    for case in cases:
+        if not (case.supports_ours and case.supports_qli):
+            assert case.unsupported_reason, case.name
+
+
 def test_topk_larger_than_visible_tokens_keeps_output_width():
     invocation = infer(topk=2048, max_seq_len_k=16)
     assert invocation.outputs[0].shape == (8, 1, 2048)
