@@ -51,12 +51,16 @@ struct ColumnSplitReducePolicy {
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.GetNextCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            SyncPolicy_::AivWaitCubeDone();
-            reducer(
-                task.coord.qStart, task.coord.actualQ, task.coord.kStart, task.coord.actualK,
-                task.coord.localQStart, task.activeQ, task.activeK, task.requestKStart, task.residual,
-                task.maskActive, task.coord.batchIdx);
-            SyncPolicy_::AivArriveVecReady();
+            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(coord, scheduler.policy());
+            for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
+                const auto tile = SchedulePolicy_::MakeS2Coord(coord, s2Idx, scheduler.policy());
+                SyncPolicy_::AivWaitCubeDone();
+                reducer(
+                    tile.qStart, tile.actualQ, tile.kStart, tile.actualK,
+                    tile.localQStart, task.activeQ, task.activeK, task.requestKStart, task.residual,
+                    task.maskActive, tile.batchIdx);
+                SyncPolicy_::AivArriveVecReady();
+            }
         }
     }
 };

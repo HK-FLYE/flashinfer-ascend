@@ -20,8 +20,8 @@ namespace SparseIndexer::QuantLightningIndexer::Policy {
  */
 struct RoundRobinSchedulePolicy {
     using RequestSource = QuantLightningIndexerKernelDetail::QuantLightningIndexerRequestSource;
-    using Scheduler = SparseIndexer::Common::Block::BlockScheduler<
-        RequestSource, SparseIndexer::Common::Block::RequestBlockDiagonalPolicy>;
+    using BlockPolicy = SparseIndexer::Common::Block::RequestBlockDiagonalPolicy;
+    using Scheduler = SparseIndexer::Common::Block::BlockScheduler<RequestSource, BlockPolicy>;
     using Params = typename Scheduler::Params;
     using Coord = SparseIndexer::Common::Block::ScheduleCoord;
     using Task = QuantLightningIndexerKernelDetail::QuantLightningIndexerTask;
@@ -36,6 +36,17 @@ struct RoundRobinSchedulePolicy {
         params.policy.topkRowsPerTask = tiling->topkRowsPerTask;
         params.source.InitFromGm(tiling, cuSeqlensQ, sequsedK, cmpResidualK);
         return params;
+    }
+
+    CATLASS_DEVICE static uint32_t CountS2Tiles(Coord const& coord, BlockPolicy::Params const& params)
+    {
+        return BlockPolicy::CountS2Tiles(coord, params);
+    }
+
+    CATLASS_DEVICE static Coord MakeS2Coord(
+        Coord const& coord, uint32_t s2Idx, BlockPolicy::Params const& params)
+    {
+        return BlockPolicy::MakeS2Coord(coord, s2Idx, params);
     }
 
     CATLASS_DEVICE static Task MakeTask(Coord const& coord, RequestSource const& source)

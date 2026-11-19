@@ -54,12 +54,16 @@ struct SplitNMmadPolicy {
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.GetNextCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const SparseIndexer::Common::Block::KeyCoord keyCoord{
-                task.coord.kStart, task.coord.kStart - task.requestKStart, task.coord.batchIdx};
-            SyncPolicy_::AicWaitCubeReady();
-            blockMmad(
-                task.coord.qStart * tiling->n1, task.coord.actualQ * tiling->n1, keyCoord, task.coord.actualK);
-            SyncPolicy_::AicArriveCubeDone();
+            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(coord, scheduler.policy());
+            for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
+                const auto tile = SchedulePolicy_::MakeS2Coord(coord, s2Idx, scheduler.policy());
+                const SparseIndexer::Common::Block::KeyCoord keyCoord{
+                    tile.kStart, tile.kStart - task.requestKStart, tile.batchIdx};
+                SyncPolicy_::AicWaitCubeReady();
+                blockMmad(
+                    tile.qStart * tiling->n1, tile.actualQ * tiling->n1, keyCoord, tile.actualK);
+                SyncPolicy_::AicArriveCubeDone();
+            }
         }
         SyncPolicy_::AicFinalWait();
     }

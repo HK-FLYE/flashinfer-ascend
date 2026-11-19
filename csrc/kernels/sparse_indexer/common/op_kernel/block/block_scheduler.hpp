@@ -115,6 +115,16 @@ public:
         return false;
     }
 
+    CATLASS_DEVICE static uint32_t CountS2Tiles(ScheduleCoord const&, Params const&)
+    {
+        return 1U;
+    }
+
+    CATLASS_DEVICE static ScheduleCoord MakeS2Coord(ScheduleCoord const& coord, uint32_t, Params const&)
+    {
+        return coord;
+    }
+
     template <class RequestRangeSource>
     CATLASS_DEVICE static bool FindTopK(
         RequestRangeSource& source, Params const& params, uint64_t tileId, ScheduleCoord& coord)
@@ -196,6 +206,12 @@ public:
     RequestRangeSource const& source() const
     {
         return source_;
+    }
+
+    CATLASS_DEVICE
+    typename SchedulePolicy::Params const& policy() const
+    {
+        return policy_;
     }
 
 private:

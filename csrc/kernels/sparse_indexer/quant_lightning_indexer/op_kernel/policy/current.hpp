@@ -16,6 +16,7 @@
 #include "reduce/row_split.hpp"
 #include "resource/current.hpp"
 #include "schedule/round_robin.hpp"
+#include "schedule/static_gsa1.hpp"
 #include "sync/block_barrier.hpp"
 #include "topk/prefix_litopkvf.hpp"
 #include "core/traits.hpp"
@@ -40,7 +41,13 @@ using C1Reduce = RowSplitReducePolicy<
     QuantLightningIndexerKernelDetail::BlockReduceQuantHead<
         SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>>;
 using C1Policy = PolicyBundle<RoundRobinSchedulePolicy, CommonKeyLoad, C1Mmad, C1Reduce, CommonTopK,
-    CommonSync, CommonResource, QliV2PerformanceTraits>;
+    CommonSync, CommonResource, RowSplitPerformanceTraits>;
+
+// C2 is a compile-time experiment. The naive gS1/S2 inner loop currently
+// re-loads Q for every S2 tile and regresses long-K cases; keep C1 as the
+// production default until the load/pipeline policies are implemented.
+using C2Policy = PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C1Mmad, C1Reduce, CommonTopK,
+    CommonSync, CommonResource, StaticGSA1PerformanceTraits>;
 
 using CurrentPolicy = C1Policy;
 

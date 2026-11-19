@@ -20,6 +20,22 @@ struct CurrentPerformanceTraits {
     static constexpr uint32_t kS2Base = 128;
 };
 
+struct RowSplitPerformanceTraits {
+    static constexpr bool kSplitAivByRow = true;
+    static constexpr bool kS2InnerLoop = false;
+    static constexpr bool kTopKPerGSA1 = false;
+    static constexpr bool kUseMetadataBalance = false;
+    static constexpr uint32_t kS2Base = 128;
+};
+
+struct StaticGSA1PerformanceTraits {
+    static constexpr bool kSplitAivByRow = true;
+    static constexpr bool kS2InnerLoop = true;
+    static constexpr bool kTopKPerGSA1 = false;
+    static constexpr bool kUseMetadataBalance = false;
+    static constexpr uint32_t kS2Base = 128;
+};
+
 struct QliV2PerformanceTraits {
     static constexpr bool kSplitAivByRow = true;
     static constexpr bool kS2InnerLoop = true;
