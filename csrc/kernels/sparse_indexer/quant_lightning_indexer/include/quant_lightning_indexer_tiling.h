@@ -114,9 +114,9 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     }
     // The 2D qTile x s2Tile scheduler must produce enough independent reduce
     // tasks. Resource-max s1Tile collapses short-K requests onto one or two
-    // AIC blocks. Eight rows is the smallest block that passes the current
-    // matrix anchors; the four-row SPLIT_M path remains a separate follow-up.
-    constexpr uint32_t kS1TileCap = 8;
+    // AIC blocks. Four rows matches the QLIv2 gS1 base; reduce scratch reserves
+    // the vector-aligned row count independently of this tile size.
+    constexpr uint32_t kS1TileCap = 4;
     if (s1Tile > kS1TileCap) {
         s1Tile = kS1TileCap;
     }

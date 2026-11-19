@@ -93,6 +93,10 @@ public:
           maskPolicy_(ubOut_, ubWBrcb_, ubTmp_)
     {
         wStride_ = SparseIndexer::Common::AlignUp(n1_, kFloatBlock);
+        // ScaleHeadVF processes at least one 256-byte row vector. With a
+        // four-row tile, actualS1 can round up to eight rows, so scratch must
+        // follow the compute-aligned row count rather than s1Tile alone.
+        const uint32_t vectorRows = AscendC::Std::max(s1Tile_, kFloatBlock);
         const uint32_t aivPerAic = AscendC::GetSubBlockNum();
         const uint32_t colPerAiv =
             SparseIndexer::Common::AlignUp(s2Tile_, 16U * aivPerAic) / aivPerAic;
@@ -100,11 +104,11 @@ public:
         ubOut_ = resource.ubBuf.template GetBufferByByte<float>(offset);
         offset += s1Tile_ * colPerAiv * sizeof(float);
         ubW_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += s1Tile_ * wStride_ * sizeof(float);
+        offset += vectorRows * wStride_ * sizeof(float);
         ubWIn_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += s1Tile_ * wStride_ * sizeof(float);
+        offset += vectorRows * wStride_ * sizeof(float);
         ubQScaleIn_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += s1Tile_ * wStride_ * sizeof(float);
+        offset += vectorRows * wStride_ * sizeof(float);
         offset = SparseIndexer::Common::AlignUp(offset, 32U);
         ubWBrcb_ = resource.ubBuf.template GetBufferByByte<float>(offset);
         offset += s1Tile_ * kFloatBlock * sizeof(float);
