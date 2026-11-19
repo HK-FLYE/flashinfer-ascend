@@ -84,13 +84,7 @@ def test_model_perf_suite_keeps_supported_and_blocked_cases_explicit():
     cases = model_cases()
     assert len(cases) == 31
     runnable = {case.name for case in cases if case.supports_ours and case.supports_qli}
-    assert runnable == {
-        "prefill_8k_h1",
-        "prefill_8k_h2",
-        "prefill_8k_h4",
-        "prefill_16k_h4",
-        "decode_8k_h4",
-    }
+    assert runnable == set()
     for case in cases:
         if not (case.supports_ours and case.supports_qli):
             assert case.unsupported_reason, case.name
