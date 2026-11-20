@@ -262,6 +262,9 @@ def validate_values(arguments):
     if any(v < 0 or v >= ratio for v in arguments["cmp_residual_k"].cpu().tolist()):
         raise ValueError("cmp_residual_k must satisfy 0 <= residual < cmp_ratio")
     used = arguments["seqused_k"].cpu().tolist()
+    max_seq = int(arguments["max_seq_len_k"])
+    if any(v < 0 or v > max_seq for v in used):
+        raise ValueError("seqused_k values must be in [0, max_seq_len_k]")
     width = int(arguments["block_table"].shape[1])
     if any((v + meta.block - 1) // meta.block > width for v in used):
         raise ValueError("block_table width is smaller than seqused_k requires")

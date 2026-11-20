@@ -25,19 +25,38 @@ public:
         tq_ = tiling->tq;
         maxSeqLenK_ = tiling->maxSeqLenK;
         batch_ = tiling->batch == 0 ? 1U : tiling->batch;
-        if (batch_ > kMaxBatch) batch_ = 1U;
+        if (batch_ > kMaxBatch) batch_ = kMaxBatch;
 
         AscendC::GlobalTensor<int32_t> gmCuQ;
         gmCuQ.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(cuSeqlensQ));
-        for (uint32_t i = 0; i <= batch_; ++i) cuQ_[i] = gmCuQ.GetValue(i);
+        int64_t previousQ = 0;
+        for (uint32_t i = 0; i <= batch_; ++i) {
+            int64_t value = i == 0 ? 0 : static_cast<int64_t>(gmCuQ.GetValue(i));
+            value = value < previousQ ? previousQ : value;
+            value = value > static_cast<int64_t>(tq_) ? static_cast<int64_t>(tq_) : value;
+            cuQ_[i] = static_cast<int32_t>(value);
+            previousQ = value;
+        }
+        // The public contract requires the prefix sum to end at Tq. If malformed
+        // metadata arrived through a direct ACLNN call, make the last batch cover
+        // the remaining rows rather than wrapping an unsigned length.
+        cuQ_[batch_] = static_cast<int32_t>(tq_);
 
         AscendC::GlobalTensor<int32_t> gmSeqK;
         gmSeqK.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(sequsedK));
         AscendC::GlobalTensor<int32_t> gmResidual;
         gmResidual.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(cmpResidualK));
+        const int32_t residualLimit = tiling->cmpRatio > 0 ? tiling->cmpRatio : 1;
         for (uint32_t i = 0; i < batch_; ++i) {
-            sequsedK_[i] = gmSeqK.GetValue(i);
-            cmpResidualK_[i] = gmResidual.GetValue(i);
+            int64_t seqK = gmSeqK.GetValue(i);
+            seqK = seqK < 0 ? 0 : seqK;
+            seqK = seqK > static_cast<int64_t>(maxSeqLenK_) ? static_cast<int64_t>(maxSeqLenK_) : seqK;
+            sequsedK_[i] = static_cast<int32_t>(seqK);
+
+            int64_t residual = gmResidual.GetValue(i);
+            residual = residual < 0 ? 0 : residual;
+            residual = residual >= residualLimit ? residualLimit - 1 : residual;
+            cmpResidualK_[i] = static_cast<int32_t>(residual);
         }
     }
 

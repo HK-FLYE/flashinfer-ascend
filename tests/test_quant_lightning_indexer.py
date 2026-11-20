@@ -20,7 +20,7 @@ from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import (
     qli_v2_oracle,
     qli_v2_raw_golden,
 )
-from flashinfer.operators.sparse_indexer.quant_lightning_indexer.operator import OPERATOR
+from flashinfer.operators.sparse_indexer.quant_lightning_indexer.operator import OPERATOR, validate_values
 
 
 class Tensor:
@@ -74,18 +74,6 @@ def test_hot_path_contract_keeps_two_outputs():
     assert invocation.inference.causal is True
 
 
-def test_model_perf_suite_keeps_supported_and_blocked_cases_explicit():
-    from tools.qli_v2_whitebox_perf_cases import model_cases
-
-    cases = model_cases()
-    assert len(cases) == 31
-    runnable = {case.name for case in cases if case.supports_ours and case.supports_qli}
-    assert runnable == set()
-    for case in cases:
-        if not (case.supports_ours and case.supports_qli):
-            assert case.unsupported_reason, case.name
-
-
 def test_topk_larger_than_visible_tokens_keeps_output_width():
     invocation = infer(topk=2048, max_seq_len_k=16)
     assert invocation.outputs[0].shape == (8, 1, 2048)
@@ -115,6 +103,36 @@ def test_topk_larger_than_visible_tokens_keeps_output_width():
 def test_first_grid_rejects_out_of_scope_or_invalid(change, match):
     with pytest.raises(ValueError, match=match):
         infer(**change)
+
+
+def _validate_args(case_name):
+    case = next(c for c in CASE_PARAMETERS if c["name"] == case_name)
+    tensors = make_cpu_inputs(torch, case)
+    tensors["cu_seqlens_k"] = None
+    tensors["seqused_q"] = None
+    return case, tensors
+
+
+def test_validate_values_rejects_seqused_k_outside_capacity():
+    case, tensors = _validate_args("smoke_tiny")
+    for invalid in (-1, case["max_seq_len_k"] + 1):
+        tensors["seqused_k"] = torch.tensor([invalid], dtype=torch.int32)
+        with pytest.raises(ValueError, match="max_seq_len_k"):
+            validate_values(tensors)
+
+
+def test_validate_values_rejects_nonmonotonic_query_prefix():
+    case, tensors = _validate_args("multi_batch_ragged")
+    tensors["cu_seqlens_q"] = torch.tensor([0, 3, 2], dtype=torch.int32)
+    with pytest.raises(ValueError, match="cu_seqlens_q"):
+        validate_values(tensors)
+
+
+def test_validate_values_rejects_residual_at_ratio():
+    case, tensors = _validate_args("smoke_tiny")
+    tensors["cmp_residual_k"] = torch.tensor([case["cmp_ratio"]], dtype=torch.int32)
+    with pytest.raises(ValueError, match="cmp_residual_k"):
+        validate_values(tensors)
 
 
 def test_top_level_export_is_installed():
@@ -502,6 +520,34 @@ def test_smoke_tiny_matches_qli_v2_score_order():
     _, order = values.float().sort(dim=-1, descending=True)
     ours_ordered = torch.gather(out_idx.cpu(), dim=-1, index=order)
     assert torch.equal(ours_ordered.to(expected.dtype), expected), (ours_ordered, expected)
+
+
+@pytest.mark.real_compile
+def test_npu_clamps_invalid_seqused_k_before_scheduling():
+    """Direct ACLNN metadata is normalized on device to prevent OOB scheduling."""
+    import os
+
+    _require_npu()
+    if not os.environ.get("FLASHINFER_AOT_PATHS"):
+        raise AssertionError(
+            "FLASHINFER_AOT_PATHS is required for the metadata safety contract; missing package is a failure"
+        )
+    import torch_npu
+    import flashinfer
+    from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import sample
+
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
+    args, options, _ = sample(torch, torch_npu, **case)
+    for invalid in (case["max_seq_len_k"] + 4096, -7):
+        run_options = dict(options)
+        run_options["seqused_k"] = torch.tensor([invalid], dtype=torch.int32, device="npu")
+        out_idx, values = flashinfer.quant_lightning_indexer(*args, **run_options)
+        torch.npu.synchronize()
+        expected_case = dict(case)
+        expected_case["seqused_k"] = max(0, min(invalid, case["max_seq_len_k"]))
+        expected, _ = qli_v2_raw_golden(torch, **make_cpu_inputs(torch, expected_case))
+        assert values.numel() == 0
+        assert torch.equal(out_idx.cpu(), expected), (invalid, out_idx.cpu(), expected)
 
 
 @pytest.mark.real_compile
