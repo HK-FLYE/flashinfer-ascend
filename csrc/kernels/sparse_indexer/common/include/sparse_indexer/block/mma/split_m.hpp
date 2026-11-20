@@ -11,7 +11,7 @@
 #include "catlass/detail/macros.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "sparse_indexer/block/mask/visible_coord.hpp"
-#include "sparse_indexer/block/support/score_buffer.hpp"
+#include "sparse_indexer/block/mma/runtime.hpp"
 
 namespace SparseIndexer::Common::Block {
 
@@ -20,51 +20,35 @@ namespace SparseIndexer::Common::Block {
  * boundary must be exactly 2 * N1: vector0 owns query rows 0..1 and vector1
  * owns rows 2..3. The alignment is deliberately not a fixed four M rows.
  */
-template <class Dtype_, class LoadPolicy_, class Tiling_>
+template <class Dtype_, class LoadPolicy_>
 struct SplitMMmadPolicy {
     using Dtype = Dtype_;
     using LoadPolicy = LoadPolicy_;
-    using Tiling = Tiling_;
     using InputType = typename LoadPolicy::Dtype;
     using Block = SparseIndexer::Common::Block::BlockMmad<Dtype, Dtype, typename LoadPolicy::Loader,
         Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using Params = typename Block::Params;
 
-    CATLASS_DEVICE static Params MakeParams(__gm__ Tiling const* tiling)
-    {
-        Params params{};
-        params.keyLoader.d = tiling->d;
-        params.keyLoader.blockSize = tiling->blockSize;
-        params.keyLoader.maxBlocksPerBatch = tiling->maxBlocksPerBatch;
-        params.keyLoader.numPages = tiling->numPages;
-        params.keyLoader.keyStride0 = tiling->keyStride0;
-        params.mSplitAlignment = 2U * tiling->n1;
-        return params;
-    }
-
     template <class SyncPolicy_, class Scheduler_, class SchedulePolicy_>
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
         AscendC::LocalTensor<typename Block::DtypeC> const& ubC,
         AscendC::GlobalTensor<InputType> const& gmQ, AscendC::GlobalTensor<InputType> const& gmK,
-        __gm__ Tiling const* tiling,
+        MmaRuntimeParams<Block> const& runtime,
         AscendC::GlobalTensor<int32_t> const& gmBlockTable,
         AscendC::GlobalTensor<InputType> const& gmZeroPage, Scheduler_& scheduler)
     {
-        typename Block::Params mmadParams{MakeParams(tiling)};
         Block blockMmad(
-            ubC, gmQ, gmK, Catlass::GemmCoord(tiling->tq * tiling->n1, tiling->maxSeqLenK, tiling->d),
-            Catlass::GemmCoord(
-                SparseIndexer::Common::AlignUp(tiling->s1Tile * tiling->n1, 16U), tiling->s2Tile, tiling->d),
-            resource, mmadParams, gmBlockTable, gmZeroPage);
-        const bool doubleBuffered = ScoreBufferCount(tiling) > 1U;
-        const uint32_t scoreElems = ScoreElementsPerAiv(tiling);
+            ubC, gmQ, gmK, runtime.problemShape, runtime.tileShape, resource, runtime.block,
+            gmBlockTable, gmZeroPage);
+        const bool doubleBuffered = runtime.scoreBuffers > 1U;
+        const uint32_t scoreElems = runtime.scoreElemsPerAiv;
         uint32_t lastPingpong = 0;
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.Next(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
+            const auto visibleCoord = VisibleCoord(runtime.mask, coord, task.activeQ, task.activeK, task.residual);
             const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
-            blockMmad.BeginTask(coord.qStart * tiling->n1, coord.qRows * tiling->n1);
+            blockMmad.BeginTask(coord.qStart * runtime.heads, coord.qRows * runtime.heads);
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
                 const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
                 const SparseIndexer::Common::Block::KeyCoord keyCoord{
@@ -82,15 +66,15 @@ struct SplitMMmadPolicy {
                 const uint32_t pingpong = doubleBuffered ? (s2Idx & 1U) : 0U;
                 if (doubleBuffered) {
                     blockMmad.Compute(
-                        tile.qStart * tiling->n1, tile.qRows * tiling->n1, keyBufferIdx, tile.kRows);
+                        tile.qStart * runtime.heads, tile.qRows * runtime.heads, keyBufferIdx, tile.kRows);
                     SyncPolicy_::AicWaitCubeReady(pingpong);
                     blockMmad.SetOutputOffset(pingpong * scoreElems);
-                    blockMmad.Store(tile.qRows * tiling->n1, tile.kRows);
+                    blockMmad.Store(tile.qRows * runtime.heads, tile.kRows);
                 } else {
                     SyncPolicy_::AicWaitCubeReady(0);
                     blockMmad.Compute(
-                        tile.qStart * tiling->n1, tile.qRows * tiling->n1, keyBufferIdx, tile.kRows);
-                    blockMmad.Store(tile.qRows * tiling->n1, tile.kRows);
+                        tile.qStart * runtime.heads, tile.qRows * runtime.heads, keyBufferIdx, tile.kRows);
+                    blockMmad.Store(tile.qRows * runtime.heads, tile.kRows);
                 }
                 SyncPolicy_::AicArriveCubeDone(pingpong);
                 lastPingpong = pingpong;

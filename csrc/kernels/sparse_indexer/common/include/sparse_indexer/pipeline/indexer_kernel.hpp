@@ -31,6 +31,10 @@ class IndexerKernel {
     using TopK = typename Policies_::TopK;
     using Sync = typename Policies_::Sync;
     using ResourcePolicy = typename Policies_::Resource;
+    using ScheduleParams = typename Policies_::ScheduleRuntimeParams;
+    using MmaParams = typename Policies_::MmaRuntimeParams;
+    using ReduceParams = typename Policies_::ReduceRuntimeParams;
+    using SelectionParams = typename Policies_::SelectionRuntimeParams;
     using InputType = typename Mmad::InputType;
     using DtypeC = typename Mmad::Block::DtypeC;
 
@@ -69,17 +73,20 @@ public:
         GM_ADDR cmpResidualK, AscendC::GlobalTensor<int32_t> const& gmBlockTable,
         AscendC::GlobalTensor<InputType> const& gmZeroPage)
     {
-        typename Schedule::Params schedulerParams =
-            Schedule::MakeParams(tiling, cuSeqlensQ, sequsedK, cmpResidualK);
-        typename Schedule::Scheduler blockScheduler(schedulerParams);
+        ScheduleParams scheduleParams =
+            Policies_::MakeScheduleParams(tiling, cuSeqlensQ, sequsedK, cmpResidualK);
+        typename Schedule::Scheduler blockScheduler(scheduleParams);
 
         if ASCEND_IS_AIC {
+            MmaParams mmaParams = Policies_::MakeMmaParams(tiling);
             Mmad::template Run<Sync, typename Schedule::Scheduler, Schedule>(
-                resource_, ubC_, gmQ, gmK, tiling, gmBlockTable, gmZeroPage, blockScheduler);
+                resource_, ubC_, gmQ, gmK, mmaParams, gmBlockTable, gmZeroPage, blockScheduler);
         } else {
+            ReduceParams reduceParams = Policies_::MakeReduceParams(tiling);
+            SelectionParams selectionParams = Policies_::MakeSelectionParams(tiling);
             Reduce::template Run<Sync, typename Schedule::Scheduler, Schedule, TopK>(
-                resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores, tiling, blockScheduler,
-                outIndices);
+                resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores, reduceParams,
+                selectionParams, blockScheduler, outIndices);
         }
 
         Sync::GlobalBarrier();

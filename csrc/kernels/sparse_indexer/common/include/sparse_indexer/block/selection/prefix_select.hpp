@@ -8,6 +8,7 @@
 
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
+#include "sparse_indexer/block/selection/runtime.hpp"
 
 namespace SparseIndexer::Common::Block {
 
@@ -15,23 +16,22 @@ namespace SparseIndexer::Common::Block {
  * Current production TopK policy: RegTensor prefix below topK,
  * LiTopKVF above topK.
  */
-template <class VectorBlock_, class Tiling_>
+template <class VectorBlock_>
 struct PrefixLiTopKVFPolicy {
     using VectorBlock = VectorBlock_;
-    using Tiling = Tiling_;
 
     template <class Scheduler_, class SchedulePolicy_>
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
-        Scheduler_& scheduler, __gm__ Tiling const* tiling,
+        Scheduler_& scheduler, SelectionRuntimeParams const& selection,
         AscendC::GlobalTensor<float>& scores, AscendC::GlobalTensor<int32_t> const& outIndices)
     {
         AscendC::GlobalTensor<int32_t> dummyOffset;
         typename SchedulePolicy_::Coord coord{};
         typename VectorBlock::Params params{};
-        params.topK = tiling->topk;
-        params.s2Stride = tiling->maxSeqLenK;
-        params.s2Tile = tiling->topkS2Tile;
-        params.hasOutputIdxOffset = false;
+        params.topK = selection.topK;
+        params.s2Stride = selection.s2Stride;
+        params.s2Tile = selection.s2Tile;
+        params.hasOutputIdxOffset = selection.hasOutputIdxOffset;
         VectorBlock topk(resource, scores, outIndices, params, dummyOffset);
         while (scheduler.GetNextTopKCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
@@ -47,13 +47,12 @@ struct PrefixLiTopKVFPolicy {
  * LocalRows disables the generic TopK block's subblock row split, so each AIV
  * consumes exactly the rows it owns.
  */
-template <class VectorBlock_, class Tiling_>
+template <class VectorBlock_>
 struct InlinePrefixLiTopKVFPolicy {
     using VectorBlock = VectorBlock_;
-    using Tiling = Tiling_;
 
     CATLASS_DEVICE static void RunLocal(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
-        __gm__ Tiling const* tiling, AscendC::GlobalTensor<float>& scores,
+        SelectionRuntimeParams const& selection, AscendC::GlobalTensor<float>& scores,
         AscendC::GlobalTensor<int32_t> const& outIndices, uint32_t s1Start, uint32_t rows,
         uint32_t kStart, uint32_t kLen, uint32_t localQStart, uint32_t qLen, int32_t residual)
     {
@@ -62,10 +61,10 @@ struct InlinePrefixLiTopKVFPolicy {
         }
         AscendC::GlobalTensor<int32_t> dummyOffset;
         typename VectorBlock::Params params{};
-        params.topK = tiling->topk;
-        params.s2Stride = tiling->maxSeqLenK;
-        params.s2Tile = tiling->topkS2Tile;
-        params.hasOutputIdxOffset = false;
+        params.topK = selection.topK;
+        params.s2Stride = selection.s2Stride;
+        params.s2Tile = selection.s2Tile;
+        params.hasOutputIdxOffset = selection.hasOutputIdxOffset;
         VectorBlock topk(resource, scores, outIndices, params, dummyOffset);
         topk(s1Start, rows, kStart, kLen, localQStart, qLen, kLen, residual);
     }

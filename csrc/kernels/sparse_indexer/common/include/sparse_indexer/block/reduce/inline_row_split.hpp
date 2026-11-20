@@ -9,7 +9,8 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
 #include "sparse_indexer/block/mask/visible_coord.hpp"
-#include "sparse_indexer/block/support/score_buffer.hpp"
+#include "sparse_indexer/block/reduce/runtime.hpp"
+#include "sparse_indexer/block/selection/runtime.hpp"
 
 namespace SparseIndexer::Common::Block {
 
@@ -17,40 +18,22 @@ namespace SparseIndexer::Common::Block {
  * C2 reduce ownership. Each AIV processes half of the gS1 rows across all S2
  * tiles, then runs TopK for exactly those rows on the same core.
  */
-template <class Block_, class Tiling_>
+template <class Block_>
 struct InlineRowSplitReducePolicy {
     using Block = Block_;
-    using Tiling = Tiling_;
     using Params = typename Block::Params;
-
-    CATLASS_DEVICE static Params MakeParams(__gm__ Tiling const* tiling)
-    {
-        Params params{};
-        params.n1 = tiling->n1;
-        params.s2 = tiling->maxSeqLenK;
-        params.s1Tile = tiling->s1Tile;
-        params.s2Tile = tiling->s2Tile;
-        params.maskMode = tiling->maskMode;
-        params.cmpRatio = tiling->cmpRatio;
-        params.blockSize = tiling->blockSize;
-        params.maxBlocksPerBatch = tiling->maxBlocksPerBatch;
-        params.numPages = tiling->numPages;
-        params.kScaleStride0 = tiling->kScaleStride0;
-        params.scoreBuffers = ScoreBufferCount(tiling);
-        return params;
-    }
 
     template <class SyncPolicy_, class Scheduler_, class SchedulePolicy_, class TopKPolicy_>
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
         AscendC::LocalTensor<typename Block::DtypeScore>& ubC,
         AscendC::GlobalTensor<float> const& gmW, AscendC::GlobalTensor<float> const& gmQScale,
         AscendC::GlobalTensor<float> const& gmKScale, AscendC::GlobalTensor<int32_t> const& gmBlockTable,
-        AscendC::GlobalTensor<float>& scores, __gm__ Tiling const* tiling,
-        Scheduler_& scheduler, AscendC::GlobalTensor<int32_t> const& outIndices)
+        AscendC::GlobalTensor<float>& scores, ReduceRuntimeParams<Block> const& runtime,
+        SelectionRuntimeParams const& selection, Scheduler_& scheduler,
+        AscendC::GlobalTensor<int32_t> const& outIndices)
     {
-        typename Block::Params params{MakeParams(tiling)};
-        Block reducer(ubC, resource, gmW, gmQScale, gmKScale, gmBlockTable, scores, params);
-        const bool doubleBuffered = params.scoreBuffers > 1U;
+        Block reducer(ubC, resource, gmW, gmQScale, gmKScale, gmBlockTable, scores, runtime.block);
+        const bool doubleBuffered = runtime.scoreBuffers > 1U;
         SyncPolicy_::AivArriveVecReady(0);
         if (doubleBuffered) {
             SyncPolicy_::AivArriveVecReady(1);
@@ -58,7 +41,7 @@ struct InlineRowSplitReducePolicy {
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.Next(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
+            const auto visibleCoord = VisibleCoord(runtime.mask, coord, task.activeQ, task.activeK, task.residual);
             const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
                 const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
@@ -84,7 +67,7 @@ struct InlineRowSplitReducePolicy {
             const uint32_t rowBegin = sub * rowsPerAiv;
             if (rowBegin < task.coord.qRows) {
                 const uint32_t rows = AscendC::Std::min(rowsPerAiv, task.coord.qRows - rowBegin);
-                TopKPolicy_::RunLocal(resource, tiling, scores, outIndices,
+                TopKPolicy_::RunLocal(resource, selection, scores, outIndices,
                     task.coord.qStart + rowBegin, rows, task.requestKStart, task.activeK,
                     task.coord.localQBegin + rowBegin, task.activeQ, task.residual);
             }
