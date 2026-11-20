@@ -10,6 +10,7 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
 #include "catlass/gemm_coord.hpp"
+#include "../core/score_buffer.hpp"
 #include "quant_lightning_indexer_tiling_data.h"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
@@ -54,21 +55,47 @@ struct SplitMMmadPolicy {
             Catlass::GemmCoord(
                 SparseIndexer::Common::AlignUp(tiling->s1Tile * tiling->n1, 16U), tiling->s2Tile, tiling->d),
             resource, mmadParams, gmBlockTable, gmZeroPage);
+        const bool doubleBuffered = ScoreBufferCount(tiling) > 1U;
+        const uint32_t scoreElems = ScoreElementsPerAiv(tiling);
+        uint32_t lastPingpong = 0;
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.GetNextCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(coord, scheduler.policy());
+            const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
+            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
+            blockMmad.BeginTask(coord.qStart * tiling->n1, coord.actualQ * tiling->n1);
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
-                const auto tile = SchedulePolicy_::MakeS2Coord(coord, s2Idx, scheduler.policy());
+                const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
                 const SparseIndexer::Common::Block::KeyCoord keyCoord{
                     tile.kStart, tile.kStart - task.requestKStart, tile.batchIdx};
-                SyncPolicy_::AicWaitCubeReady();
-                blockMmad(
-                    tile.qStart * tiling->n1, tile.actualQ * tiling->n1, keyCoord, tile.actualK);
-                SyncPolicy_::AicArriveCubeDone();
+                if (s2Idx == 0U) {
+                    blockMmad.PrefetchKey(0, keyCoord, tile.actualK);
+                }
+                if (s2Idx + 1U < s2Tiles) {
+                    const auto nextTile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx + 1U, scheduler.policy());
+                    const SparseIndexer::Common::Block::KeyCoord nextKeyCoord{
+                        nextTile.kStart, nextTile.kStart - task.requestKStart, nextTile.batchIdx};
+                    blockMmad.PrefetchKey((s2Idx + 1U) % 3U, nextKeyCoord, nextTile.actualK);
+                }
+                const uint32_t keyBufferIdx = s2Idx % 3U;
+                const uint32_t pingpong = doubleBuffered ? (s2Idx & 1U) : 0U;
+                if (doubleBuffered) {
+                    blockMmad.Compute(
+                        tile.qStart * tiling->n1, tile.actualQ * tiling->n1, keyBufferIdx, tile.actualK);
+                    SyncPolicy_::AicWaitCubeReady(pingpong);
+                    blockMmad.SetOutputOffset(pingpong * scoreElems);
+                    blockMmad.Store(tile.actualQ * tiling->n1, tile.actualK);
+                } else {
+                    SyncPolicy_::AicWaitCubeReady(0);
+                    blockMmad.Compute(
+                        tile.qStart * tiling->n1, tile.actualQ * tiling->n1, keyBufferIdx, tile.actualK);
+                    blockMmad.Store(tile.actualQ * tiling->n1, tile.actualK);
+                }
+                SyncPolicy_::AicArriveCubeDone(pingpong);
+                lastPingpong = pingpong;
             }
         }
-        SyncPolicy_::AicFinalWait();
+        SyncPolicy_::AicFinalWait(lastPingpong);
     }
 };
 

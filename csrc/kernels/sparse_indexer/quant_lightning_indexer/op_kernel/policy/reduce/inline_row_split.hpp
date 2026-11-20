@@ -8,6 +8,7 @@
 
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
+#include "../core/score_buffer.hpp"
 #include "quant_lightning_indexer_tiling_data.h"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
@@ -35,6 +36,7 @@ struct InlineRowSplitReducePolicy {
         params.maxBlocksPerBatch = tiling->maxBlocksPerBatch;
         params.numPages = tiling->numPages;
         params.kScaleStride0 = tiling->kScaleStride0;
+        params.scoreBuffers = ScoreBufferCount(tiling);
         return params;
     }
 
@@ -49,26 +51,33 @@ struct InlineRowSplitReducePolicy {
     {
         typename Block::Params params{MakeParams(tiling)};
         Block reducer(ubC, resource, gmW, gmQScale, gmKScale, gmBlockTable, scores, params);
-        SyncPolicy_::AivArriveVecReady();
+        const bool doubleBuffered = params.scoreBuffers > 1U;
+        SyncPolicy_::AivArriveVecReady(0);
+        if (doubleBuffered) {
+            SyncPolicy_::AivArriveVecReady(1);
+        }
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.GetNextCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(coord, scheduler.policy());
+            const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
+            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
-                const auto tile = SchedulePolicy_::MakeS2Coord(coord, s2Idx, scheduler.policy());
-                SyncPolicy_::AivWaitCubeDone();
+                const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
+                const uint32_t pingpong = doubleBuffered ? (s2Idx & 1U) : 0U;
+                SyncPolicy_::AivWaitCubeDone(pingpong);
                 reducer(
                     tile.qStart, tile.actualQ, tile.kStart, tile.actualK,
                     tile.localQStart, task.activeQ, task.activeK, task.requestKStart, task.residual,
-                    task.maskActive, tile.batchIdx);
+                    task.maskActive, tile.batchIdx, pingpong);
                 // The last tile also carries the score hand-off for this gS1 task.
                 // Keep the cube/vector ready flag pending until the owning AIV has
                 // finished TopK, otherwise the next gS1 task can overwrite UB.
                 if (s2Idx + 1U < s2Tiles) {
-                    SyncPolicy_::AivArriveVecReady();
+                    SyncPolicy_::AivArriveVecReady(pingpong);
                 }
             }
 
+            reducer.WaitAllOutputs();
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             const uint32_t sub = AscendC::GetSubBlockIdx();
@@ -80,7 +89,8 @@ struct InlineRowSplitReducePolicy {
                     task.coord.qStart + rowBegin, rows, task.requestKStart, task.activeK,
                     task.coord.localQStart + rowBegin, task.activeQ, task.residual);
             }
-            SyncPolicy_::AivArriveVecReady();
+            const uint32_t lastPingpong = doubleBuffered ? ((s2Tiles - 1U) & 1U) : 0U;
+            SyncPolicy_::AivArriveVecReady(lastPingpong);
         }
     }
 };

@@ -36,10 +36,10 @@ struct DirectWorkspaceStore {
     /// Write rows of a packed UB tile. srcRowStride / dstRowStride are element counts.
     CATLASS_DEVICE static void StoreTile(
         AscendC::GlobalTensor<DtypeDst> gmDst, AscendC::LocalTensor<DtypeScore>& ubTile, uint32_t rows, uint32_t cols,
-        uint32_t srcRowStride, uint32_t dstRowStride)
+        uint32_t srcRowStride, uint32_t dstRowStride, uint32_t eventId = EVENT_ID0)
     {
-        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+        AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(eventId);
+        AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(eventId);
         uint32_t copyBytes = cols * sizeof(DtypeDst);
         uint32_t srcRowBytes = srcRowStride * sizeof(DtypeDst);
         uint32_t copyAligned = (copyBytes + Catlass::BYTE_PER_BLK - 1) / Catlass::BYTE_PER_BLK * Catlass::BYTE_PER_BLK;
@@ -47,8 +47,9 @@ struct DirectWorkspaceStore {
         uint32_t dstStrideBytes = (dstRowStride - cols) * sizeof(DtypeDst);
         AscendC::DataCopyExtParams params(rows, copyBytes, srcStrideBlocks, dstStrideBytes, 0);
         AscendC::DataCopyPad(gmDst, ubTile, params);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0);
+        // The caller defers this event until the same ping-pong buffer is
+        // reused (or until TopK takes over UB).
+        AscendC::SetFlag<AscendC::HardEvent::MTE3_V>(eventId);
     }
 };
 

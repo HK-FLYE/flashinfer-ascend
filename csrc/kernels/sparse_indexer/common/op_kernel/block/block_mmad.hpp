@@ -85,7 +85,7 @@ public:
         AscendC::GlobalTensor<int32_t> const& gmTable,
         AscendC::GlobalTensor<DtypeB> const& gmZero)
         : problemShape_(problemShape), tileShape_(tileShape), resource_(resource), gmA_(gmQ), gmB_(gmK), ubC_(ubC),
-          mSplitAlignment_(params.mSplitAlignment == 0 ? 1U : params.mSplitAlignment)
+          ubOut_(ubC), mSplitAlignment_(params.mSplitAlignment == 0 ? 1U : params.mSplitAlignment)
     {
         layoutA_ = LayoutA::template MakeLayout<DtypeA>(problemShape_.m(), problemShape_.k());
         layoutB_ = LayoutB::template MakeLayout<DtypeB>(problemShape_.k(), problemShape_.n());
@@ -97,6 +97,9 @@ public:
         kPart_ = AscendC::Std::min(kPart_, tileShape_.k());
 
         uint32_t l1ABytes = tileShape_.m() * tileShape_.k() * sizeof(DtypeA);
+        const uint32_t alignedNMax = SparseIndexer::Common::AlignUp(tileShape_.n(), L1BAlign::N_ALIGNED);
+        keyPartElems_ = kPart_ * alignedNMax;
+        keyBufElems_ = SparseIndexer::Common::CeilDiv(tileShape_.k(), kPart_) * keyPartElems_;
         l1A_ = resource_.l1Buf.template GetBufferByByte<DtypeA>(0);
         l1B_ = resource_.l1Buf.template GetBufferByByte<DtypeB>(l1ABytes);
         l0A_ = resource_.l0ABuf.template GetBufferByByte<DtypeA>(0);
@@ -104,6 +107,13 @@ public:
         l0C_ = resource_.l0CBuf.template GetBufferByByte<DtypeAccum>(0);
 
         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        // Q is invariant across all S2 tiles of one gS1 task. A separate
+        // event protects the optional L1A cache from the next task's reload.
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
+        // Three independent L1B buffers keep the next key transfer in flight
+        // while the current tile is consumed by MTE1/cube.
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
+        AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
         AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID0);
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
     }
@@ -112,43 +122,126 @@ public:
     ~BlockMmad()
     {
         AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID2);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID3);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
         AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID0);
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
     }
 
+    /**
+     * Load the Q tile once for a gS1 task. All S2 tiles produced by the same
+     * schedule coordinate reuse it, eliminating one GM->L1 Q transfer per S2.
+     * The cache is enabled only for the current single-K-part geometry; other
+     * problem shapes retain the original per-tile load path.
+     */
     CATLASS_DEVICE
-    void operator()(uint32_t mStart, uint32_t actualM, KeyCoord const& keyCoord, uint32_t actualN)
+    void BeginTask(uint32_t mStart, uint32_t actualM)
     {
-        uint32_t kTileCount = SparseIndexer::Common::CeilDiv(problemShape_.k(), kPart_);
-        uint32_t alignedM = SparseIndexer::Common::AlignUp(actualM, L1AAlign::M_ALIGNED);
-        uint32_t alignedN = SparseIndexer::Common::AlignUp(actualN, L1BAlign::N_ALIGNED);
+        const uint32_t kTileCount = SparseIndexer::Common::CeilDiv(problemShape_.k(), kPart_);
+        qCacheValid_ = false;
+        if (kTileCount != 1U) {
+            return;
+        }
+
+        const uint32_t alignedM = SparseIndexer::Common::AlignUp(actualM, L1AAlign::M_ALIGNED);
+        auto layoutAInL1 = Catlass::layout::zN::template MakeLayout<DtypeA>(alignedM, problemShape_.k());
+        const int64_t offsetA = layoutA_.GetOffset(Catlass::MatrixCoord(mStart, 0));
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
+        copyGmToL1A_(
+            l1A_, gmA_[offsetA], layoutAInL1, layoutA_.GetTileLayout(Catlass::MatrixCoord(actualM, problemShape_.k())));
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID1);
+        qCacheValid_ = true;
+        qReadyPending_ = true;
+    }
+
+    CATLASS_DEVICE
+    void SetOutputOffset(uint32_t elementOffset)
+    {
+        ubOut_ = ubC_[elementOffset];
+    }
+
+    CATLASS_DEVICE
+    static constexpr uint32_t KeyEvent(uint32_t bufferIdx)
+    {
+        return bufferIdx == 0U ? EVENT_ID0 : (bufferIdx == 1U ? EVENT_ID2 : EVENT_ID3);
+    }
+
+    /// Start the GM->L1 transfer for one S2 tile. The caller must keep at most
+    /// three tiles in flight so the ring buffer cannot overtake MTE1.
+    CATLASS_DEVICE
+    void PrefetchKey(uint32_t bufferIdx, KeyCoord const& keyCoord, uint32_t actualN)
+    {
+        const uint32_t kTileCount = SparseIndexer::Common::CeilDiv(problemShape_.k(), kPart_);
+        const uint32_t alignedN = SparseIndexer::Common::AlignUp(actualN, L1BAlign::N_ALIGNED);
+        auto layoutBInL1 = Catlass::layout::nZ::template MakeLayout<DtypeB>(kPart_, alignedN);
+        const uint32_t eventId = KeyEvent(bufferIdx);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(eventId);
+        for (uint32_t kIdx = 0; kIdx < kTileCount; ++kIdx) {
+            const uint32_t kStart = kIdx * kPart_;
+            const uint32_t actualK = AscendC::Std::min(kPart_, problemShape_.k() - kStart);
+            keyLoader_.Load(
+                l1B_[bufferIdx * keyBufElems_ + kIdx * keyPartElems_],
+                layoutBInL1, kStart, actualK, keyCoord, actualN);
+        }
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(eventId);
+    }
+
+    CATLASS_DEVICE
+    void Compute(uint32_t mStart, uint32_t actualM, uint32_t keyBufferIdx, uint32_t actualN)
+    {
+        const uint32_t kTileCount = SparseIndexer::Common::CeilDiv(problemShape_.k(), kPart_);
+        const uint32_t alignedM = SparseIndexer::Common::AlignUp(actualM, L1AAlign::M_ALIGNED);
+        const uint32_t alignedN = SparseIndexer::Common::AlignUp(actualN, L1BAlign::N_ALIGNED);
         auto layoutAInL1 = Catlass::layout::zN::template MakeLayout<DtypeA>(alignedM, kPart_);
         auto layoutBInL1 = Catlass::layout::nZ::template MakeLayout<DtypeB>(kPart_, alignedN);
+        const uint32_t keyEventId = KeyEvent(keyBufferIdx);
 
         AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(keyEventId);
         for (uint32_t kIdx = 0; kIdx < kTileCount; ++kIdx) {
-            uint32_t kStart = kIdx * kPart_;
-            uint32_t actualK = AscendC::Std::min(kPart_, problemShape_.k() - kStart);
-            int64_t offsetA = layoutA_.GetOffset(Catlass::MatrixCoord(mStart, kStart));
+            const uint32_t kStart = kIdx * kPart_;
+            const uint32_t actualK = AscendC::Std::min(kPart_, problemShape_.k() - kStart);
+            const int64_t offsetA = layoutA_.GetOffset(Catlass::MatrixCoord(mStart, kStart));
 
-            AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
-            copyGmToL1A_(
-                l1A_, gmA_[offsetA], layoutAInL1, layoutA_.GetTileLayout(Catlass::MatrixCoord(actualM, actualK)));
-            keyLoader_.Load(l1B_, layoutBInL1, kStart, actualK, keyCoord, actualN);
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
-
-            AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
+            if (!qCacheValid_) {
+                copyGmToL1A_(
+                    l1A_, gmA_[offsetA], layoutAInL1, layoutA_.GetTileLayout(Catlass::MatrixCoord(actualM, actualK)));
+            }
             AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID0);
+            if (qCacheValid_) {
+                if (qReadyPending_) {
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID1);
+                    qReadyPending_ = false;
+                } else {
+                    // The same cached Q is consumed by every S2 tile. Drain the
+                    // previous L1->L0A completion before starting the next one.
+                    AscendC::WaitFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
+                }
+            }
             copyL1ToL0A_(l0A_, l1A_, layoutAInL1, layoutAInL1);
-            copyL1ToL0B_(l0B_, l1B_, layoutBInL1, layoutBInL1);
+            if (qCacheValid_) {
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID1);
+            }
+            copyL1ToL0B_(
+                l0B_, l1B_[keyBufferIdx * keyBufElems_ + kIdx * keyPartElems_], layoutBInL1, layoutBInL1);
+            if (kIdx + 1U == kTileCount) {
+                // L1B can be refilled as soon as the tile has reached L0B.
+                AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(keyEventId);
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
 
             AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
             tileMmad_(l0C_, l0A_, l0B_, actualM, actualN, actualK, kIdx == 0);
             AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(EVENT_ID0);
-            AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(EVENT_ID0);
         }
 
+
+    }
+
+    CATLASS_DEVICE
+    void Store(uint32_t actualM, uint32_t actualN)
+    {
         constexpr uint32_t aivPerAic = 2;
         if constexpr (CopyMode_ == Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_N) {
             constexpr uint32_t l0cFractalN = 16;
@@ -157,7 +250,7 @@ public:
             auto tensorL0C =
                 tla::MakeTensor(l0C_, tla::MakeLayoutL0C(actualM, splitN), Catlass::Arch::PositionL0C{});
             auto tensorUbC = tla::MakeTensor(
-                ubC_,
+                ubOut_,
                 tla::MakeLayout(
                     tla::MakeShape(actualM, splitN),
                     tla::MakeStride(static_cast<int64_t>(splitN / aivPerAic), tla::Int<1>{}),
@@ -175,7 +268,7 @@ public:
             auto tensorL0C =
                 tla::MakeTensor(l0C_, tla::MakeLayoutL0C(splitM, splitN), Catlass::Arch::PositionL0C{});
             auto tensorUbC = tla::MakeTensor(
-                ubC_,
+                ubOut_,
                 tla::MakeLayout(
                     tla::MakeShape(splitM, splitN),
                     tla::MakeStride(static_cast<int64_t>(splitN), tla::Int<1>{}),
@@ -189,6 +282,14 @@ public:
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(EVENT_ID0);
     }
 
+    CATLASS_DEVICE
+    void operator()(uint32_t mStart, uint32_t actualM, KeyCoord const& keyCoord, uint32_t actualN)
+    {
+        PrefetchKey(0, keyCoord, actualN);
+        Compute(mStart, actualM, 0, actualN);
+        Store(actualM, actualN);
+    }
+
 private:
     using L1AAlign = Catlass::Gemm::helper::L1AlignHelper<DtypeA, LayoutA>;
     using L1BAlign = Catlass::Gemm::helper::L1AlignHelper<DtypeB, LayoutB>;
@@ -197,12 +298,17 @@ private:
     Catlass::GemmCoord tileShape_{};
     uint32_t kPart_{0};
     uint32_t mSplitAlignment_{1};
+    uint32_t keyPartElems_{0};
+    uint32_t keyBufElems_{0};
+    bool qCacheValid_{false};
+    bool qReadyPending_{false};
     LayoutA layoutA_{};
     LayoutB layoutB_{};
     Catlass::Arch::Resource<ArchTag>& resource_;
     AscendC::GlobalTensor<DtypeA> const& gmA_;
     AscendC::GlobalTensor<DtypeB> const& gmB_;
-    AscendC::LocalTensor<DtypeC> const& ubC_;
+    AscendC::LocalTensor<DtypeC> ubC_;
+    AscendC::LocalTensor<DtypeC> ubOut_;
     AscendC::LocalTensor<DtypeA> l1A_;
     AscendC::LocalTensor<DtypeB> l1B_;
     AscendC::LocalTensor<DtypeA> l0A_;

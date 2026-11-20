@@ -33,11 +33,9 @@ __simd_vf__ void ScaleHeadRowVF(__ubuf__ float *out, __ubuf__ float *score, __ub
     Reg::RegTensor<float> scale;
 
     Reg::Duplicate(sum, 0.0f, mask);
-    Reg::UnalignRegForLoad qkLoad;
     for (uint32_t head = 0; head < n1; ++head) {
-        auto qkSrc = score + head * headStride;
-        Reg::LoadUnAlignPre(qkLoad, qkSrc);
-        Reg::LoadUnAlign(qk, qkLoad, qkSrc);
+        // score/headStride are 32-byte aligned in the QLI UB layout.
+        Reg::LoadAlign<float>(qk, score + head * headStride);
         Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight + head);
         Reg::Relu(qk, qk, mask);
         Reg::MulAddDst(sum, qk, w, mask);
@@ -45,6 +43,56 @@ __simd_vf__ void ScaleHeadRowVF(__ubuf__ float *out, __ubuf__ float *score, __ub
     Reg::LoadAlign<float>(scale, kScale);
     Reg::Mul(sum, sum, scale, mask);
     Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM>(out, sum, mask);
+}
+
+// H4-only fast path: one row x two 64-lane segments. Keeping the register
+// footprint to two accumulators avoids the pressure that made a 2-row port
+// slower on this UB layout.
+__simd_vf__ void ScaleHeadH4Row2SegVF(__ubuf__ float *out, __ubuf__ float *score,
+                                      __ubuf__ float *weight, __ubuf__ float *kScale,
+                                      uint32_t headStride)
+{
+    Reg::MaskReg mask = Reg::CreateMask<float, Reg::MaskPattern::ALL>();
+    Reg::RegTensor<float> acc0;
+    Reg::RegTensor<float> acc1;
+    Reg::RegTensor<float> qk;
+    Reg::RegTensor<float> w;
+    Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight);
+    Reg::LoadAlign<float>(qk, score);
+    Reg::Relu(qk, qk, mask);
+    Reg::Mul(acc0, qk, w, mask);
+    Reg::LoadAlign<float>(qk, score + 64U);
+    Reg::Relu(qk, qk, mask);
+    Reg::Mul(acc1, qk, w, mask);
+    Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight + 1U);
+    Reg::LoadAlign<float>(qk, score + headStride);
+    Reg::Relu(qk, qk, mask);
+    Reg::MulAddDst(acc0, qk, w, mask);
+    Reg::LoadAlign<float>(qk, score + headStride + 64U);
+    Reg::Relu(qk, qk, mask);
+    Reg::MulAddDst(acc1, qk, w, mask);
+    Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight + 2U);
+    Reg::LoadAlign<float>(qk, score + 2U * headStride);
+    Reg::Relu(qk, qk, mask);
+    Reg::MulAddDst(acc0, qk, w, mask);
+    Reg::LoadAlign<float>(qk, score + 2U * headStride + 64U);
+    Reg::Relu(qk, qk, mask);
+    Reg::MulAddDst(acc1, qk, w, mask);
+    Reg::LoadAlign<float, Reg::LoadDist::DIST_BRC_B32>(w, weight + 3U);
+    Reg::LoadAlign<float>(qk, score + 3U * headStride);
+    Reg::Relu(qk, qk, mask);
+    Reg::MulAddDst(acc0, qk, w, mask);
+    Reg::LoadAlign<float>(qk, score + 3U * headStride + 64U);
+    Reg::Relu(qk, qk, mask);
+    Reg::MulAddDst(acc1, qk, w, mask);
+    Reg::RegTensor<float> scale0;
+    Reg::RegTensor<float> scale1;
+    Reg::LoadAlign<float>(scale0, kScale);
+    Reg::LoadAlign<float>(scale1, kScale + 64U);
+    Reg::Mul(acc0, acc0, scale0, mask);
+    Reg::Mul(acc1, acc1, scale1, mask);
+    Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM>(out, acc0, mask);
+    Reg::StoreAlign<float, Reg::StoreDist::DIST_NORM>(out + 64U, acc1, mask);
 }
 
 template <class MaskPolicy_ = SparseIndexer::Common::Block::LiV2MaskPolicy<float>, bool RowSplit_ = false>
@@ -59,6 +107,7 @@ public:
     static constexpr uint32_t kFloatBlock = Catlass::BYTE_PER_BLK / sizeof(float);
     static constexpr uint32_t kFloatVec = 256 / sizeof(float);
     static constexpr uint32_t kMaxRepeat = 255;
+    static constexpr uint32_t kKScaleCacheTiles = 16;
     static constexpr bool kRowSplit = RowSplit_;
 
     struct Params {
@@ -72,6 +121,7 @@ public:
         uint32_t maxBlocksPerBatch{0};
         uint32_t numPages{0};
         uint64_t kScaleStride0{0};
+        uint32_t scoreBuffers{1};
     };
 
     CATLASS_DEVICE
@@ -104,9 +154,12 @@ public:
             ? SparseIndexer::Common::AlignUp(s2Tile_, 8U)
             : SparseIndexer::Common::AlignUp(s2Tile_, 16U * aivPerAic) / aivPerAic;
         const uint32_t outStride = kRowSplit ? SparseIndexer::Common::AlignUp(s2Tile_, 64U) : colPerAiv;
-        uint32_t offset = workRows * n1_ * colPerAiv * sizeof(float);
-        ubOut_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += workRows * outStride * sizeof(float);
+        scoreElems_ = workRows * n1_ * colPerAiv;
+        uint32_t offset = params.scoreBuffers * scoreElems_ * sizeof(float);
+        outElems_ = workRows * outStride;
+        ubOutBase_ = resource.ubBuf.template GetBufferByByte<float>(offset);
+        ubOut_ = ubOutBase_;
+        offset += params.scoreBuffers * outElems_ * sizeof(float);
         ubW_ = resource.ubBuf.template GetBufferByByte<float>(offset);
         offset += vectorRows * wStride_ * sizeof(float);
         ubWIn_ = resource.ubBuf.template GetBufferByByte<float>(offset);
@@ -122,27 +175,100 @@ public:
         offset += vectorRows * kFloatVec * sizeof(float);
         offset = SparseIndexer::Common::AlignUp(offset, 256U);
         ubKScale_ = resource.ubBuf.template GetBufferByByte<float>(offset);
+        kScaleCacheCols_ = kKScaleCacheTiles * s2Tile_;
     }
 
     CATLASS_DEVICE
-    void ScaleHeadVF(uint32_t rows, uint32_t sourceStride, uint32_t outStride, uint32_t cols)
+    void WaitOutput(uint32_t bufferIdx)
+    {
+        if (outStorePending_[bufferIdx]) {
+            AscendC::WaitFlag<AscendC::HardEvent::MTE3_V>(EVENT_ID0 + bufferIdx);
+            outStorePending_[bufferIdx] = false;
+        }
+    }
+
+    CATLASS_DEVICE
+    void WaitAllOutputs()
+    {
+        for (uint32_t i = 0; i < params_.scoreBuffers; ++i) {
+            WaitOutput(i);
+        }
+    }
+
+    CATLASS_DEVICE
+    void ScaleHeadRow(uint32_t row, uint32_t sourceStride, uint32_t outStride, uint32_t cols,
+                      uint32_t kScaleOffset, uint32_t scoreElemOffset)
     {
         constexpr uint32_t kBlockFloats = 64;
-        for (uint32_t row = 0; row < rows; ++row) {
-            for (uint32_t off = 0; off < cols; off += kBlockFloats) {
-                const uint32_t blockCols = AscendC::Std::min(kBlockFloats, cols - off);
-                ScaleHeadRowVF((__ubuf__ float *)ubOut_[row * outStride + off].GetPhyAddr(),
-                    (__ubuf__ float *)ubScore_[(row * n1_) * sourceStride + off].GetPhyAddr(),
+        constexpr uint32_t kPairFloats = 2U * kBlockFloats;
+        uint32_t off = 0;
+        if (n1_ == 4U) {
+            for (; off + kPairFloats <= cols; off += kPairFloats) {
+                ScaleHeadH4Row2SegVF(
+                    (__ubuf__ float *)ubOut_[row * outStride + off].GetPhyAddr(),
+                    (__ubuf__ float *)ubScore_[scoreElemOffset + (row * n1_) * sourceStride + off].GetPhyAddr(),
                     (__ubuf__ float *)ubW_[row * wStride_].GetPhyAddr(),
-                    (__ubuf__ float *)ubKScale_[off].GetPhyAddr(), n1_, sourceStride, blockCols);
+                    (__ubuf__ float *)ubKScale_[kScaleOffset + off].GetPhyAddr(), sourceStride);
             }
         }
+        for (; off < cols; off += kBlockFloats) {
+            const uint32_t blockCols = AscendC::Std::min(kBlockFloats, cols - off);
+            ScaleHeadRowVF((__ubuf__ float *)ubOut_[row * outStride + off].GetPhyAddr(),
+                (__ubuf__ float *)ubScore_[scoreElemOffset + (row * n1_) * sourceStride + off].GetPhyAddr(),
+                (__ubuf__ float *)ubW_[row * wStride_].GetPhyAddr(),
+                (__ubuf__ float *)ubKScale_[kScaleOffset + off].GetPhyAddr(), n1_, sourceStride, blockCols);
+        }
+    }
+
+    CATLASS_DEVICE
+    void ScaleHeadVF(uint32_t rows, uint32_t sourceStride, uint32_t outStride, uint32_t cols,
+                    uint32_t kScaleOffset, uint32_t scoreElemOffset)
+    {
+        for (uint32_t row = 0; row < rows; ++row) {
+            ScaleHeadRow(row, sourceStride, outStride, cols, kScaleOffset, scoreElemOffset);
+        }
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
+    CATLASS_DEVICE
+    void LoadKScaleCache(uint32_t cacheStart, uint32_t fillCols, uint32_t batchIdx)
+    {
+        uint32_t localCol = 0;
+        while (localCol < fillCols) {
+            const uint32_t tok = cacheStart + localCol;
+            const uint32_t block = tok / params_.blockSize;
+            const uint32_t off = tok % params_.blockSize;
+            const uint32_t segCols = AscendC::Std::min(fillCols - localCol, params_.blockSize - off);
+            int32_t page = -1;
+            if (block < params_.maxBlocksPerBatch) {
+                page = gmBlockTable_.GetValue(
+                    static_cast<int64_t>(batchIdx) * params_.maxBlocksPerBatch + block);
+            }
+            if (page >= 0 && static_cast<uint32_t>(page) < params_.numPages) {
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
+                AscendC::DataCopyExtParams copyIn{
+                    1, static_cast<uint32_t>(segCols * sizeof(float)), 0, 0, 0};
+                AscendC::DataCopyPadExtParams<float> pad{false, 0, 0, 0.0f};
+                AscendC::DataCopyPad(
+                    ubKScale_[localCol],
+                    gmKScale_[static_cast<uint32_t>(page) * params_.kScaleStride0 + off], copyIn, pad);
+            } else {
+                AscendC::Duplicate(ubKScale_[localCol], 0.0f, segCols);
+            }
+            localCol += segCols;
+        }
+        // Columns beyond the visible range are masked to -inf below, so the
+        // partial tail does not need a second, variably-sized vector fill.
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
         AscendC::PipeBarrier<PIPE_V>();
     }
 
     CATLASS_DEVICE void operator()(
         uint32_t s1Start, uint32_t actualS1, uint32_t s2Start, uint32_t actualS2, uint32_t localQStart,
-        uint32_t qAct, uint32_t kAct, uint32_t reqKStart, int32_t residual, bool maskActive, uint32_t batchIdx)
+        uint32_t qAct, uint32_t kAct, uint32_t reqKStart, int32_t residual, bool maskActive, uint32_t batchIdx,
+        uint32_t scoreBufferIdx)
     {
         const uint32_t sub = AscendC::GetSubBlockIdx();
         uint32_t rowBegin = 0;
@@ -172,68 +298,142 @@ public:
             cols = AscendC::Std::min(outStride, actualS2 - colBegin);
             sourceStride = outStride;
         }
+        const uint32_t outBufferIdx = scoreBufferIdx % params_.scoreBuffers;
+        ubOut_ = ubOutBase_[outBufferIdx * outElems_];
+        WaitOutput(outBufferIdx);
+
         const uint32_t alignedRows = SparseIndexer::Common::AlignUp(rows, kFloatBlock);
         const uint32_t outputRowStart = s1Start + rowBegin;
         const uint32_t requestQStart = localQStart + rowBegin;
 
-        const uint32_t rightPad = wStride_ - n1_;
-        AscendC::DataCopyExtParams load{
-            static_cast<uint16_t>(rows), static_cast<uint32_t>(n1_ * sizeof(float)), 0, 0, 0};
-        AscendC::DataCopyPadExtParams<float> pad{rightPad != 0, 0, static_cast<uint8_t>(rightPad), 0.0f};
-        AscendC::DataCopyPad(ubWIn_, gmW_[outputRowStart * n1_], load, pad);
-        AscendC::DataCopyPad(ubQScaleIn_, gmQScale_[outputRowStart * n1_], load, pad);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-        if (alignedRows > rows) {
-            AscendC::Duplicate(ubWIn_[rows * wStride_], 0.0f, (alignedRows - rows) * wStride_);
-            AscendC::Duplicate(ubQScaleIn_[rows * wStride_], 0.0f, (alignedRows - rows) * wStride_);
+        // W and QScale are invariant across every S2 tile owned by this row
+        // group. Fuse them once per gS1 task instead of repeating two tiny
+        // GM->UB copies and a Mul for each 128-column tile.
+        const bool weightCacheHit =
+            weightCacheValid_ && weightCacheRowStart_ == outputRowStart && weightCacheRows_ == rows;
+        if (!weightCacheHit) {
+            const uint32_t rightPad = wStride_ - n1_;
+            AscendC::DataCopyExtParams load{
+                static_cast<uint16_t>(rows), static_cast<uint32_t>(n1_ * sizeof(float)), 0, 0, 0};
+            AscendC::DataCopyPadExtParams<float> pad{rightPad != 0, 0, static_cast<uint8_t>(rightPad), 0.0f};
+            AscendC::DataCopyPad(ubWIn_, gmW_[outputRowStart * n1_], load, pad);
+            AscendC::DataCopyPad(ubQScaleIn_, gmQScale_[outputRowStart * n1_], load, pad);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+            if (alignedRows > rows) {
+                AscendC::Duplicate(ubWIn_[rows * wStride_], 0.0f, (alignedRows - rows) * wStride_);
+                AscendC::Duplicate(ubQScaleIn_[rows * wStride_], 0.0f, (alignedRows - rows) * wStride_);
+                AscendC::PipeBarrier<PIPE_V>();
+            }
+            AscendC::Mul(ubW_, ubWIn_, ubQScaleIn_, alignedRows * wStride_);
+            AscendC::PipeBarrier<PIPE_V>();
+            weightCacheValid_ = true;
+            weightCacheRowStart_ = outputRowStart;
+            weightCacheRows_ = rows;
+        }
+
+        // QLIv2 caches 16 S2 tiles of PA key scales. Reuse the same chunk so
+        // only page-id lookups and one MTE2 transfer are paid per 2048 tokens.
+        uint32_t kScaleOffset = 0;
+        if constexpr (kRowSplit) {
+            const uint32_t tileStart = s2Start + colBegin;
+            const uint32_t cacheStart = tileStart / kScaleCacheCols_ * kScaleCacheCols_;
+            const bool cacheHit = kScaleCacheValid_ && kScaleCacheBatch_ == batchIdx &&
+                kScaleCacheStart_ == cacheStart;
+            if (!cacheHit) {
+                const uint32_t fillCols = cacheStart < kAct
+                    ? AscendC::Std::min(kScaleCacheCols_, kAct - cacheStart)
+                    : 0U;
+                LoadKScaleCache(cacheStart, fillCols, batchIdx);
+                kScaleCacheValid_ = true;
+                kScaleCacheBatch_ = batchIdx;
+                kScaleCacheStart_ = cacheStart;
+            }
+            kScaleOffset = tileStart - cacheStart;
+        } else {
+            uint32_t localCol = 0;
+            while (localCol < cols) {
+                const uint32_t tok = s2Start + colBegin + localCol;
+                const uint32_t block = tok / params_.blockSize;
+                const uint32_t off = tok % params_.blockSize;
+                const uint32_t segCols = AscendC::Std::min(cols - localCol, params_.blockSize - off);
+                int32_t page = -1;
+                if (block < params_.maxBlocksPerBatch) {
+                    page = gmBlockTable_.GetValue(
+                        static_cast<int64_t>(batchIdx) * params_.maxBlocksPerBatch + block);
+                }
+                if (page >= 0 && static_cast<uint32_t>(page) < params_.numPages) {
+                    AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
+                    AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
+                    AscendC::DataCopyExtParams copyIn{
+                        1, static_cast<uint32_t>(segCols * sizeof(float)), 0, 0, 0};
+                    AscendC::DataCopyPadExtParams<float> pad{false, 0, 0, 0.0f};
+                    AscendC::DataCopyPad(
+                        ubKScale_[localCol],
+                        gmKScale_[static_cast<uint32_t>(page) * params_.kScaleStride0 + off], copyIn, pad);
+                } else {
+                    AscendC::Duplicate(ubKScale_[localCol], 0.0f, segCols);
+                }
+                localCol += segCols;
+            }
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
             AscendC::PipeBarrier<PIPE_V>();
         }
-        AscendC::Mul(ubW_, ubWIn_, ubQScaleIn_, alignedRows * wStride_);
-        AscendC::PipeBarrier<PIPE_V>();
-
-        // Gather PA key scales per page segment. Only the page-id lookup is
-        // scalar; the scale payload stays on the MTE2 path and is never copied
-        // element-by-element through GetValue/SetValue.
-        uint32_t localCol = 0;
-        while (localCol < cols) {
-            const uint32_t tok = s2Start + colBegin + localCol;
-            const uint32_t block = tok / params_.blockSize;
-            const uint32_t off = tok % params_.blockSize;
-            const uint32_t segCols = AscendC::Std::min(cols - localCol, params_.blockSize - off);
-            int32_t page = -1;
-            if (block < params_.maxBlocksPerBatch) {
-                page = gmBlockTable_.GetValue(
-                    static_cast<int64_t>(batchIdx) * params_.maxBlocksPerBatch + block);
+        const uint32_t scoreElemOffset = scoreBufferIdx * scoreElems_;
+        bool integratedRowMask = false;
+        if constexpr (kRowSplit) {
+            if (maskActive && params_.maskMode == 3) {
+                integratedRowMask = true;
+                uint32_t rowCols[4] = {cols, cols, cols, cols};
+                const uint32_t tileBase = s2Start + colBegin - reqKStart;
+                bool needsFill = false;
+                for (uint32_t row = 0; row < rows; ++row) {
+                    const uint32_t localQ = localQStart + rowBegin + row;
+                    if (localQ >= qAct) {
+                        rowCols[row] = 0U;
+                    } else {
+                        const uint32_t visible = SparseIndexer::Common::Block::Mask3VisibleLen(
+                            localQ, qAct, kAct, params_.cmpRatio, residual);
+                        rowCols[row] = visible > tileBase
+                            ? AscendC::Std::min(cols, visible - tileBase)
+                            : 0U;
+                    }
+                    needsFill = needsFill || rowCols[row] < cols;
+                }
+                if (needsFill) {
+                    for (uint32_t row = 0; row < rows; ++row) {
+                        if (rowCols[row] < cols) {
+                            auto rowOut = ubOut_[row * outStride];
+                            AscendC::Duplicate(rowOut.ReinterpretCast<uint32_t>(),
+                                SparseIndexer::Common::Block::kFloatNegInfBits, outStride);
+                        }
+                    }
+                    AscendC::PipeBarrier<PIPE_V>();
+                }
+                for (uint32_t row = 0; row < rows; ++row) {
+                    if (rowCols[row] != 0U) {
+                        ScaleHeadRow(row, sourceStride, outStride, rowCols[row], kScaleOffset, scoreElemOffset);
+                    }
+                }
+                AscendC::PipeBarrier<PIPE_V>();
             }
-            if (page >= 0 && static_cast<uint32_t>(page) < params_.numPages) {
-                AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
-                AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(EVENT_ID1);
-                AscendC::DataCopyExtParams copyIn{
-                    1, static_cast<uint32_t>(segCols * sizeof(float)), 0, 0, 0};
-                AscendC::DataCopyPadExtParams<float> pad{false, 0, 0, 0.0f};
-                AscendC::DataCopyPad(
-                    ubKScale_[localCol],
-                    gmKScale_[static_cast<uint32_t>(page) * params_.kScaleStride0 + off], copyIn, pad);
-            } else {
-                AscendC::Duplicate(ubKScale_[localCol], 0.0f, segCols);
-            }
-            localCol += segCols;
         }
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
-        AscendC::PipeBarrier<PIPE_V>();
-        ScaleHeadVF(rows, sourceStride, outStride, cols);
-
-        maskPolicy_.Apply(
-            rows, cols, outStride, colBegin, s2Start, requestQStart, qAct, kAct, reqKStart, residual,
-            maskActive, params_.maskMode, params_.cmpRatio);
+        if (!integratedRowMask) {
+            ScaleHeadVF(rows, sourceStride, outStride, cols, kScaleOffset, scoreElemOffset);
+            maskPolicy_.Apply(
+                rows, cols, outStride, colBegin, s2Start, requestQStart, qAct, kAct, reqKStart, residual,
+                maskActive, params_.maskMode, params_.cmpRatio);
+        }
         SparseIndexer::Common::Block::DirectWorkspaceStore<float, float>::StoreTile(
-            gmDst_[outputRowStart * s2_ + s2Start + colBegin], ubOut_, rows, cols, outStride, s2_);
+            gmDst_[outputRowStart * s2_ + s2Start + colBegin], ubOut_, rows, cols, outStride, s2_,
+            EVENT_ID0 + outBufferIdx);
+        outStorePending_[outBufferIdx] = true;
     }
 
 private:
     AscendC::LocalTensor<float>& ubScore_;
+    AscendC::LocalTensor<float> ubOutBase_;
     AscendC::LocalTensor<float> ubOut_;
     AscendC::LocalTensor<float> ubW_;
     AscendC::LocalTensor<float> ubWIn_;
@@ -252,6 +452,16 @@ private:
     uint32_t s1Tile_{0};
     uint32_t s2Tile_{0};
     uint32_t wStride_{0};
+    uint32_t scoreElems_{0};
+    uint32_t outElems_{0};
+    bool outStorePending_[2]{false, false};
+    bool weightCacheValid_{false};
+    uint32_t weightCacheRowStart_{0};
+    uint32_t weightCacheRows_{0};
+    uint32_t kScaleCacheCols_{0};
+    uint32_t kScaleCacheStart_{0};
+    uint32_t kScaleCacheBatch_{0};
+    bool kScaleCacheValid_{false};
     MaskPolicy maskPolicy_;
 };
 

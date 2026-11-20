@@ -10,6 +10,7 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/detail/macros.hpp"
+#include "../core/score_buffer.hpp"
 #include "quant_lightning_indexer_tiling_data.h"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
@@ -54,9 +55,11 @@ struct SplitNMmadPolicy {
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.GetNextCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(coord, scheduler.policy());
+            const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
+            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
+            blockMmad.BeginTask(coord.qStart * tiling->n1, coord.actualQ * tiling->n1);
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
-                const auto tile = SchedulePolicy_::MakeS2Coord(coord, s2Idx, scheduler.policy());
+                const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
                 const SparseIndexer::Common::Block::KeyCoord keyCoord{
                     tile.kStart, tile.kStart - task.requestKStart, tile.batchIdx};
                 SyncPolicy_::AicWaitCubeReady();

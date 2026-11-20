@@ -71,7 +71,7 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     tilingData.d = params.d;
     tilingData.topk = params.topk;
     tilingData.batch = params.batch;
-    constexpr uint32_t kS2TileCap = 128;
+    constexpr uint32_t kS2TileCap = 512;
     constexpr uint32_t kUbSize = 248 * 1024;
     constexpr uint32_t kL1Size = 512 * 1024;
     constexpr uint32_t kL0cSize = 256 * 1024;
@@ -92,9 +92,9 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     const uint32_t wStride = SparseIndexer::Common::AlignUp(params.n1, 32 / kWElemBytes);
     // Score + out + W/qScale tiles + wBrcb/ubTmp(kFloatVec) + ubKScale pad.
     constexpr uint32_t kFloatVec = 64;
-    const uint64_t ubBytesPerS1 = sizeof(float) * (s2Split / kAivPerAic) * (params.n1 + 1) +
+    const uint64_t ubBytesPerS1 = 2ULL * sizeof(float) * (s2Split / kAivPerAic) * (params.n1 + 1) +
         sizeof(float) * wStride * 3 + sizeof(float) * (8 + kFloatVec) +
-        sizeof(float) * (s2Split / kAivPerAic) + 256U;
+        sizeof(float) * (16 * s2Tile + s2Split / kAivPerAic) + 256U;
     const uint32_t l0cRows = kL0cSize / (s2Split * sizeof(float));
     uint32_t s1Tile = static_cast<uint32_t>(kUbSize / ubBytesPerS1);
     while (s1Tile > 0 &&

@@ -17,29 +17,29 @@ struct BlockBarrierSyncPolicy {
     static constexpr uint16_t kVecToCube = 0;
     static constexpr uint16_t kCubeToVec = 1;
 
-    CATLASS_DEVICE static void AicWaitCubeReady()
+    CATLASS_DEVICE static void AicWaitCubeReady(uint32_t pingpong = 0)
     {
-        asc_sync_block_wait(PIPE_FIX, kVecToCube);
+        asc_sync_block_wait(PIPE_FIX, kVecToCube + pingpong);
     }
 
-    CATLASS_DEVICE static void AicArriveCubeDone()
+    CATLASS_DEVICE static void AicArriveCubeDone(uint32_t pingpong = 0)
     {
-        asc_sync_block_arrive(PIPE_FIX, kCubeToVec);
+        asc_sync_block_arrive(PIPE_FIX, kCubeToVec + pingpong);
     }
 
-    CATLASS_DEVICE static void AicFinalWait()
+    CATLASS_DEVICE static void AicFinalWait(uint32_t pingpong = 0)
     {
-        asc_sync_block_wait(PIPE_FIX, kVecToCube);
+        asc_sync_block_wait(PIPE_FIX, kVecToCube + pingpong);
     }
 
-    CATLASS_DEVICE static void AivArriveVecReady()
+    CATLASS_DEVICE static void AivArriveVecReady(uint32_t pingpong = 0)
     {
-        asc_sync_block_arrive(PIPE_MTE3, kVecToCube);
+        asc_sync_block_arrive(PIPE_MTE3, kVecToCube + pingpong);
     }
 
-    CATLASS_DEVICE static void AivWaitCubeDone()
+    CATLASS_DEVICE static void AivWaitCubeDone(uint32_t pingpong = 0)
     {
-        asc_sync_block_wait(PIPE_V, kCubeToVec);
+        asc_sync_block_wait(PIPE_V, kCubeToVec + pingpong);
     }
 
     CATLASS_DEVICE static void GlobalBarrier()
@@ -61,32 +61,32 @@ struct SubblockPairBlockBarrierSyncPolicy {
     static constexpr uint16_t kCubeToVec = 2;
     static constexpr uint16_t kAivPairOffset = 16;
 
-    CATLASS_DEVICE static void AicWaitCubeReady()
+    CATLASS_DEVICE static void AicWaitCubeReady(uint32_t pingpong = 0)
     {
-        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube);
-        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube + kAivPairOffset);
+        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube + pingpong);
+        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube + pingpong + kAivPairOffset);
     }
 
-    CATLASS_DEVICE static void AicArriveCubeDone()
+    CATLASS_DEVICE static void AicArriveCubeDone(uint32_t pingpong = 0)
     {
-        AscendC::CrossCoreSetFlag<kSyncMode, PIPE_FIX>(kCubeToVec);
-        AscendC::CrossCoreSetFlag<kSyncMode, PIPE_FIX>(kCubeToVec + kAivPairOffset);
+        AscendC::CrossCoreSetFlag<kSyncMode, PIPE_FIX>(kCubeToVec + pingpong);
+        AscendC::CrossCoreSetFlag<kSyncMode, PIPE_FIX>(kCubeToVec + pingpong + kAivPairOffset);
     }
 
-    CATLASS_DEVICE static void AicFinalWait()
+    CATLASS_DEVICE static void AicFinalWait(uint32_t pingpong = 0)
     {
-        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube);
-        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube + kAivPairOffset);
+        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube + pingpong);
+        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_FIX>(kVecToCube + pingpong + kAivPairOffset);
     }
 
-    CATLASS_DEVICE static void AivArriveVecReady()
+    CATLASS_DEVICE static void AivArriveVecReady(uint32_t pingpong = 0)
     {
-        AscendC::CrossCoreSetFlag<kSyncMode, PIPE_V>(kVecToCube);
+        AscendC::CrossCoreSetFlag<kSyncMode, PIPE_V>(kVecToCube + pingpong);
     }
 
-    CATLASS_DEVICE static void AivWaitCubeDone()
+    CATLASS_DEVICE static void AivWaitCubeDone(uint32_t pingpong = 0)
     {
-        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_V>(kCubeToVec);
+        AscendC::CrossCoreWaitFlag<kSyncMode, PIPE_V>(kCubeToVec + pingpong);
     }
 
     CATLASS_DEVICE static void GlobalBarrier()

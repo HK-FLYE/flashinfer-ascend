@@ -8,6 +8,7 @@
 
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
+#include "../core/score_buffer.hpp"
 #include "quant_lightning_indexer_tiling_data.h"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
@@ -51,17 +52,19 @@ struct ColumnSplitReducePolicy {
         typename SchedulePolicy_::Coord coord{};
         while (scheduler.GetNextCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(coord, scheduler.policy());
+            const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
+            const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
-                const auto tile = SchedulePolicy_::MakeS2Coord(coord, s2Idx, scheduler.policy());
+                const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
                 SyncPolicy_::AivWaitCubeDone();
                 reducer(
                     tile.qStart, tile.actualQ, tile.kStart, tile.actualK,
                     tile.localQStart, task.activeQ, task.activeK, task.requestKStart, task.residual,
-                    task.maskActive, tile.batchIdx);
+                    task.maskActive, tile.batchIdx, 0);
                 SyncPolicy_::AivArriveVecReady();
             }
         }
+        reducer.WaitAllOutputs();
     }
 };
 
