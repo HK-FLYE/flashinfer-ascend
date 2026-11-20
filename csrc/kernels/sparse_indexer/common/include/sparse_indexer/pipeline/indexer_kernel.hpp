@@ -3,8 +3,8 @@
  * Licensed under CANN Open Software License Agreement Version 2.0.
  */
 
-#ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_KERNEL_HPP
-#define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_KERNEL_HPP
+#ifndef FLASHINFER_SPARSE_INDEXER_PIPELINE_INDEXER_KERNEL_HPP
+#define FLASHINFER_SPARSE_INDEXER_PIPELINE_INDEXER_KERNEL_HPP
 
 #include <type_traits>
 
@@ -12,6 +12,8 @@
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
 #include "sparse_indexer/foundation/contracts/policy.hpp"
+#include "sparse_indexer/pipeline/epilogue/reduce_select_epilogue.hpp"
+#include "sparse_indexer/pipeline/mainloop/load_mma_mainloop.hpp"
 
 namespace SparseIndexer::Common::Pipeline {
 
@@ -37,6 +39,8 @@ class IndexerKernel {
     using SelectionParams = typename Policies_::SelectionRuntimeParams;
     using InputType = typename Mmad::InputType;
     using DtypeC = typename Mmad::Block::DtypeC;
+    using Mainloop = LoadMmaMainloop<Mmad, Schedule, Sync>;
+    using Epilogue = ReduceSelectEpilogue<Reduce, TopK, Schedule, Sync>;
 
     static_assert(SparseIndexer::Common::HasSchedulePolicy<Schedule>::value,
         "SchedulePolicy must expose Scheduler/Params/Coord/Task");
@@ -79,14 +83,14 @@ public:
 
         if ASCEND_IS_AIC {
             MmaParams mmaParams = Policies_::MakeMmaParams(tiling);
-            Mmad::template Run<Sync, typename Schedule::Scheduler, Schedule>(
+            Mainloop::Run(
                 resource_, ubC_, gmQ, gmK, mmaParams, gmBlockTable, gmZeroPage, blockScheduler);
         } else {
             ReduceParams reduceParams = Policies_::MakeReduceParams(tiling);
             SelectionParams selectionParams = Policies_::MakeSelectionParams(tiling);
-            Reduce::template Run<Sync, typename Schedule::Scheduler, Schedule, TopK>(
-                resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores, reduceParams,
-                selectionParams, blockScheduler, outIndices);
+            Epilogue::Run(
+                resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores,
+                reduceParams, selectionParams, blockScheduler, outIndices);
         }
 
         Sync::GlobalBarrier();
@@ -98,4 +102,4 @@ public:
 
 } // namespace SparseIndexer::Common::Pipeline
 
-#endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_KERNEL_HPP
+#endif // FLASHINFER_SPARSE_INDEXER_PIPELINE_INDEXER_KERNEL_HPP
