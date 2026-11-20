@@ -15,10 +15,10 @@
 #include "catlass/catlass.hpp"
 #include "kernel_operator.h"
 
-#include "block/block_reduce_head.hpp"
-#include "block/mask_policy.hpp"
-#include "indexer/linear_arena.hpp"
-#include "sparse_indexer_common.hpp"
+#include "sparse_indexer/block/reduce/store_utils.hpp"
+#include "sparse_indexer/block/mask/mask_policy.hpp"
+#include "sparse_indexer/foundation/resource/linear_arena.hpp"
+#include "sparse_indexer/foundation/contracts/common.hpp"
 
 namespace QuantLightningIndexerKernelDetail {
 

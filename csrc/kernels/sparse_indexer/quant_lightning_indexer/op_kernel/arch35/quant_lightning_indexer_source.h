@@ -10,8 +10,8 @@
 
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_tiling_data.h"
-#include "sparse_indexer_common.hpp"
-#include "sparse_indexer_problem.hpp"
+#include "sparse_indexer/foundation/contracts/common.hpp"
+#include "sparse_indexer/foundation/contracts/problem.hpp"
 
 namespace QuantLightningIndexerKernelDetail {
 

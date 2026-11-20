@@ -12,7 +12,7 @@
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_tiling_data.h"
-#include "core/policy_bundle.hpp"
+#include "sparse_indexer/foundation/contracts/policy.hpp"
 
 /**
  * Static policy composer. Schedule/load/mmad/reduce/topk/sync/resource are
@@ -20,7 +20,7 @@
  */
 template <class Policies_>
 class QuantLightningIndexerKernel {
-    static_assert(SparseIndexer::QuantLightningIndexer::Policy::IsPolicyBundle<Policies_>::value,
+    static_assert(SparseIndexer::Common::IsPolicyBundle<Policies_>::value,
         "QuantLightningIndexerKernel requires a PolicyBundle");
 
     using Schedule = typename Policies_::Schedule;
@@ -33,6 +33,22 @@ class QuantLightningIndexerKernel {
     using InputType = typename Mmad::InputType;
     using DtypeC = typename Mmad::Block::DtypeC;
 
+    static_assert(SparseIndexer::Common::HasSchedulePolicy<Schedule>::value,
+        "SchedulePolicy must expose Scheduler/Params/Coord/Task");
+    static_assert(std::is_same<typename Schedule::Coord, SparseIndexer::Common::WorkItem>::value,
+        "SchedulePolicy Coord must be the common WorkItem");
+    static_assert(SparseIndexer::Common::HasLoadPolicy<Load>::value,
+        "LoadPolicy must expose Loader/Dtype");
+    static_assert(SparseIndexer::Common::HasMmadPolicy<Mmad>::value,
+        "MmadPolicy must expose InputType/Block/LoadPolicy");
+    static_assert(SparseIndexer::Common::HasReducePolicy<Reduce>::value,
+        "ReducePolicy must expose Block");
+    static_assert(SparseIndexer::Common::HasSelectionPolicy<TopK>::value,
+        "SelectionPolicy must expose VectorBlock");
+    static_assert(SparseIndexer::Common::HasSyncPolicy<Sync>::value,
+        "SyncPolicy must expose the cube/vector hand-off surface");
+    static_assert(SparseIndexer::Common::HasResourcePolicy<ResourcePolicy>::value,
+        "ResourcePolicy must expose Resource");
     static_assert(std::is_same<Load, typename Mmad::LoadPolicy>::value,
         "the bundle Load policy must be the policy embedded in the Mmad pipeline");
 

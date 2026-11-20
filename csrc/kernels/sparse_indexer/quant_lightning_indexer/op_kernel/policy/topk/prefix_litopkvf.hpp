@@ -35,7 +35,7 @@ struct PrefixLiTopKVFPolicy {
         VectorBlock topk(resource, scores, outIndices, params, dummyOffset);
         while (scheduler.GetNextTopKCoord(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-            topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK, coord.localQStart,
+            topk(coord.qStart, coord.qRows, coord.kStart, coord.kRows, coord.localQBegin,
                 task.activeQ, task.activeK, task.residual);
         }
     }

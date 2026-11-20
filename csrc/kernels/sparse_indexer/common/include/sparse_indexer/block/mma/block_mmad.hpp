@@ -26,8 +26,8 @@
 #include "tla/layout.hpp"
 #include "tla/tensor.hpp"
 
-#include "key_loader.hpp"
-#include "sparse_indexer_common.hpp"
+#include "sparse_indexer/block/load/key_loader.hpp"
+#include "sparse_indexer/foundation/contracts/common.hpp"
 
 namespace SparseIndexer::Common::Block {
 

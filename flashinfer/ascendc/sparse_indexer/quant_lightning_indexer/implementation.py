@@ -105,7 +105,6 @@ IMPLEMENTATION = AscendCImplementation(
         shared_native_roots=("csrc/kernels/sparse_indexer/common",),
         shared_includes=(
             "csrc/kernels/sparse_indexer/common/include",
-            "csrc/kernels/sparse_indexer/common/op_kernel",
         ),
         implementation="catlass",
         dependencies=(BuildDependency(name="catlass", revision=CATLASS_REVISION),),

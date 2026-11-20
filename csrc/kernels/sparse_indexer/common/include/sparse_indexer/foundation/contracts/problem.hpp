@@ -15,11 +15,6 @@ enum class IndexerMaskKind : uint8_t { None = 0, CompressedMask3 = 3, RegionCaus
 enum class IndexerOutputKind : uint8_t { IndicesOnly = 0, ScoreAndIndices = 1 };
 enum class IndexerSelectionOrder : uint8_t { QliRawSlot = 0, ScoreDescending = 1, IndexAscending = 2 };
 
-/**
- * Variant-neutral problem description consumed by common device policies.
- * Each operator keeps its own public ABI and tiling POD; its device adapter
- * fills this structure without exposing it to callers.
- */
 struct IndexerProblem {
     uint32_t batch{1};
     uint32_t totalQ{0};
@@ -42,12 +37,13 @@ struct RequestView {
     uint32_t visibleK{0};
 };
 
+/// Device-side unit emitted by a schedule policy and consumed by load/mmad/reduce.
 struct WorkItem {
     uint32_t requestId{0};
-    uint32_t qBegin{0};
+    uint32_t qStart{0};
     uint32_t qRows{0};
     uint32_t localQBegin{0};
-    uint32_t kBegin{0};
+    uint32_t kStart{0};
     uint32_t kRows{0};
     uint32_t visibleK{0};
     uint32_t keySlot{0};

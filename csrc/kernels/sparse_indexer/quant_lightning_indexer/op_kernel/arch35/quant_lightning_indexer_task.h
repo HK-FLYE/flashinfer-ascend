@@ -6,7 +6,7 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_ARCH35_TASK_H
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_ARCH35_TASK_H
 
-#include "block/block_scheduler.hpp"
+#include "sparse_indexer/block/schedule/block_scheduler.hpp"
 #include "quant_lightning_indexer_source.h"
 
 namespace QuantLightningIndexerKernelDetail {
@@ -25,10 +25,10 @@ CATLASS_DEVICE inline QuantLightningIndexerTask MakeQuantLightningIndexerTask(
 {
     QuantLightningIndexerTask task{};
     task.coord = coord;
-    task.requestKStart = source.KBegin(coord.batchIdx);
-    task.activeQ = source.ActiveQ(coord.batchIdx);
-    task.activeK = source.ActiveK(coord.batchIdx);
-    task.residual = source.Residual(coord.batchIdx);
+    task.requestKStart = source.KBegin(coord.requestId);
+    task.activeQ = source.ActiveQ(coord.requestId);
+    task.activeK = source.ActiveK(coord.requestId);
+    task.residual = source.Residual(coord.requestId);
     task.maskActive = source.MaskActive();
     return task;
 }

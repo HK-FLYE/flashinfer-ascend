@@ -6,7 +6,7 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_LOAD_PAGED_KEY_HPP
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_LOAD_PAGED_KEY_HPP
 
-#include "block/key_loader.hpp"
+#include "sparse_indexer/block/load/key_loader.hpp"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 

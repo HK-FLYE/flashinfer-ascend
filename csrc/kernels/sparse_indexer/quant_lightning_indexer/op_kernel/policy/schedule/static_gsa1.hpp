@@ -6,7 +6,7 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SCHEDULE_STATIC_GSA1_HPP
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SCHEDULE_STATIC_GSA1_HPP
 
-#include "block/block_scheduler.hpp"
+#include "sparse_indexer/block/schedule/block_scheduler.hpp"
 #include "catlass/detail/macros.hpp"
 #include "arch35/quant_lightning_indexer_source.h"
 #include "arch35/quant_lightning_indexer_task.h"
@@ -56,12 +56,12 @@ public:
                 continue;
             }
             const uint32_t qBlock = static_cast<uint32_t>(tileId - accumulated);
-            coord.batchIdx = b;
-            coord.localQStart = qBlock * params.s1Tile;
-            coord.qStart = requestQStart + coord.localQStart;
-            coord.actualQ = (qBlock + 1U == qDim) ? (qLen - coord.localQStart) : params.s1Tile;
+            coord.requestId = b;
+            coord.localQBegin = qBlock * params.s1Tile;
+            coord.qStart = requestQStart + coord.localQBegin;
+            coord.qRows = (qBlock + 1U == qDim) ? (qLen - coord.localQBegin) : params.s1Tile;
             coord.kStart = source.KBegin(b);
-            coord.actualK = kLen;
+            coord.kRows = kLen;
             return true;
         }
         return false;
@@ -70,7 +70,7 @@ public:
     CATLASS_DEVICE static uint32_t CountS2Tiles(
         SparseIndexer::Common::Block::ScheduleCoord const& coord, Params const& params)
     {
-        return SparseIndexer::Common::Block::detail::CeilDiv(coord.actualK, params.s2Tile);
+        return SparseIndexer::Common::Block::detail::CeilDiv(coord.kRows, params.s2Tile);
     }
 
     CATLASS_DEVICE static SparseIndexer::Common::Block::ScheduleCoord MakeS2Coord(
@@ -78,7 +78,7 @@ public:
     {
         auto tile = coord;
         tile.kStart = coord.kStart + s2Idx * params.s2Tile;
-        tile.actualK = AscendC::Std::min(params.s2Tile, coord.actualK - s2Idx * params.s2Tile);
+        tile.kRows = AscendC::Std::min(params.s2Tile, coord.kRows - s2Idx * params.s2Tile);
         return tile;
     }
 };

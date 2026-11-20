@@ -11,7 +11,7 @@
 #include "catlass/matrix_coord.hpp"
 #include "kernel_operator.h"
 
-#include "sparse_indexer_common.hpp"
+#include "sparse_indexer/foundation/contracts/common.hpp"
 
 namespace SparseIndexer::Common::Block {
 

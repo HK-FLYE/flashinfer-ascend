@@ -6,7 +6,7 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_MMAD_SPLIT_M_HPP
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_MMAD_SPLIT_M_HPP
 
-#include "block/block_mmad.hpp"
+#include "sparse_indexer/block/mma/block_mmad.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
 #include "catlass/gemm_coord.hpp"
@@ -59,37 +59,37 @@ struct SplitMMmadPolicy {
         const uint32_t scoreElems = ScoreElementsPerAiv(tiling);
         uint32_t lastPingpong = 0;
         typename SchedulePolicy_::Coord coord{};
-        while (scheduler.GetNextCoord(coord)) {
+        while (scheduler.Next(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
             const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
             const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
-            blockMmad.BeginTask(coord.qStart * tiling->n1, coord.actualQ * tiling->n1);
+            blockMmad.BeginTask(coord.qStart * tiling->n1, coord.qRows * tiling->n1);
             for (uint32_t s2Idx = 0; s2Idx < s2Tiles; ++s2Idx) {
                 const auto tile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx, scheduler.policy());
                 const SparseIndexer::Common::Block::KeyCoord keyCoord{
-                    tile.kStart, tile.kStart - task.requestKStart, tile.batchIdx};
+                    tile.kStart, tile.kStart - task.requestKStart, tile.requestId};
                 if (s2Idx == 0U) {
-                    blockMmad.PrefetchKey(0, keyCoord, tile.actualK);
+                    blockMmad.PrefetchKey(0, keyCoord, tile.kRows);
                 }
                 if (s2Idx + 1U < s2Tiles) {
                     const auto nextTile = SchedulePolicy_::MakeS2Coord(visibleCoord, s2Idx + 1U, scheduler.policy());
                     const SparseIndexer::Common::Block::KeyCoord nextKeyCoord{
-                        nextTile.kStart, nextTile.kStart - task.requestKStart, nextTile.batchIdx};
-                    blockMmad.PrefetchKey((s2Idx + 1U) % 3U, nextKeyCoord, nextTile.actualK);
+                        nextTile.kStart, nextTile.kStart - task.requestKStart, nextTile.requestId};
+                    blockMmad.PrefetchKey((s2Idx + 1U) % 3U, nextKeyCoord, nextTile.kRows);
                 }
                 const uint32_t keyBufferIdx = s2Idx % 3U;
                 const uint32_t pingpong = doubleBuffered ? (s2Idx & 1U) : 0U;
                 if (doubleBuffered) {
                     blockMmad.Compute(
-                        tile.qStart * tiling->n1, tile.actualQ * tiling->n1, keyBufferIdx, tile.actualK);
+                        tile.qStart * tiling->n1, tile.qRows * tiling->n1, keyBufferIdx, tile.kRows);
                     SyncPolicy_::AicWaitCubeReady(pingpong);
                     blockMmad.SetOutputOffset(pingpong * scoreElems);
-                    blockMmad.Store(tile.actualQ * tiling->n1, tile.actualK);
+                    blockMmad.Store(tile.qRows * tiling->n1, tile.kRows);
                 } else {
                     SyncPolicy_::AicWaitCubeReady(0);
                     blockMmad.Compute(
-                        tile.qStart * tiling->n1, tile.actualQ * tiling->n1, keyBufferIdx, tile.actualK);
-                    blockMmad.Store(tile.actualQ * tiling->n1, tile.actualK);
+                        tile.qStart * tiling->n1, tile.qRows * tiling->n1, keyBufferIdx, tile.kRows);
+                    blockMmad.Store(tile.qRows * tiling->n1, tile.kRows);
                 }
                 SyncPolicy_::AicArriveCubeDone(pingpong);
                 lastPingpong = pingpong;

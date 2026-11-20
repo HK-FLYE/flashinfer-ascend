@@ -6,10 +6,10 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_CORE_SCORE_BUFFER_HPP
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_CORE_SCORE_BUFFER_HPP
 
-#include "block/block_scheduler.hpp"
-#include "block/mask_utils.hpp"
+#include "sparse_indexer/block/schedule/block_scheduler.hpp"
+#include "sparse_indexer/block/mask/mask_utils.hpp"
 #include "quant_lightning_indexer_tiling_data.h"
-#include "sparse_indexer_common.hpp"
+#include "sparse_indexer/foundation/contracts/common.hpp"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 
@@ -42,14 +42,14 @@ CATLASS_DEVICE inline SparseIndexer::Common::Block::ScheduleCoord VisibleCoord(
     uint32_t activeQ, uint32_t activeK, int32_t residual)
 {
     auto visible = coord;
-    if (tiling->maskMode != 3 || coord.actualQ == 0U) {
+    if (tiling->maskMode != 3 || coord.qRows == 0U) {
         return visible;
     }
-    const uint32_t lastLocalQ = coord.localQStart + coord.actualQ - 1U;
+    const uint32_t lastLocalQ = coord.localQBegin + coord.qRows - 1U;
     const uint32_t visibleK = SparseIndexer::Common::Block::Mask3VisibleLen(
         lastLocalQ, activeQ, activeK, tiling->cmpRatio, residual);
-    visible.actualK = AscendC::Std::max(
-        visibleK, AscendC::Std::min(coord.actualK, tiling->s2Tile));
+    visible.kRows = AscendC::Std::max(
+        visibleK, AscendC::Std::min(coord.kRows, tiling->s2Tile));
     return visible;
 }
 

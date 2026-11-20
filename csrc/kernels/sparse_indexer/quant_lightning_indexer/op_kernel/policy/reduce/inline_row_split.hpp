@@ -55,7 +55,7 @@ struct InlineRowSplitReducePolicy {
             SyncPolicy_::AivArriveVecReady(1);
         }
         typename SchedulePolicy_::Coord coord{};
-        while (scheduler.GetNextCoord(coord)) {
+        while (scheduler.Next(coord)) {
             const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
             const auto visibleCoord = VisibleCoord(tiling, coord, task.activeQ, task.activeK, task.residual);
             const uint32_t s2Tiles = SchedulePolicy_::CountS2Tiles(visibleCoord, scheduler.policy());
@@ -64,9 +64,9 @@ struct InlineRowSplitReducePolicy {
                 const uint32_t pingpong = doubleBuffered ? (s2Idx & 1U) : 0U;
                 SyncPolicy_::AivWaitCubeDone(pingpong);
                 reducer(
-                    tile.qStart, tile.actualQ, tile.kStart, tile.actualK,
-                    tile.localQStart, task.activeQ, task.activeK, task.requestKStart, task.residual,
-                    task.maskActive, tile.batchIdx, pingpong);
+                    tile.qStart, tile.qRows, tile.kStart, tile.kRows,
+                    tile.localQBegin, task.activeQ, task.activeK, task.requestKStart, task.residual,
+                    task.maskActive, tile.requestId, pingpong);
                 // The last tile also carries the score hand-off for this gS1 task.
                 // Keep the cube/vector ready flag pending until the owning AIV has
                 // finished TopK, otherwise the next gS1 task can overwrite UB.
@@ -79,13 +79,13 @@ struct InlineRowSplitReducePolicy {
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             const uint32_t sub = AscendC::GetSubBlockIdx();
-            const uint32_t rowsPerAiv = SparseIndexer::Common::CeilDiv(task.coord.actualQ, 2U);
+            const uint32_t rowsPerAiv = SparseIndexer::Common::CeilDiv(task.coord.qRows, 2U);
             const uint32_t rowBegin = sub * rowsPerAiv;
-            if (rowBegin < task.coord.actualQ) {
-                const uint32_t rows = AscendC::Std::min(rowsPerAiv, task.coord.actualQ - rowBegin);
+            if (rowBegin < task.coord.qRows) {
+                const uint32_t rows = AscendC::Std::min(rowsPerAiv, task.coord.qRows - rowBegin);
                 TopKPolicy_::RunLocal(resource, tiling, scores, outIndices,
                     task.coord.qStart + rowBegin, rows, task.requestKStart, task.activeK,
-                    task.coord.localQStart + rowBegin, task.activeQ, task.residual);
+                    task.coord.localQBegin + rowBegin, task.activeQ, task.residual);
             }
             const uint32_t lastPingpong = doubleBuffered ? ((s2Tiles - 1U) & 1U) : 0U;
             SyncPolicy_::AivArriveVecReady(lastPingpong);

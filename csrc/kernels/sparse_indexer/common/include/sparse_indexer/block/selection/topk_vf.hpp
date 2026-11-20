@@ -13,9 +13,9 @@
 #include "catlass/catlass.hpp"
 #include "kernel_operator.h"
 
-#include "indexer/linear_arena.hpp"
-#include "mask_utils.hpp"
-#include "sparse_indexer_common.hpp"
+#include "sparse_indexer/foundation/resource/linear_arena.hpp"
+#include "sparse_indexer/block/mask/mask_utils.hpp"
+#include "sparse_indexer/foundation/contracts/common.hpp"
 #include "topk_vf/vf_topk_16_gather_quant_v2.h"
 
 namespace SparseIndexer::Common::Block {

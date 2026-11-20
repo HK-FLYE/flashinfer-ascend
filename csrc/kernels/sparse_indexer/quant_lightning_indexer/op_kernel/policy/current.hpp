@@ -7,15 +7,15 @@
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_CURRENT_HPP
 
 #include "arch35/block_reduce_quant_head.hpp"
-#include "block/block_topk_vf.hpp"
-#include "load/paged_key.hpp"
+#include "sparse_indexer/block/selection/topk_vf.hpp"
+#include "sparse_indexer/block/load/paged_key.hpp"
 #include "mmad/split_m.hpp"
 #include "reduce/inline_row_split.hpp"
-#include "resource/current.hpp"
+#include "sparse_indexer/foundation/resource/current_policy.hpp"
 #include "schedule/static_gsa1.hpp"
-#include "sync/block_barrier.hpp"
+#include "sparse_indexer/foundation/sync/subblock_barrier.hpp"
 #include "topk/prefix_litopkvf.hpp"
-#include "core/policy_bundle.hpp"
+#include "sparse_indexer/foundation/contracts/policy.hpp"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 
@@ -32,8 +32,8 @@ using C2Mmad = SplitMMmadPolicy<QkDtype, CommonKeyLoad>;
 using C2Reduce = InlineRowSplitReducePolicy<
     QuantLightningIndexerKernelDetail::BlockReduceQuantHead<
         SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>>;
-using CurrentPolicy = PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C2Mmad, C2Reduce,
-    InlineVectorTopK, C2Sync, CommonResource>;
+using CurrentPolicy = SparseIndexer::Common::PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C2Mmad,
+    C2Reduce, InlineVectorTopK, C2Sync, CommonResource>;
 
 } // namespace SparseIndexer::QuantLightningIndexer::Policy
 

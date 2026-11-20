@@ -19,17 +19,11 @@
 #include <cstdint>
 
 #include "catlass/detail/macros.hpp"
+#include "sparse_indexer/foundation/contracts/problem.hpp"
 
 namespace SparseIndexer::Common::Block {
 
-struct ScheduleCoord {
-    uint32_t batchIdx{0};
-    uint32_t qStart{0};
-    uint32_t actualQ{0};
-    uint32_t kStart{0};
-    uint32_t actualK{0};
-    uint32_t localQStart{0};
-};
+using ScheduleCoord = SparseIndexer::Common::WorkItem;
 
 namespace detail {
 
@@ -104,12 +98,12 @@ public:
             const uint64_t local = tileId - accumulated;
             const uint32_t qBlock = static_cast<uint32_t>(local / kDim);
             const uint32_t kBlock = static_cast<uint32_t>(local % kDim);
-            coord.batchIdx = b;
-            coord.localQStart = qBlock * params.s1Tile;
-            coord.qStart = requestQStart + coord.localQStart;
-            coord.actualQ = (qBlock + 1U == qDim) ? (qLen - coord.localQStart) : params.s1Tile;
+            coord.requestId = b;
+            coord.localQBegin = qBlock * params.s1Tile;
+            coord.qStart = requestQStart + coord.localQBegin;
+            coord.qRows = (qBlock + 1U == qDim) ? (qLen - coord.localQBegin) : params.s1Tile;
             coord.kStart = requestKStart + kBlock * params.s2Tile;
-            coord.actualK = (kBlock + 1U == kDim) ? (kLen - kBlock * params.s2Tile) : params.s2Tile;
+            coord.kRows = (kBlock + 1U == kDim) ? (kLen - kBlock * params.s2Tile) : params.s2Tile;
             return true;
         }
         return false;
@@ -142,12 +136,12 @@ public:
                 continue;
             }
             const uint32_t qBlock = static_cast<uint32_t>(tileId - accumulated);
-            coord.batchIdx = b;
-            coord.localQStart = qBlock * rowsPerTask;
-            coord.qStart = requestQStart + coord.localQStart;
-            coord.actualQ = (qBlock + 1U == qDim) ? (qLen - coord.localQStart) : rowsPerTask;
+            coord.requestId = b;
+            coord.localQBegin = qBlock * rowsPerTask;
+            coord.qStart = requestQStart + coord.localQBegin;
+            coord.qRows = (qBlock + 1U == qDim) ? (qLen - coord.localQBegin) : rowsPerTask;
             coord.kStart = requestKStart;
-            coord.actualK = kLen;
+            coord.kRows = kLen;
             return true;
         }
         return false;
@@ -181,7 +175,7 @@ public:
     }
 
     CATLASS_DEVICE
-    bool GetNextCoord(ScheduleCoord& coord)
+    bool Next(WorkItem& coord)
     {
         if (nextMmadTask_ >= totalMmadTasks_) {
             return false;
@@ -192,7 +186,13 @@ public:
     }
 
     CATLASS_DEVICE
-    bool GetNextTopKCoord(ScheduleCoord& coord)
+    bool GetNextCoord(WorkItem& coord)
+    {
+        return Next(coord);
+    }
+
+    CATLASS_DEVICE
+    bool GetNextTopKCoord(WorkItem& coord)
     {
         if (nextTopKTask_ >= totalTopKTasks_) {
             return false;
