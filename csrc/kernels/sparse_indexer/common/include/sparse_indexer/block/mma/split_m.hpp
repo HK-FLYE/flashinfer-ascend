@@ -10,26 +10,27 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
 #include "catlass/gemm_coord.hpp"
-#include "../core/score_buffer.hpp"
-#include "quant_lightning_indexer_tiling_data.h"
+#include "sparse_indexer/block/mask/visible_coord.hpp"
+#include "sparse_indexer/block/support/score_buffer.hpp"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common::Block {
 
 /**
  * QLIv2-style row split. M is the flattened query x head axis, so the half-M
  * boundary must be exactly 2 * N1: vector0 owns query rows 0..1 and vector1
  * owns rows 2..3. The alignment is deliberately not a fixed four M rows.
  */
-template <class Dtype_, class LoadPolicy_>
+template <class Dtype_, class LoadPolicy_, class Tiling_>
 struct SplitMMmadPolicy {
     using Dtype = Dtype_;
     using LoadPolicy = LoadPolicy_;
+    using Tiling = Tiling_;
     using InputType = typename LoadPolicy::Dtype;
     using Block = SparseIndexer::Common::Block::BlockMmad<Dtype, Dtype, typename LoadPolicy::Loader,
         Catlass::Gemm::Tile::CopyL0CToUBMode::SPLIT_M>;
     using Params = typename Block::Params;
 
-    CATLASS_DEVICE static Params MakeParams(__gm__ QuantLightningIndexerTilingData const* tiling)
+    CATLASS_DEVICE static Params MakeParams(__gm__ Tiling const* tiling)
     {
         Params params{};
         params.keyLoader.d = tiling->d;
@@ -45,7 +46,7 @@ struct SplitMMmadPolicy {
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
         AscendC::LocalTensor<typename Block::DtypeC> const& ubC,
         AscendC::GlobalTensor<InputType> const& gmQ, AscendC::GlobalTensor<InputType> const& gmK,
-        __gm__ QuantLightningIndexerTilingData const* tiling,
+        __gm__ Tiling const* tiling,
         AscendC::GlobalTensor<int32_t> const& gmBlockTable,
         AscendC::GlobalTensor<InputType> const& gmZeroPage, Scheduler_& scheduler)
     {
@@ -99,6 +100,6 @@ struct SplitMMmadPolicy {
     }
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common::Block
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_MMAD_SPLIT_M_HPP

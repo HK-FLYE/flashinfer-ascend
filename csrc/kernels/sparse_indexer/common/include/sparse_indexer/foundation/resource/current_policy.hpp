@@ -10,7 +10,7 @@
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common {
 
 /** C0 resource policy: the existing blocks allocate from one Catlass UB arena. */
 template <class ArchTag_>
@@ -25,6 +25,6 @@ struct CurrentResourcePolicy {
     }
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_RESOURCE_CURRENT_HPP

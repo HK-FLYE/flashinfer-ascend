@@ -21,7 +21,7 @@ struct QuantLightningIndexerTask {
 };
 
 CATLASS_DEVICE inline QuantLightningIndexerTask MakeQuantLightningIndexerTask(
-    SparseIndexer::Common::Block::ScheduleCoord const& coord, QuantLightningIndexerRequestSource const& source)
+    SparseIndexer::Common::WorkItem const& coord, QuantLightningIndexerRequestSource const& source)
 {
     QuantLightningIndexerTask task{};
     task.coord = coord;
@@ -32,6 +32,16 @@ CATLASS_DEVICE inline QuantLightningIndexerTask MakeQuantLightningIndexerTask(
     task.maskActive = source.MaskActive();
     return task;
 }
+
+struct QuantLightningIndexerTaskFactory {
+    using Task = QuantLightningIndexerTask;
+
+    CATLASS_DEVICE static Task Make(
+        SparseIndexer::Common::WorkItem const& coord, QuantLightningIndexerRequestSource const& source)
+    {
+        return MakeQuantLightningIndexerTask(coord, source);
+    }
+};
 
 } // namespace QuantLightningIndexerKernelDetail
 

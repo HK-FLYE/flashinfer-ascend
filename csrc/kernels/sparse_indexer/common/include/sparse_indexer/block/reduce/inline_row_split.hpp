@@ -8,21 +8,22 @@
 
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
-#include "../core/score_buffer.hpp"
-#include "quant_lightning_indexer_tiling_data.h"
+#include "sparse_indexer/block/mask/visible_coord.hpp"
+#include "sparse_indexer/block/support/score_buffer.hpp"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common::Block {
 
 /**
  * C2 reduce ownership. Each AIV processes half of the gS1 rows across all S2
  * tiles, then runs TopK for exactly those rows on the same core.
  */
-template <class Block_>
+template <class Block_, class Tiling_>
 struct InlineRowSplitReducePolicy {
     using Block = Block_;
+    using Tiling = Tiling_;
     using Params = typename Block::Params;
 
-    CATLASS_DEVICE static Params MakeParams(__gm__ QuantLightningIndexerTilingData const* tiling)
+    CATLASS_DEVICE static Params MakeParams(__gm__ Tiling const* tiling)
     {
         Params params{};
         params.n1 = tiling->n1;
@@ -44,7 +45,7 @@ struct InlineRowSplitReducePolicy {
         AscendC::LocalTensor<typename Block::DtypeScore>& ubC,
         AscendC::GlobalTensor<float> const& gmW, AscendC::GlobalTensor<float> const& gmQScale,
         AscendC::GlobalTensor<float> const& gmKScale, AscendC::GlobalTensor<int32_t> const& gmBlockTable,
-        AscendC::GlobalTensor<float>& scores, __gm__ QuantLightningIndexerTilingData const* tiling,
+        AscendC::GlobalTensor<float>& scores, __gm__ Tiling const* tiling,
         Scheduler_& scheduler, AscendC::GlobalTensor<int32_t> const& outIndices)
     {
         typename Block::Params params{MakeParams(tiling)};
@@ -93,6 +94,6 @@ struct InlineRowSplitReducePolicy {
     }
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common::Block
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_REDUCE_INLINE_ROW_SPLIT_HPP

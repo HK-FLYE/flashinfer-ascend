@@ -8,14 +8,15 @@
 
 #include "kernel_operator.h"
 
-#include "policy/current.hpp"
-#include "policy/kernel.hpp"
+#include "config/quant_lightning_indexer_config.hpp"
+#include "sparse_indexer/pipeline/indexer_kernel.hpp"
 
 namespace QuantLightningIndexerKernelDetail {
 
-using QkDtype = SparseIndexer::QuantLightningIndexer::Policy::QkDtype;
-using CurrentPolicy = SparseIndexer::QuantLightningIndexer::Policy::CurrentPolicy;
-using Kernel = QuantLightningIndexerKernel<CurrentPolicy>;
+using QkDtype = SparseIndexer::QuantLightningIndexer::Config::QkDtype;
+using CurrentPolicy = SparseIndexer::QuantLightningIndexer::Config::CurrentPolicy;
+using Kernel = SparseIndexer::Common::Pipeline::IndexerKernel<
+    CurrentPolicy, QuantLightningIndexerTilingData>;
 
 CATLASS_DEVICE inline void RunKernel(
     GM_ADDR query, GM_ADDR key, GM_ADDR weights, GM_ADDR qScale, GM_ADDR kScale, GM_ADDR blockTable,

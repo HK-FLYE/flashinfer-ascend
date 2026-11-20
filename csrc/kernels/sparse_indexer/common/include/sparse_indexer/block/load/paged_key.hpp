@@ -8,7 +8,7 @@
 
 #include "sparse_indexer/block/load/key_loader.hpp"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common::Block {
 
 /**
  * PA_BBND key loader policy. The load policy owns the key address mapping and
@@ -21,6 +21,6 @@ struct PagedKeyLoadPolicy {
         Catlass::Arch::Ascend950, Catlass::Gemm::GemmType<Dtype, Catlass::layout::ColumnMajor>>;
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common::Block
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_LOAD_PAGED_KEY_HPP

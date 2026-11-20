@@ -8,21 +8,21 @@
 
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
-#include "quant_lightning_indexer_tiling_data.h"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common::Block {
 
 /**
  * Current production TopK policy: RegTensor prefix below topK,
  * LiTopKVF above topK.
  */
-template <class VectorBlock_>
+template <class VectorBlock_, class Tiling_>
 struct PrefixLiTopKVFPolicy {
     using VectorBlock = VectorBlock_;
+    using Tiling = Tiling_;
 
     template <class Scheduler_, class SchedulePolicy_>
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
-        Scheduler_& scheduler, __gm__ QuantLightningIndexerTilingData const* tiling,
+        Scheduler_& scheduler, __gm__ Tiling const* tiling,
         AscendC::GlobalTensor<float>& scores, AscendC::GlobalTensor<int32_t> const& outIndices)
     {
         AscendC::GlobalTensor<int32_t> dummyOffset;
@@ -47,12 +47,13 @@ struct PrefixLiTopKVFPolicy {
  * LocalRows disables the generic TopK block's subblock row split, so each AIV
  * consumes exactly the rows it owns.
  */
-template <class VectorBlock_>
+template <class VectorBlock_, class Tiling_>
 struct InlinePrefixLiTopKVFPolicy {
     using VectorBlock = VectorBlock_;
+    using Tiling = Tiling_;
 
     CATLASS_DEVICE static void RunLocal(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
-        __gm__ QuantLightningIndexerTilingData const* tiling, AscendC::GlobalTensor<float>& scores,
+        __gm__ Tiling const* tiling, AscendC::GlobalTensor<float>& scores,
         AscendC::GlobalTensor<int32_t> const& outIndices, uint32_t s1Start, uint32_t rows,
         uint32_t kStart, uint32_t kLen, uint32_t localQStart, uint32_t qLen, int32_t residual)
     {
@@ -70,6 +71,6 @@ struct InlinePrefixLiTopKVFPolicy {
     }
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common::Block
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_TOPK_PREFIX_LITOPKVF_HPP

@@ -11,17 +11,18 @@
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
-#include "quant_lightning_indexer_tiling_data.h"
 #include "sparse_indexer/foundation/contracts/policy.hpp"
 
+namespace SparseIndexer::Common::Pipeline {
+
 /**
- * Static policy composer. Schedule/load/mmad/reduce/topk/sync/resource are
+ * Static Indexer executor. Schedule/load/mmad/reduce/topk/sync/resource are
  * compile-time types; there are no virtual calls or runtime policy switches.
  */
-template <class Policies_>
-class QuantLightningIndexerKernel {
-    static_assert(SparseIndexer::Common::IsPolicyBundle<Policies_>::value,
-        "QuantLightningIndexerKernel requires a PolicyBundle");
+template <class Policies_, class Tiling_>
+class IndexerKernel {
+    using Tiling = Tiling_;
+    static_assert(IsPolicyBundle<Policies_>::value, "IndexerKernel requires a PolicyBundle");
 
     using Schedule = typename Policies_::Schedule;
     using Load = typename Policies_::Load;
@@ -54,7 +55,7 @@ class QuantLightningIndexerKernel {
 
 public:
     CATLASS_DEVICE
-    QuantLightningIndexerKernel()
+    IndexerKernel()
         : ubC_(ResourcePolicy::template GetUbC<DtypeC>(resource_))
     {
     }
@@ -64,7 +65,7 @@ public:
         AscendC::GlobalTensor<float> const& gmW, AscendC::GlobalTensor<float> const& gmQScale,
         AscendC::GlobalTensor<float> const& gmKScale, AscendC::GlobalTensor<int32_t> const& outIndices,
         AscendC::GlobalTensor<float>& scores,
-        __gm__ QuantLightningIndexerTilingData const* tiling, GM_ADDR cuSeqlensQ, GM_ADDR sequsedK,
+        __gm__ Tiling const* tiling, GM_ADDR cuSeqlensQ, GM_ADDR sequsedK,
         GM_ADDR cmpResidualK, AscendC::GlobalTensor<int32_t> const& gmBlockTable,
         AscendC::GlobalTensor<InputType> const& gmZeroPage)
     {
@@ -87,5 +88,7 @@ public:
     typename ResourcePolicy::Resource resource_;
     AscendC::LocalTensor<DtypeC> ubC_;
 };
+
+} // namespace SparseIndexer::Common::Pipeline
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_KERNEL_HPP

@@ -3,24 +3,22 @@
  * Licensed under CANN Open Software License Agreement Version 2.0.
  */
 
-#ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SCHEDULE_STATIC_GSA1_HPP
-#define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SCHEDULE_STATIC_GSA1_HPP
+#ifndef FLASHINFER_SPARSE_INDEXER_BLOCK_SCHEDULE_STATIC_GSA1_HPP
+#define FLASHINFER_SPARSE_INDEXER_BLOCK_SCHEDULE_STATIC_GSA1_HPP
 
-#include "sparse_indexer/block/schedule/block_scheduler.hpp"
 #include "catlass/detail/macros.hpp"
-#include "arch35/quant_lightning_indexer_source.h"
-#include "arch35/quant_lightning_indexer_task.h"
-#include "quant_lightning_indexer_tiling_data.h"
+#include "sparse_indexer/block/schedule/block_scheduler.hpp"
+#include "sparse_indexer/foundation/contracts/problem.hpp"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common::Block {
 
 /**
  * One work item per bN2/gS1 block; all S2 tiles execute inside that core.
- * TopK keeps the existing row-group schedule after the global reduce barrier.
+ * The policy is parameterized by a variant request source and task factory.
  */
-class StaticGSA1BlockPolicy : public SparseIndexer::Common::Block::RequestBlockDiagonalPolicy {
+class StaticGSA1BlockPolicy : public RequestBlockDiagonalPolicy {
 public:
-    using Base = SparseIndexer::Common::Block::RequestBlockDiagonalPolicy;
+    using Base = RequestBlockDiagonalPolicy;
     using Params = typename Base::Params;
 
     template <class RequestRangeSource>
@@ -32,15 +30,14 @@ public:
             if (qLen == 0 || source.KLen(b) == 0) {
                 continue;
             }
-            total += SparseIndexer::Common::Block::detail::CeilDiv(qLen, params.s1Tile);
+            total += detail::CeilDiv(qLen, params.s1Tile);
         }
         return total;
     }
 
     template <class RequestRangeSource>
     CATLASS_DEVICE static bool FindMmad(
-        RequestRangeSource& source, Params const& params, uint64_t tileId,
-        SparseIndexer::Common::Block::ScheduleCoord& coord)
+        RequestRangeSource& source, Params const& params, uint64_t tileId, WorkItem& coord)
     {
         uint64_t accumulated = 0;
         for (uint32_t b = 0; b < source.Batch(); ++b) {
@@ -50,7 +47,7 @@ public:
             if (qLen == 0 || kLen == 0) {
                 continue;
             }
-            const uint32_t qDim = SparseIndexer::Common::Block::detail::CeilDiv(qLen, params.s1Tile);
+            const uint32_t qDim = detail::CeilDiv(qLen, params.s1Tile);
             if (tileId >= accumulated + qDim) {
                 accumulated += qDim;
                 continue;
@@ -67,14 +64,12 @@ public:
         return false;
     }
 
-    CATLASS_DEVICE static uint32_t CountS2Tiles(
-        SparseIndexer::Common::Block::ScheduleCoord const& coord, Params const& params)
+    CATLASS_DEVICE static uint32_t CountS2Tiles(WorkItem const& coord, Params const& params)
     {
-        return SparseIndexer::Common::Block::detail::CeilDiv(coord.kRows, params.s2Tile);
+        return detail::CeilDiv(coord.kRows, params.s2Tile);
     }
 
-    CATLASS_DEVICE static SparseIndexer::Common::Block::ScheduleCoord MakeS2Coord(
-        SparseIndexer::Common::Block::ScheduleCoord const& coord, uint32_t s2Idx, Params const& params)
+    CATLASS_DEVICE static WorkItem MakeS2Coord(WorkItem const& coord, uint32_t s2Idx, Params const& params)
     {
         auto tile = coord;
         tile.kStart = coord.kStart + s2Idx * params.s2Tile;
@@ -83,16 +78,18 @@ public:
     }
 };
 
+template <class RequestSource_, class TaskFactory_>
 struct StaticGSA1SchedulePolicy {
-    using RequestSource = QuantLightningIndexerKernelDetail::QuantLightningIndexerRequestSource;
-    using Scheduler = SparseIndexer::Common::Block::BlockScheduler<RequestSource, StaticGSA1BlockPolicy>;
+    using RequestSource = RequestSource_;
+    using TaskFactory = TaskFactory_;
+    using Scheduler = BlockScheduler<RequestSource, StaticGSA1BlockPolicy>;
     using Params = typename Scheduler::Params;
-    using Coord = SparseIndexer::Common::Block::ScheduleCoord;
-    using Task = QuantLightningIndexerKernelDetail::QuantLightningIndexerTask;
+    using Coord = WorkItem;
+    using Task = typename TaskFactory::Task;
 
+    template <class Tiling>
     CATLASS_DEVICE static Params MakeParams(
-        __gm__ QuantLightningIndexerTilingData const* tiling, GM_ADDR cuSeqlensQ, GM_ADDR sequsedK,
-        GM_ADDR cmpResidualK)
+        Tiling const* tiling, GM_ADDR cuSeqlensQ, GM_ADDR sequsedK, GM_ADDR cmpResidualK)
     {
         Params params{};
         params.policy.s1Tile = tiling->s1Tile;
@@ -102,8 +99,7 @@ struct StaticGSA1SchedulePolicy {
         return params;
     }
 
-    CATLASS_DEVICE static uint32_t CountS2Tiles(
-        Coord const& coord, StaticGSA1BlockPolicy::Params const& params)
+    CATLASS_DEVICE static uint32_t CountS2Tiles(Coord const& coord, StaticGSA1BlockPolicy::Params const& params)
     {
         return StaticGSA1BlockPolicy::CountS2Tiles(coord, params);
     }
@@ -116,10 +112,10 @@ struct StaticGSA1SchedulePolicy {
 
     CATLASS_DEVICE static Task MakeTask(Coord const& coord, RequestSource const& source)
     {
-        return QuantLightningIndexerKernelDetail::MakeQuantLightningIndexerTask(coord, source);
+        return TaskFactory::Make(coord, source);
     }
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common::Block
 
-#endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SCHEDULE_STATIC_GSA1_HPP
+#endif // FLASHINFER_SPARSE_INDEXER_BLOCK_SCHEDULE_STATIC_GSA1_HPP

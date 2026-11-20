@@ -20,7 +20,7 @@
 #include "sparse_indexer/foundation/resource/linear_arena.hpp"
 #include "sparse_indexer/foundation/contracts/common.hpp"
 
-namespace QuantLightningIndexerKernelDetail {
+namespace SparseIndexer::Common::Block {
 
 namespace Reg = AscendC::Reg;
 
@@ -458,6 +458,6 @@ private:
     MaskPolicy maskPolicy_;
 };
 
-} // namespace QuantLightningIndexerKernelDetail
+} // namespace SparseIndexer::Common::Block
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_ARCH35_BLOCK_REDUCE_QUANT_HEAD_HPP

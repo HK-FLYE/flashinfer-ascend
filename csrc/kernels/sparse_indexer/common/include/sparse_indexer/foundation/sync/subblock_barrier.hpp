@@ -9,7 +9,7 @@
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
 
-namespace SparseIndexer::QuantLightningIndexer::Policy {
+namespace SparseIndexer::Common {
 
 /**
  * C2 uses explicit per-subblock cross-core flags. In MIX 1:2, a cube core
@@ -57,6 +57,6 @@ struct SubblockPairBlockBarrierSyncPolicy {
     }
 };
 
-} // namespace SparseIndexer::QuantLightningIndexer::Policy
+} // namespace SparseIndexer::Common
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SYNC_BLOCK_BARRIER_HPP
