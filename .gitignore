@@ -31,3 +31,6 @@ CMakeFiles/
 cmake-build-*/
 packages/
 flashinfer/data/aclnn/
+# Local QLI planning/performance artifacts, not part of production releases.
+/docs/reports/quant-lightning-indexer-*.md
+/tools/qli_v2_*.py
