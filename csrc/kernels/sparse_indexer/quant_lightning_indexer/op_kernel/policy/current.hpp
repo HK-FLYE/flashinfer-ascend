@@ -10,52 +10,30 @@
 #include "block/block_topk_vf.hpp"
 #include "load/paged_key.hpp"
 #include "mmad/split_m.hpp"
-#include "mmad/split_n.hpp"
-#include "reduce/column_split.hpp"
 #include "reduce/inline_row_split.hpp"
-#include "reduce/row_split.hpp"
 #include "resource/current.hpp"
-#include "schedule/round_robin.hpp"
 #include "schedule/static_gsa1.hpp"
 #include "sync/block_barrier.hpp"
 #include "topk/prefix_litopkvf.hpp"
-#include "core/traits.hpp"
+#include "core/policy_bundle.hpp"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 
 using QkDtype = fp8_e4m3fn_t;
 using CommonKeyLoad = PagedKeyLoadPolicy<QkDtype>;
-using CommonTopK = PrefixLiTopKVFPolicy<
-    SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>>;
-using CommonSync = BlockBarrierSyncPolicy;
 using C2Sync = SubblockPairBlockBarrierSyncPolicy;
 using CommonResource = CurrentResourcePolicy<Catlass::Arch::Ascend950>;
 
-using C0Mmad = SplitNMmadPolicy<QkDtype, CommonKeyLoad>;
-using C0Reduce = ColumnSplitReducePolicy<QuantLightningIndexerKernelDetail::BlockReduceQuantHead<>>;
-using C0Policy = PolicyBundle<RoundRobinSchedulePolicy, CommonKeyLoad, C0Mmad, C0Reduce, CommonTopK,
-    CommonSync, CommonResource, CurrentPerformanceTraits>;
-
-using C1Mmad = SplitMMmadPolicy<QkDtype, CommonKeyLoad>;
-using C1Reduce = RowSplitReducePolicy<
-    QuantLightningIndexerKernelDetail::BlockReduceQuantHead<
-        SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>>;
-using C1Policy = PolicyBundle<RoundRobinSchedulePolicy, CommonKeyLoad, C1Mmad, C1Reduce, CommonTopK,
-    CommonSync, CommonResource, RowSplitPerformanceTraits>;
-
-// C2 keeps one gS1 task on its owning AIC/AIV pair. The last vector-ready
-// signal is deferred until the inline TopK finishes, so the next task cannot
-// overwrite the shared UB before the score hand-off is consumed.
+// One gS1 task stays on its owning AIC/AIV pair. TopK is an explicit policy
+// boundary and executes after all S2 tiles for that task have been reduced.
 using InlineVectorTopK = InlinePrefixLiTopKVFPolicy<
     SparseIndexer::Common::Block::BlockTopKVector<float, int32_t, true>>;
+using C2Mmad = SplitMMmadPolicy<QkDtype, CommonKeyLoad>;
 using C2Reduce = InlineRowSplitReducePolicy<
     QuantLightningIndexerKernelDetail::BlockReduceQuantHead<
-        SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>,
-    InlineVectorTopK>;
-using C2Policy = PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C1Mmad, C2Reduce, CommonTopK,
-    C2Sync, CommonResource, StaticGSA1PerformanceTraits>;
-
-using CurrentPolicy = C2Policy;
+        SparseIndexer::Common::Block::LiV2MaskPolicy<float>, true>>;
+using CurrentPolicy = PolicyBundle<StaticGSA1SchedulePolicy, CommonKeyLoad, C2Mmad, C2Reduce,
+    InlineVectorTopK, C2Sync, CommonResource>;
 
 } // namespace SparseIndexer::QuantLightningIndexer::Policy
 

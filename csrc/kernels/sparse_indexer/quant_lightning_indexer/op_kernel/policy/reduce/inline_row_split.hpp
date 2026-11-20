@@ -17,10 +17,9 @@ namespace SparseIndexer::QuantLightningIndexer::Policy {
  * C2 reduce ownership. Each AIV processes half of the gS1 rows across all S2
  * tiles, then runs TopK for exactly those rows on the same core.
  */
-template <class Block_, class TopKPolicy_>
+template <class Block_>
 struct InlineRowSplitReducePolicy {
     using Block = Block_;
-    using TopKPolicy = TopKPolicy_;
     using Params = typename Block::Params;
 
     CATLASS_DEVICE static Params MakeParams(__gm__ QuantLightningIndexerTilingData const* tiling)
@@ -40,7 +39,7 @@ struct InlineRowSplitReducePolicy {
         return params;
     }
 
-    template <class SyncPolicy_, class Scheduler_, class SchedulePolicy_>
+    template <class SyncPolicy_, class Scheduler_, class SchedulePolicy_, class TopKPolicy_>
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
         AscendC::LocalTensor<typename Block::DtypeScore>& ubC,
         AscendC::GlobalTensor<float> const& gmW, AscendC::GlobalTensor<float> const& gmQScale,
@@ -84,7 +83,7 @@ struct InlineRowSplitReducePolicy {
             const uint32_t rowBegin = sub * rowsPerAiv;
             if (rowBegin < task.coord.actualQ) {
                 const uint32_t rows = AscendC::Std::min(rowsPerAiv, task.coord.actualQ - rowBegin);
-                TopKPolicy::RunLocal(resource, tiling, scores, outIndices,
+                TopKPolicy_::RunLocal(resource, tiling, scores, outIndices,
                     task.coord.qStart + rowBegin, rows, task.requestKStart, task.activeK,
                     task.coord.localQStart + rowBegin, task.activeQ, task.residual);
             }

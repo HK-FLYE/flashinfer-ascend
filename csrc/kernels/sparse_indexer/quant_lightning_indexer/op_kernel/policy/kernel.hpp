@@ -6,11 +6,13 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_KERNEL_HPP
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_KERNEL_HPP
 
+#include <type_traits>
+
 #include "catlass/arch/resource.hpp"
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_tiling_data.h"
-#include "core/traits.hpp"
+#include "core/policy_bundle.hpp"
 
 /**
  * Static policy composer. Schedule/load/mmad/reduce/topk/sync/resource are
@@ -22,6 +24,7 @@ class QuantLightningIndexerKernel {
         "QuantLightningIndexerKernel requires a PolicyBundle");
 
     using Schedule = typename Policies_::Schedule;
+    using Load = typename Policies_::Load;
     using Mmad = typename Policies_::Mmad;
     using Reduce = typename Policies_::Reduce;
     using TopK = typename Policies_::TopK;
@@ -29,6 +32,9 @@ class QuantLightningIndexerKernel {
     using ResourcePolicy = typename Policies_::Resource;
     using InputType = typename Mmad::InputType;
     using DtypeC = typename Mmad::Block::DtypeC;
+
+    static_assert(std::is_same<Load, typename Mmad::LoadPolicy>::value,
+        "the bundle Load policy must be the policy embedded in the Mmad pipeline");
 
 public:
     CATLASS_DEVICE
@@ -54,23 +60,12 @@ public:
             Mmad::template Run<Sync, typename Schedule::Scheduler, Schedule>(
                 resource_, ubC_, gmQ, gmK, tiling, gmBlockTable, gmZeroPage, blockScheduler);
         } else {
-            if constexpr (Policies_::Traits::kTopKPerGSA1) {
-                Reduce::template Run<Sync, typename Schedule::Scheduler, Schedule>(
-                    resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores, tiling, blockScheduler,
-                    outIndices);
-            } else {
-                Reduce::template Run<Sync, typename Schedule::Scheduler, Schedule>(
-                    resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores, tiling, blockScheduler);
-            }
+            Reduce::template Run<Sync, typename Schedule::Scheduler, Schedule, TopK>(
+                resource_, ubC_, gmW, gmQScale, gmKScale, gmBlockTable, scores, tiling, blockScheduler,
+                outIndices);
         }
 
         Sync::GlobalBarrier();
-        if ASCEND_IS_AIV {
-            if constexpr (!Policies_::Traits::kTopKPerGSA1) {
-                TopK::template Run<typename Schedule::Scheduler, Schedule>(
-                    resource_, blockScheduler, tiling, scores, outIndices);
-            }
-        }
     }
 
     typename ResourcePolicy::Resource resource_;

@@ -13,6 +13,7 @@
 #include "catlass/catlass.hpp"
 #include "kernel_operator.h"
 
+#include "indexer/linear_arena.hpp"
 #include "mask_utils.hpp"
 #include "sparse_indexer_common.hpp"
 #include "topk_vf/vf_topk_16_gather_quant_v2.h"
@@ -122,18 +123,13 @@ public:
     {
         const uint32_t outWords = topKAlign_ + 64U;
         const uint32_t tmpWords = SparseIndexer::Common::AlignUp(sharedBufferBytes(params.topK, tileColAlign_), 4U) / 4U;
-        uint32_t byteOffset = 0;
-        scoreUb_ = resource.ubBuf.template GetBufferByByte<DtypeScore>(byteOffset);
-        byteOffset += SparseIndexer::Common::AlignUp(tileColAlign_ * sizeof(DtypeScore), 256U);
-        inputUb_ = resource.ubBuf.template GetBufferByByte<uint16_t>(byteOffset);
+        SparseIndexer::Common::LinearArena<decltype(resource.ubBuf)> arena(resource.ubBuf);
+        scoreUb_ = arena.Take<DtypeScore>(tileColAlign_);
         const uint32_t inputCols = AscendC::Std::max(tileColAlign_, topKAlign_);
-        byteOffset += SparseIndexer::Common::AlignUp(inputCols * sizeof(uint16_t), 256U);
-        outIdxUb_ = resource.ubBuf.template GetBufferByByte<uint32_t>(byteOffset);
-        byteOffset += outWords * sizeof(uint32_t);
-        outValueUb_ = resource.ubBuf.template GetBufferByByte<uint16_t>(byteOffset);
-        byteOffset += SparseIndexer::Common::AlignUp((topKAlign_ + 64U) * sizeof(uint16_t), 256U);
-        topkTmpUb_ = resource.ubBuf.template GetBufferByByte<uint32_t>(byteOffset);
-        (void)byteOffset;
+        inputUb_ = arena.Take<uint16_t>(inputCols, 256U);
+        outIdxUb_ = arena.Take<uint32_t>(outWords);
+        outValueUb_ = arena.Take<uint16_t>(topKAlign_ + 64U, 256U);
+        topkTmpUb_ = arena.Take<uint32_t>(tmpWords);
 
         hisIndex1_ = outIdxUb_;
         hisIndex2_ = topkTmpUb_[0];

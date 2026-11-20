@@ -6,48 +6,10 @@
 #ifndef FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SYNC_BLOCK_BARRIER_HPP
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_SYNC_BLOCK_BARRIER_HPP
 
-#include "c_api/sync/sync.h"
 #include "catlass/detail/macros.hpp"
 #include "kernel_operator.h"
 
 namespace SparseIndexer::QuantLightningIndexer::Policy {
-
-/** C0 cross-core synchronization: one cube/vector hand-off per scheduled tile. */
-struct BlockBarrierSyncPolicy {
-    static constexpr uint16_t kVecToCube = 0;
-    static constexpr uint16_t kCubeToVec = 1;
-
-    CATLASS_DEVICE static void AicWaitCubeReady(uint32_t pingpong = 0)
-    {
-        asc_sync_block_wait(PIPE_FIX, kVecToCube + pingpong);
-    }
-
-    CATLASS_DEVICE static void AicArriveCubeDone(uint32_t pingpong = 0)
-    {
-        asc_sync_block_arrive(PIPE_FIX, kCubeToVec + pingpong);
-    }
-
-    CATLASS_DEVICE static void AicFinalWait(uint32_t pingpong = 0)
-    {
-        asc_sync_block_wait(PIPE_FIX, kVecToCube + pingpong);
-    }
-
-    CATLASS_DEVICE static void AivArriveVecReady(uint32_t pingpong = 0)
-    {
-        asc_sync_block_arrive(PIPE_MTE3, kVecToCube + pingpong);
-    }
-
-    CATLASS_DEVICE static void AivWaitCubeDone(uint32_t pingpong = 0)
-    {
-        asc_sync_block_wait(PIPE_V, kCubeToVec + pingpong);
-    }
-
-    CATLASS_DEVICE static void GlobalBarrier()
-    {
-        AscendC::SyncAll<false>();
-    }
-};
-
 
 /**
  * C2 uses explicit per-subblock cross-core flags. In MIX 1:2, a cube core

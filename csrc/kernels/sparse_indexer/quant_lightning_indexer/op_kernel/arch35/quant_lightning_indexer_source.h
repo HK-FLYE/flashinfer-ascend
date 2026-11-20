@@ -11,6 +11,7 @@
 #include "kernel_operator.h"
 #include "quant_lightning_indexer_tiling_data.h"
 #include "sparse_indexer_common.hpp"
+#include "sparse_indexer_problem.hpp"
 
 namespace QuantLightningIndexerKernelDetail {
 
@@ -58,6 +59,17 @@ public:
             residual = residual >= residualLimit ? residualLimit - 1 : residual;
             cmpResidualK_[i] = static_cast<int32_t>(residual);
         }
+
+        problem_.batch = batch_;
+        problem_.totalQ = tq_;
+        problem_.groups = 1U;
+        problem_.heads = tiling->n1;
+        problem_.headDim = tiling->d;
+        problem_.totalK = maxSeqLenK_;
+        problem_.cacheKind = SparseIndexer::Common::IndexerCacheKind::Paged;
+        problem_.maskKind = SparseIndexer::Common::IndexerMaskKind::CompressedMask3;
+        problem_.outputKind = SparseIndexer::Common::IndexerOutputKind::IndicesOnly;
+        problem_.selectionOrder = SparseIndexer::Common::IndexerSelectionOrder::QliRawSlot;
     }
 
     CATLASS_DEVICE uint32_t Batch() const { return batch_; }
@@ -69,8 +81,10 @@ public:
     CATLASS_DEVICE uint32_t ActiveK(uint32_t b) const { return static_cast<uint32_t>(sequsedK_[b]); }
     CATLASS_DEVICE int32_t Residual(uint32_t b) const { return cmpResidualK_[b]; }
     CATLASS_DEVICE bool MaskActive() const { return true; }
+    CATLASS_DEVICE SparseIndexer::Common::IndexerProblem const& GetProblem() const { return problem_; }
 
 private:
+    SparseIndexer::Common::IndexerProblem problem_{};
     uint32_t tq_{0};
     uint32_t maxSeqLenK_{0};
     uint32_t batch_{1};

@@ -17,6 +17,7 @@
 
 #include "block/block_reduce_head.hpp"
 #include "block/mask_policy.hpp"
+#include "indexer/linear_arena.hpp"
 #include "sparse_indexer_common.hpp"
 
 namespace QuantLightningIndexerKernelDetail {
@@ -155,27 +156,19 @@ public:
             : SparseIndexer::Common::AlignUp(s2Tile_, 16U * aivPerAic) / aivPerAic;
         const uint32_t outStride = kRowSplit ? SparseIndexer::Common::AlignUp(s2Tile_, 64U) : colPerAiv;
         scoreElems_ = workRows * n1_ * colPerAiv;
-        uint32_t offset = params.scoreBuffers * scoreElems_ * sizeof(float);
         outElems_ = workRows * outStride;
-        ubOutBase_ = resource.ubBuf.template GetBufferByByte<float>(offset);
+        SparseIndexer::Common::LinearArena<decltype(resource.ubBuf)> arena(
+            resource.ubBuf, params.scoreBuffers * scoreElems_ * sizeof(float));
+        ubOutBase_ = arena.Take<float>(params.scoreBuffers * outElems_);
         ubOut_ = ubOutBase_;
-        offset += params.scoreBuffers * outElems_ * sizeof(float);
-        ubW_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += vectorRows * wStride_ * sizeof(float);
-        ubWIn_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += vectorRows * wStride_ * sizeof(float);
-        ubQScaleIn_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += vectorRows * wStride_ * sizeof(float);
-        offset = SparseIndexer::Common::AlignUp(offset, 32U);
-        ubWBrcb_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += vectorRows * kFloatBlock * sizeof(float);
+        ubW_ = arena.Take<float>(vectorRows * wStride_);
+        ubWIn_ = arena.Take<float>(vectorRows * wStride_);
+        ubQScaleIn_ = arena.Take<float>(vectorRows * wStride_);
+        ubWBrcb_ = arena.Take<float>(vectorRows * kFloatBlock, 32U);
         // MaskPolicy may build a full 256-byte vector per row.
-        offset = SparseIndexer::Common::AlignUp(offset, 32U);
-        ubTmp_ = resource.ubBuf.template GetBufferByByte<float>(offset);
-        offset += vectorRows * kFloatVec * sizeof(float);
-        offset = SparseIndexer::Common::AlignUp(offset, 256U);
-        ubKScale_ = resource.ubBuf.template GetBufferByByte<float>(offset);
+        ubTmp_ = arena.Take<float>(vectorRows * kFloatVec, 32U);
         kScaleCacheCols_ = kKScaleCacheTiles * s2Tile_;
+        ubKScale_ = arena.Take<float>(kScaleCacheCols_, 256U);
     }
 
     CATLASS_DEVICE
