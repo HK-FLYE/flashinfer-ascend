@@ -19,8 +19,8 @@ using Kernel = QuantLightningIndexerKernel<CurrentPolicy>;
 
 CATLASS_DEVICE inline void RunKernel(
     GM_ADDR query, GM_ADDR key, GM_ADDR weights, GM_ADDR qScale, GM_ADDR kScale, GM_ADDR blockTable,
-    GM_ADDR cuSeqlensQ, GM_ADDR sequsedK, GM_ADDR cmpResidualK, GM_ADDR indices, GM_ADDR valuesScratch,
-    GM_ADDR valuesOut, GM_ADDR scores, GM_ADDR zeroPage, GM_ADDR tiling)
+    GM_ADDR cuSeqlensQ, GM_ADDR sequsedK, GM_ADDR cmpResidualK, GM_ADDR indices,
+    GM_ADDR scores, GM_ADDR zeroPage, GM_ADDR tiling)
 {
     auto const* tilingData = reinterpret_cast<__gm__ QuantLightningIndexerTilingData const*>(tiling);
     AscendC::GlobalTensor<QkDtype> gmQ;
@@ -30,8 +30,6 @@ CATLASS_DEVICE inline void RunKernel(
     AscendC::GlobalTensor<float> gmQScale;
     AscendC::GlobalTensor<float> gmKScale;
     AscendC::GlobalTensor<float> gmScores;
-    AscendC::GlobalTensor<float> gmValues;
-    AscendC::GlobalTensor<bfloat16_t> gmValuesOut;
     AscendC::GlobalTensor<int32_t> gmTable;
     AscendC::GlobalTensor<int32_t> gmOut;
     gmQ.SetGlobalBuffer(reinterpret_cast<__gm__ QkDtype*>(query));
@@ -41,14 +39,12 @@ CATLASS_DEVICE inline void RunKernel(
     gmKScale.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(kScale));
     gmTable.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(blockTable));
     gmOut.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(indices));
-    gmValues.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(valuesScratch));
-    gmValuesOut.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(valuesOut));
     gmScores.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(scores));
     gmZero.SetGlobalBuffer(reinterpret_cast<__gm__ QkDtype*>(zeroPage));
     Kernel kernel;
     kernel(
-        gmQ, gmK, gmW, gmQScale, gmKScale, gmOut, gmValues, gmValuesOut, gmScores, tilingData, cuSeqlensQ,
-        sequsedK, cmpResidualK, gmTable, gmZero);
+        gmQ, gmK, gmW, gmQScale, gmKScale, gmOut, gmScores, tilingData, cuSeqlensQ, sequsedK,
+        cmpResidualK, gmTable, gmZero);
 }
 
 } // namespace QuantLightningIndexerKernelDetail

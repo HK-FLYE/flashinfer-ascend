@@ -46,8 +46,7 @@ struct InlineRowSplitReducePolicy {
         AscendC::GlobalTensor<float> const& gmW, AscendC::GlobalTensor<float> const& gmQScale,
         AscendC::GlobalTensor<float> const& gmKScale, AscendC::GlobalTensor<int32_t> const& gmBlockTable,
         AscendC::GlobalTensor<float>& scores, __gm__ QuantLightningIndexerTilingData const* tiling,
-        Scheduler_& scheduler, AscendC::GlobalTensor<int32_t> const& outIndices,
-        AscendC::GlobalTensor<float> const& outValues)
+        Scheduler_& scheduler, AscendC::GlobalTensor<int32_t> const& outIndices)
     {
         typename Block::Params params{MakeParams(tiling)};
         Block reducer(ubC, resource, gmW, gmQScale, gmKScale, gmBlockTable, scores, params);
@@ -85,7 +84,7 @@ struct InlineRowSplitReducePolicy {
             const uint32_t rowBegin = sub * rowsPerAiv;
             if (rowBegin < task.coord.actualQ) {
                 const uint32_t rows = AscendC::Std::min(rowsPerAiv, task.coord.actualQ - rowBegin);
-                TopKPolicy::RunLocal(resource, tiling, scores, outIndices, outValues,
+                TopKPolicy::RunLocal(resource, tiling, scores, outIndices,
                     task.coord.qStart + rowBegin, rows, task.requestKStart, task.activeK,
                     task.coord.localQStart + rowBegin, task.activeQ, task.residual);
             }

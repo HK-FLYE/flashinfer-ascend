@@ -29,7 +29,6 @@ struct Params {
     int32_t quantMode{1};
     int32_t maskMode{3};
     int32_t cmpRatio{4};
-    int32_t returnValue{0};
     bool hasBlockTable{false};
     bool hasCuSeqlensQ{false};
     bool hasSequsedK{false};
@@ -134,7 +133,6 @@ inline void GetTiling(const Params& params, QuantLightningIndexerTilingData& til
     tilingData.quantMode = params.quantMode;
     tilingData.maskMode = params.maskMode;
     tilingData.cmpRatio = params.cmpRatio;
-    tilingData.returnValue = params.returnValue;
 }
 
 } // namespace QuantLightningIndexerTiling

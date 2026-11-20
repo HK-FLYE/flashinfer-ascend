@@ -7,7 +7,6 @@
 #define FLASHINFER_QUANT_LIGHTNING_INDEXER_POLICY_CURRENT_HPP
 
 #include "arch35/block_reduce_quant_head.hpp"
-#include "block/block_topk.hpp"
 #include "block/block_topk_vf.hpp"
 #include "load/paged_key.hpp"
 #include "mmad/split_m.hpp"
@@ -27,8 +26,7 @@ namespace SparseIndexer::QuantLightningIndexer::Policy {
 using QkDtype = fp8_e4m3fn_t;
 using CommonKeyLoad = PagedKeyLoadPolicy<QkDtype>;
 using CommonTopK = PrefixLiTopKVFPolicy<
-    SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>,
-    SparseIndexer::Common::Block::BlockTopK<float, int32_t>>;
+    SparseIndexer::Common::Block::BlockTopKVector<float, int32_t>>;
 using CommonSync = BlockBarrierSyncPolicy;
 using C2Sync = SubblockPairBlockBarrierSyncPolicy;
 using CommonResource = CurrentResourcePolicy<Catlass::Arch::Ascend950>;

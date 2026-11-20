@@ -88,7 +88,6 @@ ge::graphStatus FiQuantLightningIndexerTiling(gert::TilingContext* context)
         const int64_t maskMode = Attr<int64_t>(context, ATTR_MASK_MODE, 3);
         const int64_t cmpRatio = Attr<int64_t>(context, ATTR_CMP_RATIO, 4);
         const int64_t maxSeq = Attr<int64_t>(context, ATTR_MAX_SEQ_LEN_K, 0);
-        const int64_t returnValue = Attr<int64_t>(context, ATTR_RETURN_VALUE, 0);
         if (topk <= 0 || maxSeq <= 0) {
             return ge::GRAPH_FAILED;
         }
@@ -113,7 +112,6 @@ ge::graphStatus FiQuantLightningIndexerTiling(gert::TilingContext* context)
         params.quantMode = static_cast<int32_t>(quantMode);
         params.maskMode = static_cast<int32_t>(maskMode);
         params.cmpRatio = static_cast<int32_t>(cmpRatio);
-        params.returnValue = static_cast<int32_t>(returnValue);
         params.hasBlockTable = true;
         params.hasCuSeqlensQ = true;
         params.hasSequsedK = true;
@@ -133,13 +131,9 @@ ge::graphStatus FiQuantLightningIndexerTiling(gert::TilingContext* context)
         context->SetBlockDim(cores);
         // Single compiled binary (no template tiling keys yet).
         context->SetTilingKey(0);
-        // User workspace: FP32 score grid + FP32 TopK value scratch + FP8 zero page.
-        const uint64_t valueScratchBytes = params.returnValue == 0
-            ? 0
-            : static_cast<uint64_t>(params.tq) * params.topk * sizeof(float);
+        // User workspace: FP32 score grid + FP8 zero page.
         context->GetWorkspaceSizes(1)[0] = platform.GetLibApiWorkSpaceSize() +
             static_cast<uint64_t>(params.tq) * params.maxSeqLenK * sizeof(float) +
-            valueScratchBytes +
             static_cast<uint64_t>(params.blockSize) * params.d;
         return ge::GRAPH_SUCCESS;
     } catch (const std::exception&) {

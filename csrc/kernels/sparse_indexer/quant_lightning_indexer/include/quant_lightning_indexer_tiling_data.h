@@ -16,7 +16,7 @@
  * metadata product op.
  *
  * First grid locks: quant_mode=1, mask_mode=3, cmp_ratio=4, d=128, nk=1,
- * layout_q=TND, layout_k=PA_BBND, return_value=0 (public values empty).
+ * layout_q=TND, layout_k=PA_BBND; public values are always an empty tensor.
  *
  * When common block headers are wired, prefer SparseIndexer::Common::kMaxBatch
  * via shared_native_roots; keep the literal until that BuildConfig change lands.
@@ -44,7 +44,6 @@ struct QuantLightningIndexerTilingData {
     int32_t quantMode{1};
     int32_t maskMode{3};
     int32_t cmpRatio{4};
-    int32_t returnValue{0};
 };
 
 #endif // FLASHINFER_QUANT_LIGHTNING_INDEXER_TILING_DATA_H

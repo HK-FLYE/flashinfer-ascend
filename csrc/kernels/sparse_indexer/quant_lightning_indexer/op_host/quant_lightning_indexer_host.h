@@ -31,7 +31,6 @@ constexpr size_t ATTR_MASK_MODE = 2;
 constexpr size_t ATTR_CMP_RATIO = 3;
 constexpr size_t ATTR_MAX_SEQ_LEN_K = 4;
 constexpr size_t ATTR_MAX_SEQLEN_Q = 5;
-constexpr size_t ATTR_RETURN_VALUE = 6;
 
 template <typename T, typename Context>
 T Attr(const Context* context, size_t index, T fallback)

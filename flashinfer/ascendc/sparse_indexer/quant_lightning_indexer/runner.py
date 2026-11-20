@@ -103,7 +103,8 @@ class QuantLightningIndexerRunner:
         weights_flat = _nd_contig(weights)
         q_scale = _nd_contig(query_dequant_scale)
 
-        # Native values buffer is always full-shaped even when public return_value=0.
+        # The native ABI retains a full-shaped values output; the first-grid public
+        # contract always exposes it as an empty tensor.
         if values.numel() == 0:
             values_work = torch.empty(
                 indices.shape, dtype=torch.bfloat16, device=query.device
@@ -134,7 +135,6 @@ class QuantLightningIndexerRunner:
             cmp_ratio=int(attributes["cmp_ratio"]),
             max_seq_len_k=int(attributes["max_seq_len_k"]),
             max_seqlen_q=int(attributes.get("max_seqlen_q", -1)),
-            return_value=int(attributes.get("return_value", 0)),
         )
 
         if query.device.type == torch._C._get_privateuse1_backend_name():

@@ -1,7 +1,7 @@
 """L0/L1 tests for sparse_indexer.quant_lightning_indexer.
 
 First grid: Ascend950 DeepSeek V4 DSA hot path
-(quant_mode=1, TND/PA_BBND, mask_mode=3, cmp_ratio=4, D=128, return_value=0).
+(quant_mode=1, TND/PA_BBND, mask_mode=3, cmp_ratio=4, D=128).
 
 L0 = public schema / NativeBinding contract.
 L1 = CPU golden semantic boundaries (device kernel still unverified).
@@ -51,7 +51,6 @@ def args(**overrides):
         seqused_k=Tensor((1,), "int32"),
         cmp_residual_k=Tensor((1,), "int32"),
         block_table=Tensor((1, 8), "int32"),
-        return_value=0,
         validate_metadata=False,
     )
     base.update(overrides)
@@ -69,13 +68,10 @@ def test_hot_path_contract_keeps_two_outputs():
     assert invocation.attributes["quant_mode"] == 1
     assert invocation.attributes["mask_mode"] == 3
     assert invocation.attributes["cmp_ratio"] == 4
+    assert "return_value" not in OPERATOR.schema
+    assert "return_value" not in invocation.attributes
     assert invocation.inference.kv_cache_type == "paged"
     assert invocation.inference.causal is True
-
-
-def test_return_value_one_allocates_values_shape():
-    invocation = infer(return_value=1)
-    assert [o.shape for o in invocation.outputs] == [(8, 1, 4), (8, 1, 4)]
 
 
 def test_model_perf_suite_keeps_supported_and_blocked_cases_explicit():
@@ -104,7 +100,6 @@ def test_topk_larger_than_visible_tokens_keeps_output_width():
         (dict(mask_mode=0), "mask_mode"),
         (dict(cmp_ratio=1), "cmp_ratio"),
         (dict(topk=0), "topk"),
-        (dict(return_value=2), "return_value"),
         (dict(query=Tensor((8, 64, 64))), "head dim"),
         (dict(query=Tensor((8, 65, 128)), weights=Tensor((8, 65), "float32"),
               query_dequant_scale=Tensor((8, 65), "float32")), "N1"),
@@ -230,7 +225,6 @@ def test_runner_preserves_page_axis_stride_without_host_copy():
         cmp_ratio=4,
         max_seq_len_k=block,
         max_seqlen_q=1,
-        return_value=0,
     )
 
     native_key = captured["args"][1]
@@ -302,18 +296,6 @@ def test_cpu_golden_mask3_respects_visibility_window():
             assert (chosen < visible).all()
         else:
             assert chosen.numel() == 0
-
-
-def test_cpu_golden_return_value_matches_score_gather():
-    case = next(c for c in CASE_PARAMETERS if c["name"] == "short_query_topk_overflow")
-    tensors = make_cpu_inputs(torch, case)
-    tensors["return_value"] = 1
-    indices, values = golden(torch, **tensors)
-    assert values.shape == indices.shape
-    assert values.dtype == torch.bfloat16
-    # Invalid slots stay -inf after bf16 cast of -inf scores.
-    invalid = indices < 0
-    assert torch.isneginf(values[invalid]).all()
 
 
 def test_cpu_golden_is_deterministic():
@@ -431,7 +413,6 @@ def _hand_built_inputs(*, weights=None, q_scale=None, k_scale=None, key_vals=Non
         seqused_k=torch.tensor([4], dtype=torch.int32),
         cmp_residual_k=torch.tensor([0], dtype=torch.int32),
         block_table=torch.tensor([[0]], dtype=torch.int32),
-        return_value=0,
     )
 
 
@@ -451,11 +432,9 @@ def test_cpu_golden_zero_weights_still_topk_by_index():
 def test_cpu_golden_extreme_scales_finite_indices():
     q_scale = torch.full((1, 2), 1e-6, dtype=torch.float32)
     k_scale = torch.full((1, 16, 1), 1e4, dtype=torch.float32)
-    indices, values = golden(
-        torch, **{**_hand_built_inputs(q_scale=q_scale, k_scale=k_scale), "return_value": 1}
-    )
+    indices, values = golden(torch, **_hand_built_inputs(q_scale=q_scale, k_scale=k_scale))
     assert ((indices >= 0) | (indices == -1)).all()
-    assert torch.isfinite(values[indices >= 0]).all()
+    assert values.shape == (0,)
 
 
 def test_cpu_golden_negative_qk_masked_by_relu_still_fills():
@@ -481,36 +460,10 @@ def _qli_v2_indices_sorted_by_values(torch, tensors):
     slots. With ``return_value=1``, their tests re-sort indices by the returned
     values before comparing. That is the semantic order we match.
     """
-    ref, values = qli_v2_oracle(torch, {**tensors, "return_value": 1})
+    ref, values = qli_v2_oracle(torch, tensors, return_value=1)
     assert values is not None and values.numel() == ref.numel(), (ref.shape, getattr(values, "shape", None))
     _, order = values.float().sort(dim=-1, descending=True)
     return torch.gather(ref, dim=-1, index=order)
-
-
-@pytest.mark.real_compile
-def test_npu_rejects_non_dense_pa_inner_axis():
-    """Only the page axis may be strided; padded block rows are rejected."""
-    import os
-
-    _require_npu()
-    if not os.environ.get("FLASHINFER_AOT_PATHS"):
-        raise AssertionError(
-            "FLASHINFER_AOT_PATHS is required for the PA stride contract; missing package is a failure"
-        )
-    import torch_npu
-    import flashinfer
-    from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import sample
-
-    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
-    args, options, _ = sample(torch, torch_npu, **case)
-    key = args[1]
-    pages, block, nk, d = key.shape
-    padded = torch.empty((pages, block * 2, nk, d), dtype=key.dtype, device=key.device)
-    padded[:, ::2].copy_(key)
-    bad_key = torch_npu.npu_format_cast(padded[:, ::2], 2)
-    args = (args[0], bad_key) + args[2:]
-    with pytest.raises(RuntimeError):
-        flashinfer.quant_lightning_indexer(*args, **options)
 
 
 @pytest.mark.real_compile
@@ -544,8 +497,38 @@ def test_smoke_tiny_matches_qli_v2_score_order():
     expected, _ = golden(torch, **tensors)
     ordered = _qli_v2_indices_sorted_by_values(torch, tensors)
     assert torch.equal(ordered.to(expected.dtype), expected), (ordered, expected)
-    ref, values = qli_v2_oracle(torch, {**tensors, "return_value": 1})
+    ref, values = qli_v2_oracle(torch, tensors, return_value=1)
     assert torch.equal(ref, raw), (ref, raw)
     _, order = values.float().sort(dim=-1, descending=True)
     ours_ordered = torch.gather(out_idx.cpu(), dim=-1, index=order)
     assert torch.equal(ours_ordered.to(expected.dtype), expected), (ours_ordered, expected)
+
+
+@pytest.mark.real_compile
+def test_npu_rejects_non_dense_pa_inner_axis():
+    """Only the page axis may be strided; padded block rows are rejected.
+
+    Keep this expected-failure test last in the process: ACLNN runtime state may
+    remain unusable after the rejected launch.
+    """
+    import os
+
+    _require_npu()
+    if not os.environ.get("FLASHINFER_AOT_PATHS"):
+        raise AssertionError(
+            "FLASHINFER_AOT_PATHS is required for the PA stride contract; missing package is a failure"
+        )
+    import torch_npu
+    import flashinfer
+    from flashinfer.operators.sparse_indexer.quant_lightning_indexer.cases import sample
+
+    case = next(c for c in CASE_PARAMETERS if c["name"] == "smoke_tiny")
+    args, options, _ = sample(torch, torch_npu, **case)
+    key = args[1]
+    pages, block, nk, d = key.shape
+    padded = torch.empty((pages, block * 2, nk, d), dtype=key.dtype, device=key.device)
+    padded[:, ::2].copy_(key)
+    bad_key = torch_npu.npu_format_cast(padded[:, ::2], 2)
+    args = (args[0], bad_key) + args[2:]
+    with pytest.raises(RuntimeError):
+        flashinfer.quant_lightning_indexer(*args, **options)

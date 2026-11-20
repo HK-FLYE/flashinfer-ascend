@@ -65,7 +65,6 @@ public:
         Attr("cmp_ratio").AttrType(OPTIONAL).Int(4);
         Attr("max_seq_len_k").AttrType(OPTIONAL).Int(0);
         Attr("max_seqlen_q").AttrType(OPTIONAL).Int(-1);
-        Attr("return_value").AttrType(OPTIONAL).Int(0);
 
         SetInferShape(InferQuantLightningIndexerShape)
             .SetInferDataType(InferQuantLightningIndexerType);

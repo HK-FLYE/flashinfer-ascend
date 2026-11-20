@@ -13,51 +13,30 @@
 namespace SparseIndexer::QuantLightningIndexer::Policy {
 
 /**
- * Current production TopK policy. return_value=0 uses the unified vector block
- * (RegTensor prefix below topK, LiTopKVF above topK). The scalar block is kept
- * only for the non-default public-value path and is not a performance claim.
+ * Current production TopK policy: RegTensor prefix below topK,
+ * LiTopKVF above topK.
  */
-template <class VectorBlock_, class ScalarBlock_>
+template <class VectorBlock_>
 struct PrefixLiTopKVFPolicy {
     using VectorBlock = VectorBlock_;
-    using ScalarBlock = ScalarBlock_;
-
-    CATLASS_DEVICE static bool UseVector(__gm__ QuantLightningIndexerTilingData const* tiling)
-    {
-        return tiling->returnValue == 0;
-    }
 
     template <class Scheduler_, class SchedulePolicy_>
     CATLASS_DEVICE static void Run(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
         Scheduler_& scheduler, __gm__ QuantLightningIndexerTilingData const* tiling,
-        AscendC::GlobalTensor<float>& scores, AscendC::GlobalTensor<int32_t> const& outIndices,
-        AscendC::GlobalTensor<float> const& outValues)
+        AscendC::GlobalTensor<float>& scores, AscendC::GlobalTensor<int32_t> const& outIndices)
     {
         AscendC::GlobalTensor<int32_t> dummyOffset;
         typename SchedulePolicy_::Coord coord{};
-        if (UseVector(tiling)) {
-            typename VectorBlock::Params params{};
-            params.topK = tiling->topk;
-            params.s2Stride = tiling->maxSeqLenK;
-            params.s2Tile = tiling->topkS2Tile;
-            params.hasOutputIdxOffset = false;
-            VectorBlock topk(resource, scores, outIndices, params, dummyOffset, outValues);
-            while (scheduler.GetNextTopKCoord(coord)) {
-                const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
-                topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK, coord.localQStart,
-                    task.activeQ, task.activeK, task.residual);
-            }
-        } else {
-            typename ScalarBlock::Params params{};
-            params.topK = tiling->topk;
-            params.s2Stride = tiling->maxSeqLenK;
-            params.s2Tile = tiling->topkS2Tile;
-            params.hasOutputIdxOffset = false;
-            params.writeValues = tiling->returnValue != 0;
-            ScalarBlock topk(resource, scores, outIndices, params, dummyOffset, outValues);
-            while (scheduler.GetNextTopKCoord(coord)) {
-                topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK);
-            }
+        typename VectorBlock::Params params{};
+        params.topK = tiling->topk;
+        params.s2Stride = tiling->maxSeqLenK;
+        params.s2Tile = tiling->topkS2Tile;
+        params.hasOutputIdxOffset = false;
+        VectorBlock topk(resource, scores, outIndices, params, dummyOffset);
+        while (scheduler.GetNextTopKCoord(coord)) {
+            const auto task = SchedulePolicy_::MakeTask(coord, scheduler.source());
+            topk(coord.qStart, coord.actualQ, coord.kStart, coord.actualK, coord.localQStart,
+                task.activeQ, task.activeK, task.residual);
         }
     }
 };
@@ -74,11 +53,10 @@ struct InlinePrefixLiTopKVFPolicy {
 
     CATLASS_DEVICE static void RunLocal(Catlass::Arch::Resource<Catlass::Arch::Ascend950>& resource,
         __gm__ QuantLightningIndexerTilingData const* tiling, AscendC::GlobalTensor<float>& scores,
-        AscendC::GlobalTensor<int32_t> const& outIndices, AscendC::GlobalTensor<float> const& outValues,
-        uint32_t s1Start, uint32_t rows, uint32_t kStart, uint32_t kLen, uint32_t localQStart,
-        uint32_t qLen, int32_t residual)
+        AscendC::GlobalTensor<int32_t> const& outIndices, uint32_t s1Start, uint32_t rows,
+        uint32_t kStart, uint32_t kLen, uint32_t localQStart, uint32_t qLen, int32_t residual)
     {
-        if (rows == 0 || tiling->returnValue != 0) {
+        if (rows == 0) {
             return;
         }
         AscendC::GlobalTensor<int32_t> dummyOffset;
@@ -87,7 +65,7 @@ struct InlinePrefixLiTopKVFPolicy {
         params.s2Stride = tiling->maxSeqLenK;
         params.s2Tile = tiling->topkS2Tile;
         params.hasOutputIdxOffset = false;
-        VectorBlock topk(resource, scores, outIndices, params, dummyOffset, outValues);
+        VectorBlock topk(resource, scores, outIndices, params, dummyOffset);
         topk(s1Start, rows, kStart, kLen, localQStart, qLen, kLen, residual);
     }
 };

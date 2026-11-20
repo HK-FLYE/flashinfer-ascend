@@ -142,7 +142,6 @@ IMPLEMENTATION = AscendCImplementation(
             AttributeParameter("cmp_ratio", "int64", 4, 4, 4),
             AttributeParameter("max_seq_len_k", "int64", 1, 1, MAX_TOTAL),
             AttributeParameter("max_seqlen_q", "int64", -1, -1, MAX_TOTAL),
-            AttributeParameter("return_value", "int64", 0, 0, 1),
         ),
     ),
     runner_factory=make_runner,

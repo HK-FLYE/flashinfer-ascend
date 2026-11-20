@@ -14,7 +14,7 @@
 
 ## QuantLightningIndexer（首期热点格）
 
-公共入口为 `flashinfer.quant_lightning_indexer`，返回 `(indices, values)`。`return_value=0` 时 `values` 为空形状 `bfloat16` Tensor。计算语义对齐 DeepSeek V4 DSA 生产热点：
+公共入口为 `flashinfer.quant_lightning_indexer`，返回 `(indices, values)`。首期生产语义固定只消费 indices，`values` 始终为空形状 `bfloat16` Tensor；不提供 `return_value` 开关。计算语义对齐 DeepSeek V4 DSA 生产热点：
 
 ```text
 score = sum_h W * ReLU((Sq @ Sk^T) ⊙ (Qq @ Kq^T))
@@ -38,7 +38,7 @@ indices = stable_topk(score, topk)
 
 必选运行时输入：`cu_seqlens_q`、`seqused_k`、`block_table`、`cmp_residual_k`、`max_seq_len_k>0`。TND 下 `indices` 形状为 `[Tq, Nk, topk]`；无效位填 `-1`。
 
-正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`。QLIv2 设备侧 TopK **槽位次序非分值降序**；对拍时按 ops-transformer 自测惯例，用 `return_value=1` 的 values 重排后再严相等。**不声称性能优势。**
+正确性验收目标：与 ops-transformer QLIv2 在同语义输入下比较 `indices`。QLIv2 设备侧 TopK **槽位次序非分值降序**；对拍时仅在测试工具中请求 QLIv2 返回 values 并按其重排，本算子公共接口不暴露 values/`return_value` 能力。**不声称性能优势。**
 
 源码：[公共定义](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/operator.py)、[CPU golden / sample](../../flashinfer/operators/sparse_indexer/quant_lightning_indexer/cases.py)、[AOT/runner](../../flashinfer/ascendc/sparse_indexer/quant_lightning_indexer/)、[设备实现](../../csrc/kernels/sparse_indexer/quant_lightning_indexer/)、[契约与 CPU 语义测试](../../tests/test_quant_lightning_indexer.py)。
 

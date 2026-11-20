@@ -109,11 +109,9 @@ public:
 
     CATLASS_DEVICE BlockTopKVector(Catlass::Arch::Resource<ArchTag>& resource,
         AscendC::GlobalTensor<DtypeScore> const& workspace, AscendC::GlobalTensor<DtypeOut> const& outIndices,
-        Params const& params, AscendC::GlobalTensor<int32_t> const& outputIdxOffset,
-        AscendC::GlobalTensor<DtypeScore> const& outValues)
+        Params const& params, AscendC::GlobalTensor<int32_t> const& outputIdxOffset)
         : gmScores_(workspace),
           gmOut_(outIndices),
-          gmValues_(outValues),
           gmOutputIdxOffset_(outputIdxOffset),
           topK_(params.topK),
           s2Stride_(params.s2Stride),
@@ -237,7 +235,6 @@ private:
 
     AscendC::GlobalTensor<DtypeScore> const& gmScores_;
     AscendC::GlobalTensor<DtypeOut> const& gmOut_;
-    AscendC::GlobalTensor<DtypeScore> gmValues_;
     AscendC::GlobalTensor<int32_t> const& gmOutputIdxOffset_;
     AscendC::LocalTensor<DtypeScore> scoreUb_;
     AscendC::LocalTensor<uint16_t> inputUb_;

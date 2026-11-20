@@ -25,19 +25,16 @@ extern "C" __global__ __aicore__ void fi_quant_lightning_indexer(
     AscendC::SetSysWorkspace(workspace);
     (void)cu_seqlens_k;
     (void)seqused_q;
+    (void)values;
 
     auto const* tilingData =
         reinterpret_cast<__gm__ QuantLightningIndexerTilingData const*>(tiling);
     GM_ADDR userWorkspace = AscendC::GetUserWorkspace(workspace);
     const uint64_t scoreBytes =
         static_cast<uint64_t>(tilingData->tq) * tilingData->maxSeqLenK * sizeof(float);
-    const uint64_t valueBytes = tilingData->returnValue == 0
-        ? 0
-        : static_cast<uint64_t>(tilingData->tq) * tilingData->topk * sizeof(float);
     GM_ADDR scores = userWorkspace;
-    GM_ADDR valuesScratch = userWorkspace + scoreBytes;
-    GM_ADDR zeroPage = userWorkspace + scoreBytes + valueBytes;
+    GM_ADDR zeroPage = userWorkspace + scoreBytes;
     QuantLightningIndexerKernelDetail::RunKernel(
         query, key, weights, query_dequant_scale, key_dequant_scale, block_table, cu_seqlens_q, seqused_k,
-        cmp_residual_k, indices, valuesScratch, values, scores, zeroPage, tiling);
+        cmp_residual_k, indices, scores, zeroPage, tiling);
 }

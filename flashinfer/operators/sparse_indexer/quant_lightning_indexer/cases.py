@@ -337,7 +337,6 @@ def golden(
     seqused_k=None,
     cmp_residual_k=None,
     block_table=None,
-    return_value=0,
 ):
     if quant_mode != 1 or layout_q != "TND" or layout_k != "PA_BBND":
         raise NotImplementedError("CPU golden currently covers the first grid only")
@@ -362,7 +361,6 @@ def golden(
     logical_k, logical_s = _gather_paged(torch, pages, ks, table, used, max_seq_len_k)
 
     rows_i = []
-    rows_v = []
     for b in range(len(ql) - 1):
         q0, q1 = ql[b], ql[b + 1]
         q_len = q1 - q0
@@ -380,17 +378,9 @@ def golden(
         )
         idx = _stable_topk(torch, score, topk)
         rows_i.append(idx)
-        if return_value:
-            safe = idx.long().clamp_min(0)
-            vals = torch.gather(score, 1, safe)
-            vals = vals.masked_fill(idx < 0, float("-inf"))
-            rows_v.append(vals)
 
     indices = torch.cat(rows_i).unsqueeze(1).to(torch.int32)
-    if return_value:
-        values = torch.cat(rows_v).unsqueeze(1).to(torch.bfloat16)
-    else:
-        values = torch.empty((0,), dtype=torch.bfloat16)
+    values = torch.empty((0,), dtype=torch.bfloat16)
     return indices, values
 
 
@@ -413,7 +403,6 @@ def qli_v2_raw_golden(
     seqused_k=None,
     cmp_residual_k=None,
     block_table=None,
-    return_value=0,
 ):
     """CPU model of QLIv2 raw threshold/filter slot order.
 
@@ -440,7 +429,6 @@ def qli_v2_raw_golden(
     logical_k, logical_s = _gather_paged(torch, pages, ks, table, used, max_seq_len_k)
 
     rows_i = []
-    rows_v = []
     for batch in range(len(ql) - 1):
         q0, q1 = ql[batch], ql[batch + 1]
         q_len = q1 - q0
@@ -472,13 +460,9 @@ def qli_v2_raw_golden(
                 selected = torch.cat((gt, eq[: topk - gt.numel()])).to(torch.int32)
                 row[: selected.numel()] = selected
             rows_i.append(row.unsqueeze(0))
-            if return_value:
-                safe = row.long().clamp_min(0)
-                vals = score[local_q].gather(0, safe).to(torch.bfloat16)
-                rows_v.append(vals.masked_fill(row < 0, float("-inf")).unsqueeze(0))
 
     indices = torch.stack(rows_i)
-    values = torch.stack(rows_v) if return_value else torch.empty((0,), dtype=torch.bfloat16)
+    values = torch.empty((0,), dtype=torch.bfloat16)
     return indices, values
 
 
@@ -574,7 +558,6 @@ def make_cpu_inputs(torch, case=None):
         "seqused_k": seqused_k,
         "cmp_residual_k": residual,
         "block_table": table,
-        "return_value": int(case.get("return_value", 0)),
     }
 
 
@@ -638,7 +621,6 @@ def sample(torch, torch_npu, **configuration):
         seqused_k=to_device(tensors["seqused_k"]),
         cmp_residual_k=to_device(tensors["cmp_residual_k"]),
         block_table=to_device(tensors["block_table"]),
-        return_value=int(tensors["return_value"]),
         backend="ascendc",
     )
     return args, options, expected
@@ -648,7 +630,7 @@ def sample(torch, torch_npu, **configuration):
 TOLERANCES = ((0.0, 0.0), (0.0, 0.0))
 
 
-def qli_v2_oracle(torch, tensors):
+def qli_v2_oracle(torch, tensors, *, return_value=0):
     """Run ops-transformer QLIv2 on the same semantic inputs (NPU).
 
     Requires ``cann_ops_transformer`` and a live NPU. Builds the companion
@@ -711,6 +693,6 @@ def qli_v2_oracle(torch, tensors):
         layout_k="PA_BBND",
         mask_mode=int(tensors["mask_mode"]),
         cmp_ratio=int(tensors["cmp_ratio"]),
-        return_value=int(tensors.get("return_value", 0)),
+        return_value=int(return_value),
     )
     return indices.cpu(), values.cpu()

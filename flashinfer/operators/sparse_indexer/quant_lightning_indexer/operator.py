@@ -56,7 +56,6 @@ def _meta(arguments):
     layout_k = _layout(arguments["layout_k"], "layout_k", ("PA_BBND",))
     mask_mode = arguments["mask_mode"]
     cmp_ratio = arguments["cmp_ratio"]
-    return_value = arguments["return_value"]
     max_seq_len_k = arguments["max_seq_len_k"]
 
     _positive("topk", topk)
@@ -68,8 +67,6 @@ def _meta(arguments):
         raise ValueError("mask_mode must be 3 in the first grid")
     if cmp_ratio != FIRST_CMP_RATIO:
         raise ValueError("cmp_ratio must be 4 in the first grid")
-    if return_value not in (0, 1):
-        raise ValueError("return_value must be 0 or 1")
     if not isinstance(max_seq_len_k, int) or max_seq_len_k <= 0:
         raise ValueError("max_seq_len_k must be a positive integer for PA_BBND")
 
@@ -157,7 +154,7 @@ def _meta(arguments):
             raise ValueError("seqused_q must be int32 [B]")
 
     indices_shape = (tq, nk, topk)
-    values_shape = indices_shape if return_value else (0,)
+    values_shape = (0,)
     return SimpleNamespace(
         layout_q=layout_q,
         layout_k=layout_k,
@@ -223,7 +220,6 @@ def infer(arguments, layouts):
             "quant_mode": arguments["quant_mode"],
             "max_seq_len_k": arguments["max_seq_len_k"],
             "max_seqlen_q": arguments["max_seqlen_q"],
-            "return_value": arguments["return_value"],
         },
         InferenceSpec(
             compute_dtype=meta.dtype,
@@ -282,7 +278,7 @@ OPERATOR = OperatorDefinition(
         "int max_seq_len_k=0, int max_seqlen_q=-1, "
         "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, "
         "Tensor? seqused_q=None, Tensor? seqused_k=None, Tensor? cmp_residual_k=None, "
-        "Tensor? block_table=None, int return_value=0, "
+        "Tensor? block_table=None, "
         "bool validate_metadata=False) -> (Tensor, Tensor)"
     ),
     output_names=("indices", "values"),
@@ -291,6 +287,7 @@ OPERATOR = OperatorDefinition(
     description=(
         "Ascend950 quant lightning indexer first grid. FP8 query/key with float32 "
         "scales/weights, TND/PA_BBND, causal compressed masking (mask_mode=3, "
-        "cmp_ratio=4). Eager AOT-only and not graph capturable."
+        "cmp_ratio=4). Returns indices and an empty values tensor. "
+        "Eager AOT-only and not graph capturable."
     ),
 )
