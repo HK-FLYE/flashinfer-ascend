@@ -10,7 +10,12 @@ import flashinfer
 from flashinfer.operators.catalog import cases_module, definition, entries
 from flashinfer.operators.implementation import implementations
 from flashinfer.operators.pytest_support import aot_params, implementation_param
-from flashinfer.operators.testing import case_parameters, case_tolerances, numerical_cases
+from flashinfer.operators.testing import (
+    case_output_count,
+    case_parameters,
+    case_tolerances,
+    numerical_cases,
+)
 from flashinfer.runtime import Backend, CompileMode, KernelRegistry, get_global_registry, kernel_registry_scope
 
 
@@ -31,11 +36,14 @@ def test_public_default_route(npu_runtime, aot_runtime, op, configuration):
     else:
         call = getattr(flashinfer, operator.name)
     cases = cases_module(op)
+    count = case_output_count(operator, cases, configuration)
     args, options, expected = cases.sample(torch, torch_npu, **configuration)
     actual = call(*args, **options)
-    tolerances = case_tolerances(cases, configuration)
-    if len(tolerances) == 1:
+    tolerances = case_tolerances(cases, configuration)[:count]
+    if count == 1:
         actual, expected = (actual,), (expected,)
+    else:
+        actual, expected = tuple(actual)[:count], tuple(expected)[:count]
     assert len(actual) == len(expected) == len(tolerances)
     for output, golden, (atol, rtol) in zip(actual, expected, tolerances):
         if operator.schema:
