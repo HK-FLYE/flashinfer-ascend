@@ -11,6 +11,12 @@
 
 namespace SparseIndexer::Common {
 
+/// All participating cores must reach this barrier, including empty shards.
+CATLASS_DEVICE void SyncAllCores()
+{
+    AscendC::SyncAll<false>();
+}
+
 /**
  * C2 uses explicit per-subblock cross-core flags. In MIX 1:2, a cube core
  * owns two AIVs; a single block flag would let one AIV consume the other's
@@ -53,7 +59,7 @@ struct SubblockPairBlockBarrierSyncPolicy {
 
     CATLASS_DEVICE static void GlobalBarrier()
     {
-        AscendC::SyncAll<false>();
+        SyncAllCores();
     }
 };
 
