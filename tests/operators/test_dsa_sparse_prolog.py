@@ -17,5 +17,7 @@ def test_accuracy(npu_runtime, configuration):
     torch, torch_npu = npu_runtime
     args, options, expected = cases.sample(torch, torch_npu, **configuration)
     actual = flashinfer.dsa_sparse_prolog(*args, **options)
-    ok, rows = cases.compare(actual, expected)
+    for output, reference, (atol, rtol) in zip(actual, expected, cases.TOLERANCES):
+        torch.testing.assert_close(output.cpu().double(), reference.double(), atol=atol, rtol=rtol)
+    ok, rows = cases.compare(actual, configuration)
     assert ok, rows

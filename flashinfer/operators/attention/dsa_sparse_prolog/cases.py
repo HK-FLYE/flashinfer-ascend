@@ -202,17 +202,34 @@ def sample(torch_module, torch_npu, **configuration):
         qk_nope_head_dim=cfg.qk_nope_head_dim, is_type_demotion=bool(configuration["demote"]),
         apply_rope_fusion=bool(configuration["fusion"]), backend="ascendc",
     )
-    expected = dict(baseline=baseline, fp64=fp64, demote=bool(configuration["demote"]), case_name=configuration["case_name"])
-    return args, options, expected
+    # Public and selftest comparisons use the torch baseline. fp64 stays available
+    # for the original relative-error check.
+    return args, options, tuple(baseline)
 
 
-def compare(actual, expected):
+# Elementwise bounds covering the source L2 check on the enabled ND cases.
+# q_rstd / ckv_rstd are float32; the other seven outputs follow the compute dtype.
+TOLERANCES = (
+    (8e-2, 5e-2), (8e-2, 5e-2), (8e-2, 5e-2), (8e-2, 5e-2),
+    (8e-2, 5e-2), (8e-2, 5e-2), (5e-3, 5e-3), (8e-2, 5e-2), (5e-3, 5e-3),
+)
+
+
+def compare(actual, configuration):
+    """Source criterion: op vs fp64 is no worse than 1.5x the torch baseline."""
+    cfg, golden_cfg, token_x, weights, cos, sin = _inputs(configuration)
+    dtype = getattr(torch, configuration["dtype"])
+    baseline = dsa_sparse_prolog_golden(
+        golden_cfg, token_x.to(dtype), {key: value.to(dtype) for key, value in weights.items()},
+        cos.to(dtype), sin.to(dtype),
+    )
+    fp64 = dsa_sparse_prolog_golden_fp64(cfg, token_x, weights, cos, sin)
     rows = []
-    for name, op_out, base_out, fp64_out in zip(OUT_NAMES, actual, expected["baseline"], expected["fp64"]):
+    for name, op_out, base_out, fp64_out in zip(OUT_NAMES, actual, baseline, fp64):
         rows.append(dict(
             out=name,
             op_vs_torch=rel_err(op_out.cpu(), base_out.cpu()),
             op_vs_fp64=rel_err(op_out.cpu(), fp64_out),
             torch_vs_fp64=rel_err(base_out.cpu(), fp64_out),
         ))
-    return all(check_precision_row(row, expected["demote"]) for row in rows), rows
+    return all(check_precision_row(row, bool(configuration["demote"])) for row in rows), rows
