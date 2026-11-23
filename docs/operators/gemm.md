@@ -67,3 +67,42 @@ arch22 提供两个按 expert 整理 token 的公共接口，输入和输出均�
 CANN MoE 与其他通用实现统一以 `Ascend910C` 声明 A3，硬件名 `Ascend910_93xx` 归一为该值。GMM 的 B/C 变体共享源码与 runner，910B wheel 收集各自产物；A3 真机数值未验证。Matmul/FP8 等现有 A5 限定域不因共包而扩大，按 [矩阵](../backends/overview.md) 判断。
 
 源码：[公共 GEMM](../../flashinfer/gemm.py)、[Matmul 公共定义](../../flashinfer/operators/gemm/matmul/)、[Ascend C](../../flashinfer/ascendc/gemm/)、[CANN](../../flashinfer/cann/gemm/)、[Triton Matmul](../../flashinfer/triton/gemm/matmul/)、[GMM 公共定义](../../flashinfer/operators/gemm/grouped_matmul_swiglu_quant/)、[MoE 适配](../../flashinfer/cann/fused_moe/)。
+
+## GmmLocalExp 与 GmmLocalExpWithZero
+
+两个算子分别从 ops-transformer PR #12993 迁入，保留独立的原生 OpType、ACLNN 接口和设备实现。公共入口为 `flashinfer.gmm_local_exp` 和 `flashinfer.gmm_local_exp_with_zero`，也可从 `flashinfer.gemm` 调用。
+
+```python
+y = flashinfer.gmm_local_exp(
+    x, weight, group_list, exp_start_idx, exp_end_idx,
+    trans_b=False, is_b_nz=False, type_promotion=False,
+)
+y_zero = flashinfer.gmm_local_exp_with_zero(
+    x, weight, group_list, exp_start_idx, exp_end_idx,
+    trans_b=False, is_b_nz=False, type_promotion=False,
+)
+```
+
+- `x` 为 `[M,K]`；`weight` 仅包含本地专家，非转置为 `[E,K,N]`，`trans_b=True` 时为 `[E,N,K]`，其中 `E = exp_end_idx - exp_start_idx`。
+- `group_list` 是 Device 上的一维 INT32 逐专家 token 数，**不是累计边界**。计数必须非负且总和等于 M，token 已按全局专家顺序排列。调用者负责计数有效性；接口不会将整张计数表拷回 Host，kernel 在 Device 上累加并计算切片边界。原 PR Torch wrapper 的 INT64 到 INT32 便利转换不属于原生 ABI；使用这里的接口时显式传 INT32。
+- 本地专家区间为左闭右开 `[exp_start_idx, exp_end_idx)`。两者均返回 `[M,N]`，只计算本地专家的行；普通版保留其他行的原值（新分配输出时这些行未定义），WithZero 版将其他行清零。`out=` 可提供预分配输出，并保留对象身份。
+- `x`/`weight` 使用相同 FP16 或 BF16；默认输出同 dtype，`type_promotion=True` 输出 FP32。`trans_a=True` 不支持。
+- `is_b_nz=True` 表示按 NZ 字节排布读取权重，不执行格式转换，要求 `trans_b=True` 且 K、N 均为 16 的倍数。保留原实现的“ND Tensor 承载已打包 NZ 数据”用法；不能将普通 ND 数值直接标为 NZ。真实 FRACTAL_NZ 描述符同样要求属性与实际字节排布匹配。
+
+原 PR 的手工打包方式如下（输入 `weight` 的逻辑形状为 `[E,N,K]`）：
+
+```python
+packed = weight.reshape(E, N, K // 16, 16).permute(0, 2, 1, 3).contiguous().reshape(E, N, K)
+y = flashinfer.gmm_local_exp(x, packed, group_list, start, end, trans_b=True, is_b_nz=True)
+```
+
+声明提供 Ascend910B/Ascend910C 两个目标，A3 真机结果未验证；不声明图捕获支持。构建两套 A2 原生包：
+
+```bash
+python -B -m flashinfer.operators build \
+  --kernel-id ascendc/gemm/gmm_local_exp/native/Ascend910B \
+  --kernel-id ascendc/gemm/gmm_local_exp_with_zero/native/Ascend910B \
+  --output-dir build/gmm-release
+```
+
+独立 CPU 标杆与全 tiling-key 用例在两个公共算子的 `cases.py`，局部区间、空专家、输出保留、极小输出和非法元数据专项测试在 `tests/operators/test_gmm_local_exp.py`。迁移时修正了 WithZero 空闲尾核清零长度的无符号下溢，未归一两套接口。
