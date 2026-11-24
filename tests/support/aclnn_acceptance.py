@@ -58,6 +58,7 @@ def run(case, dtype="float16"):
             atol, rtol = (.001, .001) if dtype == torch.float16 else (.004, .008)
         else:
             raise ValueError(case)
+    torch.npu.current_stream().wait_stream(stream)
     for tensor in (python_result, result, out):
         torch.testing.assert_close(tensor.cpu().double(), expected, atol=atol, rtol=rtol)
     assert len(_native._owners) == 1

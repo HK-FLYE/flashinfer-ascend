@@ -88,6 +88,7 @@ aclDataType acl_dtype(at::ScalarType dtype) {
 struct CallState {
     std::vector<at::Tensor> tensors;
     std::vector<aclTensor*> handles;
+    std::vector<c10::IValue> attributes;
     at::Tensor workspace;
     ~CallState() { release(); }
     int release() noexcept {
@@ -101,6 +102,40 @@ struct CallState {
         return status;
     }
 };
+
+// Stage one borrows the argument addresses only during the ffi call. Stage two
+// is owned by TorchNPU and uses the stream selected by the submitting thread.
+void submit(const std::shared_ptr<Binding>& binding, const std::shared_ptr<CallState>& state,
+            std::vector<void*>& arguments, const c10_npu::NPUStream& stream) {
+    uint64_t workspace_bytes = 0;
+    aclOpExecutor* executor = nullptr;
+    auto* size_pointer = &workspace_bytes;
+    auto** executor_pointer = &executor;
+    arguments.push_back(&size_pointer);
+    arguments.push_back(&executor_pointer);
+    ffi_arg status = 0;
+    ffi_call(&binding->workspace_signature, FFI_FN(binding->workspace), &status, arguments.data());
+    TORCH_CHECK(status == 0 && executor, binding->name, " GetWorkspaceSize returned ", status);
+    binding->last_workspace_bytes.store(workspace_bytes);
+    binding->workspace_observed.store(true);
+    TORCH_CHECK(workspace_bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+                "ACLNN workspace exceeds tensor allocation range");
+    if (workspace_bytes) {
+        state->workspace = at::empty({static_cast<int64_t>(workspace_bytes)},
+                                     state->tensors.front().options().dtype(at::kByte));
+        c10_npu::NPUCachingAllocator::recordStream(state->workspace.storage().data_ptr(), stream);
+    }
+    const auto raw_stream = stream.stream(false);
+    auto launch = [state, binding, executor, workspace_bytes, raw_stream]() -> int {
+        auto* workspace = workspace_bytes ? state->workspace.data_ptr() : nullptr;
+        const int result = binding->launch(workspace, workspace_bytes, executor, raw_stream);
+        const int cleanup = state->release();
+        TORCH_CHECK(result == 0, binding->name, " launch returned ", result);
+        TORCH_CHECK(cleanup == 0, "aclDestroyTensor returned ", cleanup);
+        return 0;
+    };
+    at_npu::native::OpCommand::RunOpApi(binding->name, std::move(launch), false);
+}
 
 void execute(const std::string& token, at::TensorList inputs, at::TensorList outputs) {
     std::shared_ptr<Binding> binding;
@@ -118,10 +153,6 @@ void execute(const std::string& token, at::TensorList inputs, at::TensorList out
     TORCH_CHECK(device.type() == c10::DeviceType::PrivateUse1, "ACLNN requires NPU tensors");
     c10_npu::NPUGuard guard(device);
     const auto stream = c10_npu::getCurrentNPUStream(device.index());
-    // Prepare the stream outside its callback using TorchNPU's exported API.
-    // Draining prior host submissions is consistent with this synchronous
-    // eager boundary and also handles task-queue level 2 safely.
-    const auto raw_stream = stream.stream(true);
     auto state = std::make_shared<CallState>();
     state->tensors.insert(state->tensors.end(), inputs.begin(), inputs.end());
     state->tensors.insert(state->tensors.end(), outputs.begin(), outputs.end());
@@ -141,55 +172,20 @@ void execute(const std::string& token, at::TensorList inputs, at::TensorList out
                         "ACLNN output tensors must not overlap other arguments");
         }
     }
-    // TorchNPU owns command scheduling. The caller retains this state until
-    // RunOpApi(sync=true) has drained the host queue and completed the stream.
-    // Do not synchronize the stream from inside its host queue callback.
-    auto call = [state, binding, stream, raw_stream]() -> int {
-        auto& api = tensor_api();
-        for (const auto& tensor : state->tensors) {
-            const int64_t storage_size = tensor.storage().nbytes() / tensor.element_size();
-            auto* handle = api.create(tensor.sizes().data(), tensor.dim(), acl_dtype(tensor.scalar_type()),
-                tensor.strides().data(), tensor.storage_offset(), ACL_FORMAT_ND,
-                &storage_size, 1, const_cast<void*>(tensor.storage().data()));
-            TORCH_CHECK(handle, "aclCreateTensor failed for ", binding->name);
-            state->handles.push_back(handle);
-        }
-        uint64_t workspace_bytes = 0;
-        aclOpExecutor* executor = nullptr;
-        auto* workspace_pointer = &workspace_bytes;
-        auto** executor_pointer = &executor;
-        std::vector<void*> values;
-        for (auto& handle : state->handles) values.push_back(&handle);
-        values.push_back(&workspace_pointer);
-        values.push_back(&executor_pointer);
-        ffi_arg status = 0;
-        ffi_call(&binding->workspace_signature, FFI_FN(binding->workspace), &status, values.data());
-        TORCH_CHECK(status == 0 && executor, binding->name, "GetWorkspaceSize returned ", status);
-        binding->last_workspace_bytes.store(workspace_bytes);
-        binding->workspace_observed.store(true);
-        TORCH_CHECK(workspace_bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
-                    "ACLNN workspace exceeds tensor allocation range");
-        if (workspace_bytes) {
-            state->workspace = at::empty({static_cast<int64_t>(workspace_bytes)},
-                state->tensors.front().options().dtype(at::kByte));
-            c10_npu::NPUCachingAllocator::recordStream(state->workspace.storage().data_ptr(), stream);
-        }
-        const auto launch_status = binding->launch(
-            workspace_bytes ? state->workspace.data_ptr() : nullptr, workspace_bytes, executor, raw_stream);
-        TORCH_CHECK(launch_status == 0, binding->name, " returned ", launch_status);
-        return 0;
-    };
-    try {
-        at_npu::native::OpCommand::RunOpApi(binding->name, call, true);
-        const auto destroy_status = state->release();
-        TORCH_CHECK(destroy_status == 0, "aclDestroyTensor returned ", destroy_status);
-    } catch (...) {
-        // A failed launch may already have submitted work. Keep the original
-        // exception while completing best-effort cleanup of retained resources.
-        aclrtSynchronizeStream(raw_stream);
-        state->release();
-        throw;
+    state->handles.reserve(state->tensors.size());
+    auto& api = tensor_api();
+    for (const auto& tensor : state->tensors) {
+        const int64_t storage_size = tensor.storage().nbytes() / tensor.element_size();
+        auto* handle = api.create(tensor.sizes().data(), tensor.dim(), acl_dtype(tensor.scalar_type()),
+            tensor.strides().data(), tensor.storage_offset(), ACL_FORMAT_ND,
+            &storage_size, 1, const_cast<void*>(tensor.storage().data()));
+        TORCH_CHECK(handle, "aclCreateTensor failed for ", binding->name);
+        state->handles.push_back(handle);
     }
+    std::vector<void*> values;
+    values.reserve(state->handles.size() + 2);
+    for (auto& handle : state->handles) values.push_back(&handle);
+    submit(binding, state, values, stream);
 }
 // The original _execute boundary above retains its mandatory-Tensor/ND ABI.
 // This separately registered boundary requires explicit immutable conversion,
@@ -220,7 +216,6 @@ void execute_attributes(const std::string& token,
     TORCH_CHECK(device.type() == c10::DeviceType::PrivateUse1, "ACLNN requires NPU Tensors");
     c10_npu::NPUGuard guard(device);
     const auto stream = c10_npu::getCurrentNPUStream(device.index());
-    const auto raw_stream = stream.stream(true);
     for (size_t i = 0; i < arguments.size(); ++i) {
         if (!arguments[i]) continue;
         const auto& tensor = *arguments[i];
@@ -247,94 +242,70 @@ void execute_attributes(const std::string& token,
                         "ACLNN output Tensors must not overlap other arguments");
         }
     }
-    // IValues own string storage until the asynchronous queue callback returns.
-    std::vector<c10::IValue> scalars(attributes.begin(), attributes.end());
-    auto call = [state, binding, arguments, scalars, stream, raw_stream]() -> int {
-        auto& api = tensor_api();
-        state->handles.reserve(arguments.size());
-        for (size_t i = 0; i < arguments.size(); ++i) {
-            if (!arguments[i]) { state->handles.push_back(nullptr); continue; }
-            const auto& tensor = *arguments[i];
-            std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
-            std::vector<int64_t> strides(tensor.strides().begin(), tensor.strides().end());
-            auto offset = tensor.storage_offset();
-            const auto format = static_cast<aclFormat>(at_npu::native::get_npu_format(tensor));
-            std::vector<int64_t> storage = format == ACL_FORMAT_FRACTAL_NZ
-                ? at_npu::native::get_npu_storage_sizes(tensor)
-                : std::vector<int64_t>{static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size())};
-            auto dtype = acl_dtype(tensor.scalar_type());
-            if (binding->conversions[i] == 1 && tensor.scalar_type() == at::kInt) {
-                TORCH_CHECK(!sizes.empty() && !storage.empty(), "Packed int4 requires dimensional metadata");
-                dtype = ACL_INT4;
-                sizes.back() *= 8;
-                for (size_t j = 0; j + 1 < strides.size(); ++j) strides[j] *= 8;
-                storage.back() *= 8;
-                offset *= 8;
-                if (format == ACL_FORMAT_FRACTAL_NZ) {
-                    TORCH_CHECK(sizes.size() >= 2 && sizes.back() % 64 == 0 &&
-                                sizes[sizes.size() - 2] % 16 == 0,
-                                "Native INT4 NZ requires N aligned to 64 and K aligned to 16");
-                    // The carrier is int32, but the payload uses native INT4
-                    // NZ tiles. Its physical C0 is 64 INT4 elements, rather
-                    // than the carrier's int32 C0 multiplied by eight.
-                    storage.assign(sizes.begin(), sizes.end() - 2);
-                    storage.insert(storage.end(), {sizes.back() / 64, sizes[sizes.size() - 2] / 16, 16, 64});
-                }
-            } else if (binding->conversions[i] == 2 && tensor.scalar_type() == at::kLong) {
-                dtype = ACL_UINT64;
+    // Keep string storage valid through the queued ACLNN launch.
+    state->attributes = attributes;
+    auto& api = tensor_api();
+    state->handles.reserve(arguments.size());
+    for (size_t i = 0; i < arguments.size(); ++i) {
+        if (!arguments[i]) { state->handles.push_back(nullptr); continue; }
+        const auto& tensor = *arguments[i];
+        std::vector<int64_t> sizes(tensor.sizes().begin(), tensor.sizes().end());
+        std::vector<int64_t> strides(tensor.strides().begin(), tensor.strides().end());
+        auto offset = tensor.storage_offset();
+        const auto format = static_cast<aclFormat>(at_npu::native::get_npu_format(tensor));
+        std::vector<int64_t> storage = format == ACL_FORMAT_FRACTAL_NZ
+            ? at_npu::native::get_npu_storage_sizes(tensor)
+            : std::vector<int64_t>{static_cast<int64_t>(tensor.storage().nbytes() / tensor.element_size())};
+        auto dtype = acl_dtype(tensor.scalar_type());
+        if (binding->conversions[i] == 1 && tensor.scalar_type() == at::kInt) {
+            TORCH_CHECK(!sizes.empty() && !storage.empty(), "Packed int4 requires dimensional metadata");
+            dtype = ACL_INT4;
+            sizes.back() *= 8;
+            for (size_t j = 0; j + 1 < strides.size(); ++j) strides[j] *= 8;
+            storage.back() *= 8;
+            offset *= 8;
+            if (format == ACL_FORMAT_FRACTAL_NZ) {
+                TORCH_CHECK(sizes.size() >= 2 && sizes.back() % 64 == 0 &&
+                            sizes[sizes.size() - 2] % 16 == 0,
+                            "Native INT4 NZ requires N aligned to 64 and K aligned to 16");
+                // The carrier is int32, but the payload uses native INT4
+                // NZ tiles. Its physical C0 is 64 INT4 elements, rather
+                // than the carrier's int32 C0 multiplied by eight.
+                storage.assign(sizes.begin(), sizes.end() - 2);
+                storage.insert(storage.end(), {sizes.back() / 64, sizes[sizes.size() - 2] / 16, 16, 64});
             }
-            auto* handle = api.create(sizes.data(), sizes.size(), dtype, strides.data(), offset,
-                format, storage.data(), storage.size(), const_cast<void*>(tensor.storage().data()));
-            TORCH_CHECK(handle, "aclCreateTensor failed for ", binding->name);
-            state->handles.push_back(handle);
+        } else if (binding->conversions[i] == 2 && tensor.scalar_type() == at::kLong) {
+            dtype = ACL_UINT64;
         }
-        struct Attribute { uint8_t boolean; int64_t integer; double floating; const char* string; };
-        std::vector<Attribute> values(scalars.size());
-        std::vector<void*> ffi_values;
-        for (size_t i = 0; i < binding->inputs; ++i) ffi_values.push_back(&state->handles[i]);
-        for (size_t i = 0; i < scalars.size(); ++i) {
-            if (binding->attributes[i] == 0) {
-                TORCH_CHECK(scalars[i].isBool(), "ACLNN expected bool attribute");
-                values[i].boolean = scalars[i].toBool(); ffi_values.push_back(&values[i].boolean);
-            } else if (binding->attributes[i] == 1) {
-                TORCH_CHECK(scalars[i].isInt(), "ACLNN expected int attribute");
-                values[i].integer = scalars[i].toInt(); ffi_values.push_back(&values[i].integer);
-            } else if (binding->attributes[i] == 2) {
-                TORCH_CHECK(scalars[i].isDouble() || scalars[i].isInt(), "ACLNN expected float attribute");
-                values[i].floating = scalars[i].isInt() ? scalars[i].toInt() : scalars[i].toDouble();
-                ffi_values.push_back(&values[i].floating);
-            } else {
-                TORCH_CHECK(scalars[i].isString(), "ACLNN expected string attribute");
-                const auto& value = scalars[i].toStringRef();
-                TORCH_CHECK(value.find('\0') == std::string::npos, "ACLNN string attribute contains NUL");
-                values[i].string = value.c_str(); ffi_values.push_back(&values[i].string);
-            }
+        auto* handle = api.create(sizes.data(), sizes.size(), dtype, strides.data(), offset,
+            format, storage.data(), storage.size(), const_cast<void*>(tensor.storage().data()));
+        TORCH_CHECK(handle, "aclCreateTensor failed for ", binding->name);
+        state->handles.push_back(handle);
+    }
+    struct Attribute { uint8_t boolean; int64_t integer; double floating; const char* string; };
+    std::vector<Attribute> values(state->attributes.size());
+    std::vector<void*> ffi_values;
+    for (size_t i = 0; i < binding->inputs; ++i) ffi_values.push_back(&state->handles[i]);
+    for (size_t i = 0; i < state->attributes.size(); ++i) {
+        if (binding->attributes[i] == 0) {
+            TORCH_CHECK(state->attributes[i].isBool(), "ACLNN expected bool attribute");
+            values[i].boolean = state->attributes[i].toBool(); ffi_values.push_back(&values[i].boolean);
+        } else if (binding->attributes[i] == 1) {
+            TORCH_CHECK(state->attributes[i].isInt(), "ACLNN expected int attribute");
+            values[i].integer = state->attributes[i].toInt(); ffi_values.push_back(&values[i].integer);
+        } else if (binding->attributes[i] == 2) {
+            TORCH_CHECK(state->attributes[i].isDouble() || state->attributes[i].isInt(), "ACLNN expected float attribute");
+            values[i].floating = state->attributes[i].isInt() ? state->attributes[i].toInt() : state->attributes[i].toDouble();
+            ffi_values.push_back(&values[i].floating);
+        } else {
+            TORCH_CHECK(state->attributes[i].isString(), "ACLNN expected string attribute");
+            const auto& value = state->attributes[i].toStringRef();
+            TORCH_CHECK(value.find('\0') == std::string::npos, "ACLNN string attribute contains NUL");
+            values[i].string = value.c_str(); ffi_values.push_back(&values[i].string);
         }
-        for (size_t i = binding->inputs; i < arguments.size(); ++i) ffi_values.push_back(&state->handles[i]);
-        uint64_t workspace_bytes = 0;
-        aclOpExecutor* executor = nullptr;
-        auto* size_pointer = &workspace_bytes; auto** executor_pointer = &executor;
-        ffi_values.push_back(&size_pointer); ffi_values.push_back(&executor_pointer);
-        ffi_arg status = 0;
-        ffi_call(&binding->workspace_signature, FFI_FN(binding->workspace), &status, ffi_values.data());
-        TORCH_CHECK(status == 0 && executor, binding->name, "GetWorkspaceSize returned ", status);
-        binding->last_workspace_bytes.store(workspace_bytes);
-        binding->workspace_observed.store(true);
-        TORCH_CHECK(workspace_bytes <= static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
-                    "ACLNN workspace exceeds Tensor allocation range");
-        if (workspace_bytes) {
-            state->workspace = at::empty({static_cast<int64_t>(workspace_bytes)},
-                state->tensors.front().options().dtype(at::kByte));
-            c10_npu::NPUCachingAllocator::recordStream(state->workspace.storage().data_ptr(), stream);
-        }
-        const auto launched = binding->launch(workspace_bytes ? state->workspace.data_ptr() : nullptr,
-                                             workspace_bytes, executor, raw_stream);
-        TORCH_CHECK(launched == 0, binding->name, " launch returned ", launched);
-        return 0;
-    };
-    try { at_npu::native::OpCommand::RunOpApi(binding->name, call, true); }
-    catch (...) { state->release(); throw; }
-    TORCH_CHECK(state->release() == 0, "aclDestroyTensor failed");
+    }
+    for (size_t i = binding->inputs; i < arguments.size(); ++i) ffi_values.push_back(&state->handles[i]);
+    submit(binding, state, ffi_values, stream);
 }
 } // namespace
 
@@ -449,12 +420,26 @@ void execute_with_strings(const std::string& token,
     execute_attributes(token, inputs, outputs, values);
 }
 
+// The dispatcher needs current storage formats even for otherwise identical shapes.
+// This reads host-side metadata for all operands in one Torch call.
+static std::vector<int64_t> storage_formats(at::TensorList tensors) {
+    std::vector<int64_t> formats;
+    formats.reserve(tensors.size());
+    for (const auto& tensor : tensors) {
+        formats.push_back(tensor.device().type() == c10::DeviceType::PrivateUse1
+            ? static_cast<int64_t>(at_npu::native::get_npu_format(tensor)) : -1);
+    }
+    return formats;
+}
+
 TORCH_LIBRARY(flashinfer_aclnn, m) {
+    m.def("_storage_formats(Tensor[] tensors) -> int[]");
     m.def("_execute(str token, Tensor[] inputs, Tensor(a!)[] outputs) -> ()");
     m.def("_execute_extended(str token, Tensor?[] inputs, Tensor(a!)[] outputs, Scalar[] attributes) -> ()");
     m.def("_execute_with_strings(str token, Tensor?[] inputs, Tensor(a!)[] outputs, Any[] attributes) -> ()");
 }
 TORCH_LIBRARY_IMPL(flashinfer_aclnn, PrivateUse1, m) {
+    m.impl("_storage_formats", TORCH_FN(storage_formats));
     m.impl("_execute", TORCH_FN(execute));
     m.impl("_execute_extended", TORCH_FN(execute_extended));
     m.impl("_execute_with_strings", TORCH_FN(execute_with_strings));

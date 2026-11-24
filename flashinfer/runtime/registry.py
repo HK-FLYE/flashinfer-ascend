@@ -63,6 +63,7 @@ class KernelRegistry:
 
     def __init__(self, descriptors: Iterable[KernelDescriptor] = ()) -> None:
         self._descriptors: Dict[str, KernelDescriptor] = {}
+        self._operator_runner_profiles = {}
         self._frozen = False
         # 注册计数：dispatch 决策缓存 key 的组成部分，注册变化自动使旧缓存失效
         self._revision = 0

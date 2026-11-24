@@ -50,6 +50,8 @@ python -B -m flashinfer.aot --freeze --all
 python -B -m flashinfer.aot --all --cache-dir build/aot-cache --output-dir build/aot-release
 ```
 
+全包构建默认每两个可用 CPU 分配一个包编译任务，最多同时编译 8 个包，每个包内 CMake 使用 `-j2`。`--jobs N` 可指定并行包数，`--jobs 1` 可串行构建。发布清单保持登记顺序。
+
 冻结与构建核验依赖根、固定 revision、头文件及环境身份。CATLASS 根通过 `FLASHINFER_CATLASS_ROOT` 或 AOT 的 `--dependency-root catlass=...` 指定；wheel 不携带完整 CATLASS 头树。通用动态依赖根为 `FLASHINFER_<NAME>_ROOT`。
 
 CATLASS 固定为 [v2.2.0](https://gitcode.com/cann/catlass/tree/v2.2.0)，commit `6c0a3242b2effd861ac91aab1999f2226b643614`。A2/A3 共用 arch22，与 A5/arch35 使用独立设备实现、Descriptor 和产物，公共 prefill 接口和 runner 相同；A3 真机数值未验证。编译与数值测试定义见 [多目标验收](../tests/packaging/test_catlass_targets_real.py)。交叉编译不等于目标设备运行通过。

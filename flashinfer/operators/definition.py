@@ -90,6 +90,7 @@ class OperatorDefinition:
     public_entry: object = None
     description: str = ""
     tensor_shapes: tuple = ()
+    torch_declarations: object = None
 
     def __post_init__(self):
         if (
@@ -103,6 +104,10 @@ class OperatorDefinition:
             and not callable(self.validate_values)
         ):
             raise SchemaError("invalid logical operator definition")
+        if self.torch_declarations is not None and (
+            self.schema or not self.public_entry or not callable(self.torch_declarations)
+        ):
+            raise SchemaError("custom Torch declarations require a public entry and cannot also generate a schema")
         if self.schema:
             declarations, returns = schema_arguments(self.schema)
             names = [name for _, name, _, _ in declarations]

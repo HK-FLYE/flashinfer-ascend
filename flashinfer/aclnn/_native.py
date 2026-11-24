@@ -55,6 +55,8 @@ def verified_adapter(directory=None):
         raise RuntimeError("ACLNN Torch adapter library must not be a symlink")
     if hashlib.sha256(library.read_bytes()).hexdigest() != record["sha256"]:
         raise RuntimeError("ACLNN Torch adapter library digest mismatch")
+    if record.get("submission") != "torch_npu_task_queue":
+        raise RuntimeError("ACLNN Torch adapter lacks queued submission; rebuild the adapter or the AOT wheel")
     return library, manifest
 
 
@@ -83,6 +85,10 @@ def load_adapter():
         )
     api.fi_aclnn_last_workspace_size.argtypes = [C.c_char_p, C.POINTER(C.c_uint64)]
     api.fi_aclnn_last_workspace_size.restype = C.c_int
+    formats = getattr(torch.ops.flashinfer_aclnn, "_storage_formats", None)
+    if formats is not None and hasattr(getattr(torch.utils, "_python_dispatch", None), "is_in_torch_dispatch_mode"):
+        from ..runtime import signature
+        signature._batch_format_query = (torch, formats.default)
     return api
 
 
@@ -186,13 +192,12 @@ def prepare(module, recipe):
                 raise RuntimeError(api.fi_aclnn_last_error().decode())
             _owners[token] = module
 
+            extended = recipe.extended_aclnn
+
             def run(tensors, attributes=()):
-                args = (token, list(tensors[:inputs]), list(tensors[inputs:]))
-                return (
-                    operation(*args, list(attributes))
-                    if recipe.extended_aclnn
-                    else operation(*args)
-                )
+                if extended:
+                    return operation(token, tensors[:inputs], tensors[inputs:], attributes)
+                return operation(token, tensors[:inputs], tensors[inputs:])
 
             _runners[token] = run
         return _runners[token]

@@ -117,6 +117,14 @@ with tempfile.TemporaryDirectory() as temporary:
  try: _native.load_adapter()
  except RuntimeError as error: assert 'digest mismatch' in str(error)
  else: raise AssertionError('corrupt native adapter accepted')
+ import hashlib
+ manifest=root/'manifest.json'
+ record=json.loads(manifest.read_text())
+ record['sha256']=hashlib.sha256((root/'libflashinfer_aclnn.so').read_bytes()).hexdigest()
+ manifest.write_text(json.dumps(record))
+ try: _native.load_adapter()
+ except RuntimeError as error: assert 'lacks queued submission' in str(error)
+ else: raise AssertionError('synchronous adapter accepted')
 ''')
 
 

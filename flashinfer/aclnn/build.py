@@ -70,7 +70,7 @@ def build_adapter(output_dir, *, source_root=None):
             result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
         if result.returncode:
             raise RuntimeError("ACLNN Torch adapter build failed; see " + str(log))
-        metadata = dict(schema_version=1, library=library.name,
+        metadata = dict(schema_version=1, library=library.name, submission="torch_npu_task_queue",
                         sha256=hashlib.sha256(library.read_bytes()).hexdigest(),
                         torch_version=torch.__version__, torch_npu_version=torch_npu.__version__,
                         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest())

@@ -61,6 +61,7 @@ def run(mode, first):
                     raise AssertionError("warm native calls must reuse prepared bindings")
 
                 _native.prepare = forbidden
+    torch.npu.current_stream().wait_stream(stream)
     errors = {}
     for case, observed, expected, atol, rtol in observations:
         actual = observed.cpu()

@@ -7,6 +7,7 @@ dependency closure is read, and the result is bound into the ordinary JitSpec.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from functools import cached_property
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -327,7 +328,7 @@ class _Recipe:
                 or {c.name for c in constraints} != symbols):
             raise SchemaError("shape_constraints must bind every tensor shape symbol exactly once")
 
-    @property
+    @cached_property
     def tensor_parameter_names(self):
         """ACLNN stage-one order; the frozen probe ABI supplies the v1 default."""
         return tuple(p.name for p in self.tensor_parameters) if self.schema_version == 2 else ("a", "b", "c")
@@ -347,7 +348,7 @@ class _Recipe:
         return tuple(tuple(p.native_type(dtype) for p, dtype in zip(self.tensor_parameters, signature))
                      for signature in self.tensor_dtype_signatures)
 
-    @property
+    @cached_property
     def extended_aclnn(self):
         return bool(self.attributes or any(p.optional or p.physical_layouts != ("ND",)
                                          or p.native_conversions for p in self.tensor_parameters))

@@ -218,7 +218,7 @@ class PythonImplementation(ImplementationDefinition):
             capability=self.support.capability(self.operator),
             **metadata
         )
-        if self.operator.schema and value.capability_binding is None:
+        if (self.operator.schema or self.operator.torch_declarations is not None) and value.capability_binding is None:
             from .capability import direct_operator_binding
 
             value = replace(value, capability_binding=direct_operator_binding(

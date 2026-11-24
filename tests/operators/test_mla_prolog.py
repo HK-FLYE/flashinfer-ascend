@@ -1,9 +1,14 @@
 """CPU-only public contract tests for attention.mla_prolog (A3)."""
 
 import inspect
+from dataclasses import replace
 
 import torch
+import pytest
 
+from flashinfer.ascendc import load_contract
+from flashinfer.ascendc.attention.mla_prolog.implementation import KERNEL_ID
+from flashinfer.operators.capability import direct_operator_binding, validate_direct_operator_binding
 from flashinfer.operators.attention.mla_prolog import cases
 from flashinfer.operators.attention.mla_prolog.operator import (
     CACHE_PAGES, CACHE_ROWS, HEADS, HEAD_DIM, HIDDEN, KV_LORA, OPERATOR,
@@ -11,6 +16,7 @@ from flashinfer.operators.attention.mla_prolog.operator import (
     validate_values,
 )
 from flashinfer.operators.runtime import fake
+from flashinfer.runtime import SchemaError
 
 
 def meta(shape, dtype):
@@ -79,6 +85,15 @@ def test_torch_declarations_declare_kv_cache_mutation():
         assert mutated == set(declaration.mutates_args)
     assert declarations[0].mutates_args == ("kv_cache",)
     assert declarations[1].mutates_args == ("kv_cache", "q_output", "qr")
+    descriptor, _, _ = load_contract(KERNEL_ID)
+    validate_direct_operator_binding(descriptor)
+    changed = replace(declarations[0], mutates_args=())
+    binding = direct_operator_binding(
+        replace(OPERATOR, torch_declarations=lambda: (changed, declarations[1])),
+        descriptor.capability, descriptor.backend, KERNEL_ID,
+    )
+    with pytest.raises(SchemaError, match="capability/schema binding mismatch"):
+        validate_direct_operator_binding(replace(descriptor, capability_binding=binding))
     functional = torch._C.parse_schema(
         declarations[0].name + declarations[0].schema)
     assert [str(value.type) for value in functional.returns] == [
