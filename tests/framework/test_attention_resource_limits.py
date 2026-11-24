@@ -154,7 +154,7 @@ class AttentionResourcePlanGateTests(unittest.TestCase):
 import math
 
 import pytest
-from tests.support.pytest_plugin import a5_device as npu
+from tests.conftest import a5_device as npu
 
 from flashinfer import (
     BatchDecodeWithPagedKVCacheWrapper,

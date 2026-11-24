@@ -58,15 +58,20 @@ class TorchOpPackageRunner:
 
     def __post_init__(self):
         recipe = self.recipe
-        names = recipe.tensor_parameter_names
 
         @lru_cache(maxsize=128)
         def validate(metadata):
-            recipe.validate_tensor_metadata(
-                shapes={n: None if v is None else v[0] for n, v in zip(names, metadata)},
-                dtypes={n: None if v is None else str(v[1]).removeprefix("torch.")
-                        for n, v in zip(names, metadata)},
-            )
+            shapes, dtypes = {}, {}
+            for p, item in zip(recipe.tensor_parameters, metadata):
+                if item is None:
+                    shapes[p.name] = dtypes[p.name] = None
+                elif p.tensor_list:
+                    shapes[p.name] = tuple(t[0] for t in item)
+                    dtypes[p.name] = tuple(str(t[1]).removeprefix("torch.") for t in item)
+                else:
+                    shapes[p.name], dtype = item
+                    dtypes[p.name] = str(dtype).removeprefix("torch.")
+            recipe.validate_tensor_metadata(shapes=shapes, dtypes=dtypes)
 
         object.__setattr__(self, "_validate_metadata", validate)
 
@@ -74,26 +79,42 @@ class TorchOpPackageRunner:
         import torch
         import torch_npu
 
-        present = tuple(t for t in tensors if t is not None)
-        device = present[0].device
-        if device.type != torch._C._get_privateuse1_backend_name():
+        arguments = [(p,t) for p, value in zip(self.recipe.tensor_parameters, tensors)
+                     if value is not None for t in (value if p.tensor_list else (value,))]
+        npu = torch._C._get_privateuse1_backend_name()
+        device = next((t.device for p,t in arguments if p.device == "npu"), None)
+        if device is None or device.type != npu:
             raise ValueError("Ascend C tensor adapter requires NPU tensors")
-        if any(t.device != device for t in present):
-            raise ValueError("Ascend C tensors must share one device")
-        for parameter, tensor in zip(self.recipe.tensor_parameters, tensors):
-            if tensor is None:
+        for p, t in arguments:
+            if p.device == "cpu":
+                if t.device.type != "cpu":
+                    raise ValueError("expected a CPU input for " + p.name)
                 continue
-            layout = {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(tensor))
-            if not tensor.is_contiguous() or layout not in parameter.physical_layouts:
+            if t.device != device:
+                raise ValueError("Ascend C tensors must share one device")
+            layout = {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(t))
+            if not t.is_contiguous() or layout not in p.physical_layouts:
                 raise ValueError("Ascend C tensor adapter requires contiguous %s tensors for %s"
-                                 % ("/".join(parameter.physical_layouts), parameter.name))
-        _reject_output_overlap(self.recipe.tensor_parameters, tensors)
+                                 % ("/".join(p.physical_layouts), p.name))
+        if arguments:
+            params, flat = zip(*arguments)
+            _reject_output_overlap(params, flat)
 
     def __call__(self, *tensors, **attributes):
         names = self.recipe.tensor_parameter_names
         if len(tensors) != len(names):
             raise SchemaError("tensor adapter expected parameters %s" % (names,))
-        self._validate_metadata(tuple(None if t is None else (tuple(t.shape), t.dtype) for t in tensors))
+        metadata = []
+        for p, value in zip(self.recipe.tensor_parameters, tensors):
+            if value is None:
+                metadata.append(None)
+            elif p.tensor_list:
+                if not isinstance(value, (tuple, list)):
+                    raise SchemaError("expected TensorList for " + p.name)
+                metadata.append(tuple((tuple(t.shape), t.dtype) for t in value))
+            else:
+                metadata.append((tuple(value.shape), value.dtype))
+        self._validate_metadata(tuple(metadata))
         scalar_values = self.recipe.validate_attributes(attributes)
 
         if self._native_runner is None:
@@ -103,12 +124,9 @@ class TorchOpPackageRunner:
             with self._native_lock:
                 if self._native_runner is None:
                     object.__setattr__(self, "_native_runner", _native.prepare(self.module, self.recipe))
-        # Both native entry points check the current device, format, contiguity
-        # and storage ranges before calling ACLNN, including on cache hits.
+        # The typed call checks storage on every invocation, including warm hits.
         try:
-            if self.recipe.extended_aclnn:
-                return self._native_runner(tensors, scalar_values)
-            return self._native_runner(tensors)
+            return self._native_runner(tensors, scalar_values) if scalar_values else self._native_runner(tensors)
         except RuntimeError:
             # Preserve the eager adapter's diagnostic for invalid storage.
             self._validate_storage(tensors)

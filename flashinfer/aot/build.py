@@ -69,11 +69,6 @@ def _for_target(recipe, target):
 
 
 def export_op_package(directory, output_dir):
-    """Export only the public v2 operator contract into new distributions."""
-    return _export_op_package(directory, output_dir, allow_legacy=False)
-
-
-def _export_op_package(directory, output_dir, *, allow_legacy):
     """Copy the exact verified store generation into a read-only release layout.
 
     Release copies are distribution artifacts, never another build cache. Keep
@@ -86,11 +81,11 @@ def _export_op_package(directory, output_dir, *, allow_legacy):
 
     spec = JitSpec.from_dict(data["spec"])
     package, recipe = verify_op_package(directory, spec)
-    if recipe.schema_version != 2 and not allow_legacy:
+    if recipe.schema_version != 2:
         raise SchemaError(
             "new releases require a v2 recipe; legacy v1 artifacts are read-only compatibility"
         )
-    if recipe.schema_version == 2 and package["schema_version"] != 2 and not allow_legacy:
+    if package["schema_version"] != 2:
         raise SchemaError("new releases require a matching generated ACLNN adapter; rebuild the package")
     output_dir.mkdir(parents=True, exist_ok=True)
     target = output_dir / spec.fingerprint
