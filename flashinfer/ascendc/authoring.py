@@ -63,6 +63,20 @@ def prepare_native(root, directory, native):
         for p in native_files
         if p.relative_to(root).as_posix() not in selected
     )
+    shared_includes = tuple(root / _path(p) for p in build.shared_include_dirs)
+    kernels = root / "csrc/kernels"
+    shared_headers = set()
+    for directory_path in shared_includes:
+        if (not directory_path.is_dir()
+                or directory_path != directory_path.resolve()
+                or not directory_path.is_relative_to(kernels)
+                or directory_path == kernels):
+            raise SchemaError("shared include directory must be inside csrc/kernels")
+        shared_headers.update(
+            path for path in directory_path.rglob("*")
+            if path.is_file() and path.suffix in {".h", ".hpp", ".inc"}
+        )
+    headers += tuple(reference(path) for path in sorted(shared_headers))
     extra = []
     native_paths = {p.resolve() for p in native_files}
     for path in sorted(source_dir.rglob("*")):
@@ -107,7 +121,7 @@ def prepare_native(root, directory, native):
         headers=headers,
         include_dirs=tuple(
             local(p).relative_to(root).as_posix() for p in build.includes
-        ),
+        ) + tuple(p.relative_to(root).as_posix() for p in shared_includes),
         dependencies=build.dependencies,
         definitions=build.definitions,
         compile_options=build.compile_options,

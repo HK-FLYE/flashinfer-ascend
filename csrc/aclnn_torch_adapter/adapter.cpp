@@ -74,6 +74,7 @@ aclDataType acl_dtype(at::ScalarType dtype) {
         case at::kFloat: return ACL_FLOAT;
         case at::kHalf: return ACL_FLOAT16;
         case at::kBFloat16: return ACL_BF16;
+        case at::kFloat8_e4m3fn: return ACL_FLOAT8_E4M3FN;
         case at::kDouble: return ACL_DOUBLE;
         case at::kChar: return ACL_INT8;
         case at::kByte: return ACL_UINT8;

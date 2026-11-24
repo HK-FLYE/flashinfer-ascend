@@ -31,6 +31,7 @@ class BuildConfig:
     recipe_id: object = None
     tiling_mode: str = "host_dynamic"
     block_dim: int = 1
+    shared_include_dirs: tuple = ()
 
 
 @dataclass(frozen=True)

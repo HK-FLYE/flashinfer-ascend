@@ -54,3 +54,20 @@ Logical definitions and backend descriptor/runner declarations follow
 packaged indexes are derived from those declarations.
 
 Author workflow: [adding an operator](../../docs/development/adding-an-operator.md). Build and package rules: [compilation and delivery](../../docs/ascendc_aot.md).
+
+### Index Region Score
+
+IRS 通过 FlashInfer 的统一构建流程生成 ACLNN 和类型化 Tensor 适配器，作为 Ascend950
+算子包随 wheel 分发。设备实现和 tiling 数据位于 `sparse_indexer/index_region_score/`，
+逻辑接口通过 `flashinfer.index_region_score` 调用。设 `return_score=False` 时返回空 Score
+和 region IDs，设备复用有界批次工作区。
+
+以固定版本 CATLASS checkout 构建该算子。
+
+```bash
+source /path/to/cann/set_env.sh
+export FLASHINFER_CATLASS_ROOT=/path/to/catlass
+python -B -m flashinfer.operators build \
+    --kernel-id ascendc/attention/index_region_score/catlass/Ascend950 \
+    --output-dir build/index-region-score
+```

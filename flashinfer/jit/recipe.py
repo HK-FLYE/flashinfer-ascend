@@ -23,7 +23,8 @@ CATLASS_REVISION = "6c0a3242b2effd861ac91aab1999f2226b643614"  # v2.2.0
 _LEGACY_CATLASS_REVISION = "41bf90da655bba3c66d0acd7e00abe33960ecfd6"
 _SYMBOL = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _TENSOR_DTYPES = frozenset({
-    "bfloat16", "float16", "float32", "float64", "int8", "uint8", "int16", "int32", "int64", "bool",
+    "bfloat16", "float16", "float32", "float64", "float8_e4m3fn",
+    "int8", "uint8", "int16", "int32", "int64", "bool",
 })
 
 
