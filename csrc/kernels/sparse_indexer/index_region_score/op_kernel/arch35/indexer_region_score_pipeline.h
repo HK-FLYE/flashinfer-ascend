@@ -4,6 +4,7 @@
 #ifndef INDEXER_REGION_SCORE_COMMON_VECTOR_H
 #define INDEXER_REGION_SCORE_COMMON_VECTOR_H
 #include "kernel_operator.h"
+#include "detail/head_reduce_vf.hpp"
 namespace IndexerRegionScoreVector {
 using namespace AscendC;
 
@@ -11,91 +12,6 @@ constexpr uint32_t H4_HEADS = 4U;
 constexpr uint32_t H4_ROWS_PER_AIV = 16U;
 constexpr uint32_t H4_VECTOR_LANES = 64U;
 constexpr uint32_t H4_NEG_INF_BITS = 0xFF800000U;
-
-__aicore__ inline void WeightedReduceH4Micro(
-    const LocalTensor<float> &dst, const LocalTensor<float> &src,
-    uint32_t headStride, uint32_t count,
-    float w0, float w1, float w2, float w3)
-{
-    auto dstPtr = reinterpret_cast<__local_mem__ float *>(dst.GetPhyAddr());
-    auto srcPtr = reinterpret_cast<__local_mem__ float *>(src.GetPhyAddr());
-    __VEC_SCOPE__
-    {
-        MicroAPI::MaskReg mask = MicroAPI::UpdateMask<float>(count);
-        MicroAPI::RegTensor<float> input;
-        MicroAPI::RegTensor<float> weight;
-        MicroAPI::RegTensor<float> accum;
-
-        MicroAPI::LoadAlign<float>(input, srcPtr);
-        MicroAPI::Duplicate(weight, w0, mask);
-        MicroAPI::Mul(accum, input, weight, mask);
-
-        MicroAPI::LoadAlign<float>(input, srcPtr + headStride);
-        MicroAPI::Duplicate(weight, w1, mask);
-        MicroAPI::MulAddDst(accum, input, weight, mask);
-        MicroAPI::LoadAlign<float>(input, srcPtr + 2U * headStride);
-        MicroAPI::Duplicate(weight, w2, mask);
-        MicroAPI::MulAddDst(accum, input, weight, mask);
-        MicroAPI::LoadAlign<float>(input, srcPtr + 3U * headStride);
-        MicroAPI::Duplicate(weight, w3, mask);
-        MicroAPI::MulAddDst(accum, input, weight, mask);
-
-        MicroAPI::StoreAlign<float, MicroAPI::StoreDist::DIST_NORM>(dstPtr, accum, mask);
-    }
-}
-
-// 尾块 VF 直接广播 FP32 权重，省去 Scalar 取值与参数打包；UB 同步由调用方负责。
-__aicore__ inline void WeightedReduceH4UbMicro(
-    const LocalTensor<float> &dst, const LocalTensor<float> &src,
-    const LocalTensor<float> &weights, uint32_t headStride, uint32_t count)
-{
-    auto dstPtr = reinterpret_cast<__local_mem__ float *>(dst.GetPhyAddr());
-    auto srcPtr = reinterpret_cast<__local_mem__ float *>(src.GetPhyAddr());
-    auto weightPtr = reinterpret_cast<__local_mem__ float *>(weights.GetPhyAddr());
-    __VEC_SCOPE__
-    {
-        MicroAPI::MaskReg mask = MicroAPI::UpdateMask<float>(count);
-        MicroAPI::RegTensor<float> input;
-        MicroAPI::RegTensor<float> weight;
-        MicroAPI::RegTensor<float> accum;
-
-        MicroAPI::LoadAlign<float>(input, srcPtr);
-        MicroAPI::LoadAlign<float, MicroAPI::LoadDist::DIST_BRC_B32>(weight, weightPtr);
-        MicroAPI::Mul(accum, input, weight, mask);
-
-        MicroAPI::LoadAlign<float>(input, srcPtr + headStride);
-        MicroAPI::LoadAlign<float, MicroAPI::LoadDist::DIST_BRC_B32>(weight, weightPtr + 1U);
-        MicroAPI::MulAddDst(accum, input, weight, mask);
-        MicroAPI::LoadAlign<float>(input, srcPtr + 2U * headStride);
-        MicroAPI::LoadAlign<float, MicroAPI::LoadDist::DIST_BRC_B32>(weight, weightPtr + 2U);
-        MicroAPI::MulAddDst(accum, input, weight, mask);
-        MicroAPI::LoadAlign<float>(input, srcPtr + 3U * headStride);
-        MicroAPI::LoadAlign<float, MicroAPI::LoadDist::DIST_BRC_B32>(weight, weightPtr + 3U);
-        MicroAPI::MulAddDst(accum, input, weight, mask);
-
-        MicroAPI::StoreAlign<float, MicroAPI::StoreDist::DIST_NORM>(dstPtr, accum, mask);
-    }
-}
-
-// 仅写因果可见前缀，调用方负责初始化屏蔽后缀。
-__aicore__ inline void WeightedReduceH4MaskMicro(
-    const LocalTensor<float> &dst, const LocalTensor<float> &src,
-    uint32_t headStride, uint32_t count,
-    float w0, float w1, float w2, float w3,
-    int32_t kStart, int32_t visibleLength)
-{
-    const int32_t visibleInTile = visibleLength - kStart;
-    const uint32_t activeCount = visibleInTile <= 0
-        ? 0U
-        : (static_cast<uint32_t>(visibleInTile) < count
-               ? static_cast<uint32_t>(visibleInTile)
-               : count);
-    if (activeCount == 0U) {
-        return;
-    }
-    WeightedReduceH4Micro(dst, src, headStride, activeCount,
-                          w0, w1, w2, w3);
-}
 
 template <uint32_t SEGMENTS, uint32_t WEIGHT_ROW_STRIDE>
 __simd_callee__ inline void AccumulateH4RemainingHeads(
@@ -491,7 +407,6 @@ public:
             ReleaseCubeEvents();
         } else {
             DrainOutputStores();
-            pipe_->ReleaseEventID<HardEvent::MTE2_S>(mte2ToScalar_);
             pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToVector_);
             pipe_->ReleaseEventID<HardEvent::V_S>(vectorToScalar_);
             pipe_->ReleaseEventID<HardEvent::S_V>(scalarToVector_);
@@ -547,21 +462,17 @@ private:
         }
         pipe_->InitBuffer(accBuf_,
                           PAGED_PIPE_SLOTS * PAGED_OUTPUT_SLOT_ELEMENTS * sizeof(float));
-        pipe_->InitBuffer(tmpBuf_,
-                          PAGED_PIPE_SLOTS * PAGED_OUTPUT_SLOT_ELEMENTS * sizeof(float));
         // 跨步 GM 行分别搬入 32 字节对齐的 UB 行。
         pipe_->InitBuffer(weightUbBuf_, PAGED_WEIGHT_FP32_ELEMENTS * sizeof(float));
         pipe_->InitBuffer(weightInputUbBuf_, PAGED_M_MAX * sizeof(float));
         pipe_->InitBuffer(cuSeqLensUbBuf_, 2U * sizeof(int32_t));
         pipe_->InitBuffer(visibleUbBuf_, PAGED_QUERIES_PER_AIV_MAX * sizeof(int32_t));
         acc_ = accBuf_.Get<float>();
-        tmp_ = tmpBuf_.Get<float>();
         weightUb_ = weightUbBuf_.Get<float>();
         weightInputBf16Ub_ = weightInputUbBuf_.Get<bfloat16_t>();
         weightInputFp16Ub_ = weightInputUbBuf_.Get<half>();
         cuSeqLensUb_ = cuSeqLensUbBuf_.Get<int32_t>();
         visibleUb_ = visibleUbBuf_.Get<int32_t>();
-        mte2ToScalar_ = pipe_->AllocEventID<HardEvent::MTE2_S>();
         mte2ToVector_ = pipe_->AllocEventID<HardEvent::MTE2_V>();
         vectorToScalar_ = pipe_->AllocEventID<HardEvent::V_S>();
         scalarToVector_ = pipe_->AllocEventID<HardEvent::S_V>();
@@ -1325,11 +1236,6 @@ private:
     __aicore__ inline void FinishWeights(uint32_t localQCount)
     {
         WaitFlag<HardEvent::MTE2_V>(mte2ToVector_);
-        // FP32 权重同时供 Vector 和 Scalar 使用，须分别同步最新的 UB 数据。
-        if (tiling_.weightDtype == 0U) {
-            SetFlag<HardEvent::MTE2_S>(mte2ToScalar_);
-            WaitFlag<HardEvent::MTE2_S>(mte2ToScalar_);
-        }
         ReduceHeadBlock::ConvertWeights(
             tiling_.weightDtype, Heads(), localQCount, tiling_.headScale,
             WeightFp32RowStride(), WeightNativeRowStride(),
@@ -1338,11 +1244,6 @@ private:
             SetFlag<HardEvent::V_S>(vectorToScalar_);
             WaitFlag<HardEvent::V_S>(vectorToScalar_);
         }
-    }
-
-    __aicore__ inline float LoadScaledWeight(uint32_t row, uint32_t head) const
-    {
-        return weightUb_.GetValue(row * WeightFp32RowStride() + head);
     }
 
     __aicore__ inline void LoadVisibleLengths(uint32_t request,
@@ -1400,80 +1301,46 @@ private:
             tiling_, vectorToMte3_, outputGm_, group, firstQ, kStart, kCount, rowCount, rowStride, source);
     }
 
-    __aicore__ inline void ReduceRuntimeHeads(
-        LocalTensor<float> dst, LocalTensor<float> tmp, LocalTensor<float> src,
-        uint32_t count, uint32_t localRow)
+    template <bool CAUSAL>
+    __aicore__ inline void ReduceVariableTile(
+        LocalTensor<float> accSlot, LocalTensor<float> mmSlot,
+        uint32_t rows, uint32_t cols, uint32_t firstColumn)
     {
-        ReduceHeadBlock::ReduceRuntimeHeads(
-            Heads(), weightUb_, WeightFp32RowStride(), dst, tmp, src, count, localRow);
-    }
-
-    __aicore__ inline void PostprocessNoMaskTileRuntimeHeads(
-        uint32_t group, uint32_t qStart, uint32_t qCount, uint32_t kStart,
-        uint32_t kCount, uint32_t resultSlot)
-    {
-        uint32_t localQStart = 0U;
-        uint32_t localQCount = 0U;
-        GetLocalQueryRange(qCount, localQStart, localQCount);
-        LocalTensor<float> mmSlot = MmOut(resultSlot * PAGED_RESULT_SLOT_ELEMENTS);
-        for (uint32_t row = 0U; row < localQCount; ++row) {
-            for (uint32_t colStart = 0U; colStart < kCount; colStart += 64U) {
-                const uint32_t count = PagedMin(64U, kCount - colStart);
-                const uint32_t storeSlot = AcquireOutputStore();
-                LocalTensor<float> dst = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-                LocalTensor<float> tmp = tmp_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-                ReduceRuntimeHeads(
-                    dst, tmp, mmSlot[row * Heads() * PAGED_NR + colStart], count, row);
-                StoreRows(group, qStart + localQStart + row, kStart + colStart,
-                          count, 1U, count, dst);
-                CommitOutputStore(storeSlot);
+        const int32_t tileBegin = static_cast<int32_t>(firstColumn);
+        if constexpr (CAUSAL) {
+            // Local score rows follow request token order, including group-fused rows.
+            if (tileBegin >= visibleUb_.GetValue(rows - 1U)) {
+                Duplicate(accSlot.ReinterpretCast<uint32_t>(),
+                          IndexerRegionScoreVector::H4_NEG_INF_BITS, rows * PAGED_NR);
+                return;
+            }
+            if (static_cast<int64_t>(firstColumn) + cols > visibleUb_.GetValue(0U)) {
+                SetFlag<HardEvent::S_V>(scalarToVector_);
+                WaitFlag<HardEvent::S_V>(scalarToVector_);
+                IndexerRegionScoreVector::WeightedReduceTileVF<true>(
+                    accSlot, mmSlot, weightUb_, visibleUb_, rows, Heads(),
+                    WeightFp32RowStride(), cols, tileBegin);
+                SetFlag<HardEvent::V_S>(vectorToScalar_);
+                WaitFlag<HardEvent::V_S>(vectorToScalar_);
+                return;
             }
         }
+        IndexerRegionScoreVector::WeightedReduceTileVF<false>(
+            accSlot, mmSlot, weightUb_, visibleUb_, rows, Heads(),
+            WeightFp32RowStride(), cols, tileBegin);
     }
 
-    __aicore__ inline void PostprocessCausalTileRuntimeHeads(
-        uint32_t group, uint32_t qStart, uint32_t qCount, uint32_t kStart,
-        uint32_t kCount, uint32_t resultSlot)
+    template <bool CAUSAL>
+    __aicore__ inline void StoreVariableTile(
+        uint32_t group, uint32_t qStart, uint32_t localQStart, uint32_t localQCount,
+        uint32_t kStart, uint32_t kCount, LocalTensor<float> mmSlot)
     {
-        uint32_t localQStart = 0U;
-        uint32_t localQCount = 0U;
-        GetLocalQueryRange(qCount, localQStart, localQCount);
-        RegionScoreSyncPolicy::AivWaitCubeDone(resultSlot);
-        LocalTensor<float> mmSlot = MmOut(resultSlot * PAGED_RESULT_SLOT_ELEMENTS);
-        for (uint32_t row = 0U; row < localQCount; ++row) {
-            int32_t visible = visibleUb_.GetValue(row);
-            visible = visible < 0 ? 0 : visible;
-            visible = visible > static_cast<int32_t>(tiling_.seqK)
-                          ? static_cast<int32_t>(tiling_.seqK)
-                          : visible;
-            for (uint32_t colStart = 0U; colStart < kCount; colStart += 64U) {
-                const uint32_t count = PagedMin(64U, kCount - colStart);
-                const uint32_t segmentStart = kStart + colStart;
-                const uint32_t valid = visible > static_cast<int32_t>(segmentStart)
-                                           ? PagedMin(count, static_cast<uint32_t>(visible) - segmentStart)
-                                           : 0U;
-                const uint32_t storeSlot = AcquireOutputStore();
-                LocalTensor<float> dst = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-                LocalTensor<float> tmp = tmp_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-                if (valid != 0U) {
-                    ReduceRuntimeHeads(
-                        dst, tmp, mmSlot[row * Heads() * PAGED_NR + colStart], valid, row);
-                }
-                if (valid < count) {
-                    Duplicate(tmp.ReinterpretCast<uint32_t>(),
-                              IndexerRegionScoreVector::H4_NEG_INF_BITS, count - valid);
-                }
-                if (valid != 0U) {
-                    StoreRows(group, qStart + localQStart + row, segmentStart,
-                              valid, 1U, valid, dst);
-                }
-                if (valid < count) {
-                    StoreRows(group, qStart + localQStart + row, segmentStart + valid,
-                              count - valid, 1U, count - valid, tmp);
-                }
-                CommitOutputStore(storeSlot);
-            }
-        }
+        const uint32_t storeSlot = AcquireOutputStore();
+        LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
+        ReduceVariableTile<CAUSAL>(accSlot, mmSlot, localQCount, kCount, kStart);
+        StoreRows(group, qStart + localQStart, kStart, kCount,
+                  localQCount, PAGED_NR, accSlot);
+        CommitOutputStore(storeSlot);
     }
 
     __aicore__ inline void ReduceFullRows(
@@ -1486,59 +1353,6 @@ private:
             accSlot, mmSlot, weightUb_, 0U, PAGED_NR, PAGED_NR);
     }
 
-    __aicore__ inline void StoreNoMaskResidualRows(
-        uint32_t group, uint32_t qStart, uint32_t localQStart, uint32_t localQCount,
-        uint32_t kStart, uint32_t colStart, uint32_t segmentCount, LocalTensor<float> mmSlot)
-    {
-        for (uint32_t row = 0U; row < localQCount; ++row) {
-            const uint32_t storeSlot = AcquireOutputStore();
-            LocalTensor<float> accRow =
-                acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            IndexerRegionScoreVector::WeightedReduceH4Micro(
-                accRow, mmSlot[row * PAGED_H * PAGED_NR + colStart],
-                PAGED_NR, segmentCount,
-                LoadScaledWeight(row, 0U), LoadScaledWeight(row, 1U),
-                LoadScaledWeight(row, 2U), LoadScaledWeight(row, 3U));
-            StoreRows(group, qStart + localQStart + row,
-                      kStart + colStart, segmentCount, 1U,
-                      segmentCount, accRow);
-            CommitOutputStore(storeSlot);
-        }
-    }
-
-    __aicore__ inline void StoreNoMaskTail(
-        uint32_t group, uint32_t qStart, uint32_t localQStart, uint32_t localQCount,
-        uint32_t kStart, uint32_t kCount, LocalTensor<float> mmSlot)
-    {
-        for (uint32_t segment = 0U; segment < 2U; ++segment) {
-            const uint32_t colStart = segment * 64U;
-            if (colStart >= kCount) {
-                break;
-            }
-            const uint32_t segmentCount = PagedMin(64U, kCount - colStart);
-            if ((segmentCount & 7U) != 0U) {
-                StoreNoMaskResidualRows(group, qStart, localQStart, localQCount,
-                                        kStart, colStart, segmentCount, mmSlot);
-                continue;
-            }
-
-            const uint32_t rowStride = PagedAlignUp(segmentCount, 8U);
-            const uint32_t storeSlot = AcquireOutputStore();
-            LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            for (uint32_t row = 0U; row < localQCount; ++row) {
-                IndexerRegionScoreVector::WeightedReduceH4Micro(
-                    accSlot[row * rowStride],
-                    mmSlot[row * PAGED_H * PAGED_NR + colStart],
-                    PAGED_NR, segmentCount,
-                    LoadScaledWeight(row, 0U), LoadScaledWeight(row, 1U),
-                    LoadScaledWeight(row, 2U), LoadScaledWeight(row, 3U));
-            }
-            StoreRows(group, qStart + localQStart, kStart + colStart,
-                      segmentCount, localQCount, rowStride, accSlot);
-            CommitOutputStore(storeSlot);
-        }
-    }
-
     __aicore__ inline void PostprocessNoMaskTile(
         uint32_t group, uint32_t qStart, uint32_t qCount, uint32_t kStart,
         uint32_t kCount, uint32_t resultSlot)
@@ -1549,15 +1363,9 @@ private:
         if (localQCount == 0U) {
             return;
         }
-        if (Heads() != PAGED_H) {
-            PostprocessNoMaskTileRuntimeHeads(
-                group, qStart, qCount, kStart, kCount, resultSlot);
-            return;
-        }
         LocalTensor<float> mmSlot = MmOut(resultSlot * PAGED_RESULT_SLOT_ELEMENTS);
 
-        // 仅当前 tile 的尺寸影响批量归约，尾块不影响此前完整 tile。
-        if (qCount == PAGED_MQ_MAX && kCount == PAGED_NR &&
+        if (Heads() == PAGED_H && qCount == PAGED_MQ_MAX && kCount == PAGED_NR &&
             localQCount == PAGED_QUERIES_PER_AIV_MAX) {
             const uint32_t storeSlot = AcquireOutputStore();
             LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
@@ -1568,8 +1376,8 @@ private:
             return;
         }
 
-        // H4 尾块按 8 列对齐批量存储，仅残余 1～7 列使用逐行精确存储。
-        StoreNoMaskTail(group, qStart, localQStart, localQCount, kStart, kCount, mmSlot);
+        StoreVariableTile<false>(group, qStart, localQStart, localQCount,
+                                 kStart, kCount, mmSlot);
     }
 
     __aicore__ inline void StoreGroupFusedRows(
@@ -1603,44 +1411,18 @@ private:
         }
     }
 
-    __aicore__ inline void StoreGroupFusedNoMaskTail(
+    template <bool CAUSAL>
+    __aicore__ inline void StoreGroupFusedVariableTile(
         uint32_t qStart, uint32_t groupStart, uint32_t groupCount,
         uint32_t localScoreStart, uint32_t localScoreCount,
         uint32_t kStart, uint32_t kCount, LocalTensor<float> mmSlot)
     {
-        for (uint32_t segment = 0U; segment < 2U; ++segment) {
-            const uint32_t colStart = segment * 64U;
-            if (colStart >= kCount) {
-                break;
-            }
-            const uint32_t segmentCount =
-                PagedMin(64U, kCount - colStart);
-            const uint32_t rowStride =
-                PagedAlignUp(segmentCount, 8U);
-            const uint32_t storeSlot = AcquireOutputStore();
-            LocalTensor<float> accSlot =
-                acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            LocalTensor<float> tmpSlot =
-                tmp_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            for (uint32_t row = 0U; row < localScoreCount; ++row) {
-                if (Heads() == PAGED_H) {
-                    IndexerRegionScoreVector::WeightedReduceH4UbMicro(
-                        accSlot[row * rowStride],
-                        mmSlot[row * PAGED_H * PAGED_NR + colStart],
-                        weightUb_[row * WeightFp32RowStride()], PAGED_NR, segmentCount);
-                } else {
-                    ReduceRuntimeHeads(
-                        accSlot[row * rowStride], tmpSlot,
-                        mmSlot[row * Heads() * PAGED_NR + colStart],
-                        segmentCount, row);
-                }
-            }
-            StoreGroupFusedRows(
-                qStart, groupStart, groupCount,
-                localScoreStart, localScoreCount,
-                kStart + colStart, segmentCount, rowStride, accSlot);
-            CommitOutputStore(storeSlot);
-        }
+        const uint32_t storeSlot = AcquireOutputStore();
+        LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
+        ReduceVariableTile<CAUSAL>(accSlot, mmSlot, localScoreCount, kCount, kStart);
+        StoreGroupFusedRows(qStart, groupStart, groupCount, localScoreStart, localScoreCount,
+                           kStart, kCount, PAGED_NR, accSlot);
+        CommitOutputStore(storeSlot);
     }
 
     __aicore__ inline void PostprocessGroupFusedNoMaskTile(
@@ -1674,8 +1456,8 @@ private:
             return;
         }
 
-        StoreGroupFusedNoMaskTail(qStart, groupStart, groupCount,
-                                localScoreStart, localScoreCount, kStart, kCount, mmSlot);
+        StoreGroupFusedVariableTile<false>(qStart, groupStart, groupCount,
+                                           localScoreStart, localScoreCount, kStart, kCount, mmSlot);
     }
 
     __aicore__ inline void StoreGroupFusedCausalFullTile(
@@ -1712,63 +1494,6 @@ private:
         CommitOutputStore(storeSlot);
     }
 
-    __aicore__ inline void ReduceGroupFusedCausalSegment(
-        uint32_t localScoreCount, uint32_t segmentStart, uint32_t count,
-        uint32_t rowStride, uint32_t colStart, LocalTensor<float> accSlot,
-        LocalTensor<float> tmpSlot, LocalTensor<float> mmSlot)
-    {
-        for (uint32_t row = 0U; row < localScoreCount; ++row) {
-            int32_t visible = visibleUb_.GetValue(row);
-            visible = visible < 0 ? 0 : visible;
-            visible = visible > static_cast<int32_t>(tiling_.seqK)
-                          ? static_cast<int32_t>(tiling_.seqK)
-                          : visible;
-            const uint32_t valid =
-                visible > static_cast<int32_t>(segmentStart)
-                    ? PagedMin(
-                          count,
-                          static_cast<uint32_t>(visible) - segmentStart)
-                    : 0U;
-            LocalTensor<float> rowOutput = accSlot[row * rowStride];
-            // 先初始化 32 字节对齐的完整行，再覆盖可见前缀，避免非对齐 Duplicate。
-            Duplicate(
-                rowOutput.ReinterpretCast<uint32_t>(),
-                IndexerRegionScoreVector::H4_NEG_INF_BITS, count);
-            if (valid != 0U) {
-                ReduceRuntimeHeads(
-                    rowOutput, tmpSlot,
-                    mmSlot[row * Heads() * PAGED_NR + colStart],
-                    valid, row);
-            }
-        }
-    }
-
-    __aicore__ inline void StoreGroupFusedCausalTail(
-        uint32_t qStart, uint32_t groupStart, uint32_t groupCount,
-        uint32_t localScoreStart, uint32_t localScoreCount,
-        uint32_t kStart, uint32_t kCount, LocalTensor<float> mmSlot)
-    {
-        for (uint32_t colStart = 0U; colStart < kCount;
-             colStart += 64U) {
-            const uint32_t count =
-                PagedMin(64U, kCount - colStart);
-            const uint32_t rowStride = PagedAlignUp(count, 8U);
-            const uint32_t segmentStart = kStart + colStart;
-            const uint32_t storeSlot = AcquireOutputStore();
-            LocalTensor<float> accSlot =
-                acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            LocalTensor<float> tmpSlot =
-                tmp_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            ReduceGroupFusedCausalSegment(localScoreCount, segmentStart, count,
-                                          rowStride, colStart, accSlot, tmpSlot, mmSlot);
-            StoreGroupFusedRows(
-                qStart, groupStart, groupCount,
-                localScoreStart, localScoreCount,
-                segmentStart, count, rowStride, accSlot);
-            CommitOutputStore(storeSlot);
-        }
-    }
-
     __aicore__ inline void PostprocessGroupFusedCausalTile(
         uint32_t qStart, uint32_t qCount,
         uint32_t groupStart, uint32_t groupCount, uint32_t kStart,
@@ -1793,9 +1518,8 @@ private:
                                           kStart, kCount, mmSlot);
             return;
         }
-        // 在 UB 生成完整片段后批量散写，减少每行重复发起 MTE3。
-        StoreGroupFusedCausalTail(qStart, groupStart, groupCount,
-                                localScoreStart, localScoreCount, kStart, kCount, mmSlot);
+        StoreGroupFusedVariableTile<true>(qStart, groupStart, groupCount,
+                                          localScoreStart, localScoreCount, kStart, kCount, mmSlot);
     }
 
     __aicore__ inline void ReduceCausalFullTile(
@@ -1834,28 +1558,9 @@ private:
             WaitFlag<HardEvent::V_S>(vectorToScalar_);
             return;
         }
-        for (uint32_t row = 0U; row < localQCount; ++row) {
-            for (uint32_t segment = 0U; segment < 2U; ++segment) {
-                const uint32_t colStart = segment * 64U;
-                LocalTensor<float> rowOutput =
-                    accSlot[row * PAGED_NR + colStart];
-                LocalTensor<float> rowInput =
-                    mmSlot[row * PAGED_H * PAGED_NR + colStart];
-                if (fullyVisible) {
-                    IndexerRegionScoreVector::WeightedReduceH4Micro(
-                        rowOutput, rowInput, PAGED_NR, 64U,
-                        LoadScaledWeight(row, 0U), LoadScaledWeight(row, 1U),
-                        LoadScaledWeight(row, 2U), LoadScaledWeight(row, 3U));
-                } else {
-                    IndexerRegionScoreVector::WeightedReduceH4MaskMicro(
-                        rowOutput, rowInput, PAGED_NR, 64U,
-                        LoadScaledWeight(row, 0U), LoadScaledWeight(row, 1U),
-                        LoadScaledWeight(row, 2U), LoadScaledWeight(row, 3U),
-                        tileBegin + static_cast<int32_t>(colStart),
-                        visibleUb_.GetValue(row));
-                }
-            }
-        }
+        IndexerRegionScoreVector::WeightedReduceTileVF<false>(
+            accSlot, mmSlot, weightUb_, visibleUb_, localQCount, PAGED_H,
+            PAGED_H4_WEIGHT_ROW_STRIDE, PAGED_NR, tileBegin);
     }
 
     __aicore__ inline void StoreCausalFullTile(
@@ -1888,38 +1593,6 @@ private:
         CommitOutputStore(storeSlot);
     }
 
-    __aicore__ inline void StoreCausalTail(
-        uint32_t group, uint32_t qStart, uint32_t localQStart, uint32_t localQCount,
-        uint32_t kStart, uint32_t kCount, LocalTensor<float> mmSlot)
-    {
-        for (uint32_t segment = 0U; segment < 2U; ++segment) {
-            const uint32_t colStart = segment * 64U;
-            if (colStart >= kCount) {
-                break;
-            }
-            const uint32_t segmentCount = PagedMin(64U, kCount - colStart);
-            const uint32_t rowStride = PagedAlignUp(segmentCount, 8U);
-            const uint32_t storeSlot = AcquireOutputStore();
-            LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-            Duplicate(accSlot.ReinterpretCast<uint32_t>(),
-                      IndexerRegionScoreVector::H4_NEG_INF_BITS,
-                      localQCount * rowStride);
-            for (uint32_t row = 0U; row < localQCount; ++row) {
-                IndexerRegionScoreVector::WeightedReduceH4MaskMicro(
-                    accSlot[row * rowStride],
-                    mmSlot[row * PAGED_H * PAGED_NR + colStart],
-                    PAGED_NR, segmentCount,
-                    LoadScaledWeight(row, 0U), LoadScaledWeight(row, 1U),
-                    LoadScaledWeight(row, 2U), LoadScaledWeight(row, 3U),
-                    static_cast<int32_t>(kStart + colStart),
-                    visibleUb_.GetValue(row));
-            }
-            StoreRows(group, qStart + localQStart, kStart + colStart,
-                      segmentCount, localQCount, rowStride, accSlot);
-            CommitOutputStore(storeSlot);
-        }
-    }
-
     __aicore__ inline void PostprocessCausalTile(
         uint32_t group, uint32_t qStart, uint32_t qCount, uint32_t kStart,
         uint32_t kCount, uint32_t resultSlot)
@@ -1931,12 +1604,13 @@ private:
             RegionScoreSyncPolicy::AivWaitCubeDone(resultSlot);
             return;
         }
+        LocalTensor<float> mmSlot = MmOut(resultSlot * PAGED_RESULT_SLOT_ELEMENTS);
         if (Heads() != PAGED_H) {
-            PostprocessCausalTileRuntimeHeads(
-                group, qStart, qCount, kStart, kCount, resultSlot);
+            RegionScoreSyncPolicy::AivWaitCubeDone(resultSlot);
+            StoreVariableTile<true>(group, qStart, localQStart, localQCount,
+                                    kStart, kCount, mmSlot);
             return;
         }
-        LocalTensor<float> mmSlot = MmOut(resultSlot * PAGED_RESULT_SLOT_ELEMENTS);
 
         if constexpr (CausalH4BatchPolicy<KeyAdapter>::ENABLED) {
             // Retain the Q4 decode geometry and exclude completely masked tiles.
@@ -1985,7 +1659,8 @@ private:
         }
 
         RegionScoreSyncPolicy::AivWaitCubeDone(resultSlot);
-        StoreCausalTail(group, qStart, localQStart, localQCount, kStart, kCount, mmSlot);
+        StoreVariableTile<true>(group, qStart, localQStart, localQCount,
+                                kStart, kCount, mmSlot);
     }
 
     template <bool CAUSAL>
@@ -2268,7 +1943,6 @@ private:
     TEventID fixToM_[PAGED_PIPE_SLOTS];
     TEventID mte1ToM_;
     TEventID mToFix_;
-    TEventID mte2ToScalar_;
     TEventID mte2ToVector_;
     TEventID vectorToScalar_;
     TEventID scalarToVector_;
@@ -2282,7 +1956,6 @@ private:
     TBuf<TPosition::CO1> cL0Buf_;
     TBuf<TPosition::VECCALC> mmOutBuf_[PAGED_PIPE_SLOTS];
     TBuf<TPosition::VECCALC> accBuf_;
-    TBuf<TPosition::VECCALC> tmpBuf_;
     TBuf<TPosition::VECCALC> weightUbBuf_;
     TBuf<TPosition::VECCALC> weightInputUbBuf_;
     TBuf<TPosition::VECCALC> cuSeqLensUbBuf_;
@@ -2294,7 +1967,6 @@ private:
     LocalTensor<float> cL0_;
     LocalTensor<float> mmOut_[PAGED_PIPE_SLOTS];
     LocalTensor<float> acc_;
-    LocalTensor<float> tmp_;
     LocalTensor<float> weightUb_;
     LocalTensor<bfloat16_t> weightInputBf16Ub_;
     LocalTensor<half> weightInputFp16Ub_;

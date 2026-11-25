@@ -89,23 +89,6 @@ struct RegionScoreBlockReduceHead {
         }
     }
 
-    __aicore__ inline static void ReduceRuntimeHeads(uint32_t heads, LocalTensor<float> weights, uint32_t weightStride,
-        LocalTensor<float> dst, LocalTensor<float> tmp, LocalTensor<float> src,
-        uint32_t count, uint32_t localRow)
-    {
-        for (uint32_t head = 0U; head < heads; head += PAGED_H) {
-            LocalTensor<float> partial = head == 0U ? dst : tmp;
-            IndexerRegionScoreVector::WeightedReduceH4Micro(
-                partial, src[head * PAGED_NR], PAGED_NR, count,
-                weights.GetValue(localRow * weightStride + head + 0U),
-                weights.GetValue(localRow * weightStride + head + 1U),
-                weights.GetValue(localRow * weightStride + head + 2U),
-                weights.GetValue(localRow * weightStride + head + 3U));
-            if (head != 0U) {
-                Add(dst, dst, tmp, count);
-            }
-        }
-    }
 };
 
 } // namespace IndexerRegionScorePaged
