@@ -193,6 +193,93 @@ __aicore__ inline void WeightedReduceH4RowsVF(
         dstPtr, srcPtr, weightPtr + weightOffset, headStride, dstRowStride);
 }
 
+template <uint32_t SEGMENTS, uint32_t WEIGHT_ROW_STRIDE = H4_HEADS,
+          uint32_t ROWS = H4_ROWS_PER_AIV>
+__simd_vf__ inline void WeightedReduceH4MaskedRowsVFImpl(
+    __ubuf__ float *dst, __ubuf__ float *src, __ubuf__ float *weights,
+    uint32_t headStride, uint32_t dstRowStride, __ubuf__ int32_t *visible, int32_t tileBegin)
+{
+    static_assert(SEGMENTS == 1U || SEGMENTS == 2U,
+                  "regular H4 VF supports one or two 64-lane segments");
+    static_assert(ROWS > 0U && ROWS <= H4_ROWS_PER_AIV && ROWS % 2U == 0U,
+                  "regular H4 VF requires complete row pairs");
+    MicroAPI::MaskReg mask = MicroAPI::CreateMask<float, MicroAPI::MaskPattern::ALL>();
+    MicroAPI::RegTensor<float> in00, in01, in10, in11;
+    MicroAPI::RegTensor<float> wt0, wt1;
+    MicroAPI::RegTensor<float> acc00, acc01, acc10, acc11;
+    MicroAPI::RegTensor<int32_t> columns0, columns1, visible0, visible1;
+    MicroAPI::RegTensor<uint32_t> negativeInfinityBits;
+    MicroAPI::Duplicate(negativeInfinityBits, H4_NEG_INF_BITS, mask);
+    MicroAPI::Arange(columns0, tileBegin);
+    MicroAPI::Arange(columns1, tileBegin + H4_VECTOR_LANES);
+    MicroAPI::MaskReg keep00, keep01, keep10, keep11;
+
+    for (uint16_t row = 0U; row < ROWS; row += 2U) {
+        __ubuf__ float *src0 = src + row * H4_HEADS * headStride;
+        __ubuf__ float *src1 = src0 + H4_HEADS * headStride;
+        MicroAPI::LoadAlign(in00, src0);
+        MicroAPI::LoadAlign(in10, src1);
+        if constexpr (SEGMENTS == 2U) {
+            MicroAPI::LoadAlign(in01, src0 + H4_VECTOR_LANES);
+            MicroAPI::LoadAlign(in11, src1 + H4_VECTOR_LANES);
+        }
+        MicroAPI::LoadAlign<float, MicroAPI::LoadDist::DIST_BRC_B32>(
+            wt0, weights + row * WEIGHT_ROW_STRIDE);
+        MicroAPI::LoadAlign<float, MicroAPI::LoadDist::DIST_BRC_B32>(
+            wt1, weights + (row + 1U) * WEIGHT_ROW_STRIDE);
+        MicroAPI::Mul(acc00, in00, wt0, mask);
+        MicroAPI::Mul(acc10, in10, wt1, mask);
+        if constexpr (SEGMENTS == 2U) {
+            MicroAPI::Mul(acc01, in01, wt0, mask);
+            MicroAPI::Mul(acc11, in11, wt1, mask);
+        }
+
+        AccumulateH4RemainingHeads<SEGMENTS, WEIGHT_ROW_STRIDE>(
+            src0, src1, weights, row, headStride, mask,
+            in00, in01, in10, in11, wt0, wt1, acc00, acc01, acc10, acc11);
+
+        MicroAPI::LoadAlign<int32_t, MicroAPI::LoadDist::DIST_BRC_B32>(visible0, visible + row);
+        MicroAPI::LoadAlign<int32_t, MicroAPI::LoadDist::DIST_BRC_B32>(visible1, visible + row + 1U);
+        MicroAPI::Compare<int32_t, CMPMODE::LT>(keep00, columns0, visible0, mask);
+        MicroAPI::Compare<int32_t, CMPMODE::LT>(keep10, columns0, visible1, mask);
+        MicroAPI::Select(acc00, acc00, reinterpret_cast<MicroAPI::RegTensor<float> &>(negativeInfinityBits), keep00);
+        MicroAPI::Select(acc10, acc10, reinterpret_cast<MicroAPI::RegTensor<float> &>(negativeInfinityBits), keep10);
+        if constexpr (SEGMENTS == 2U) {
+            MicroAPI::Compare<int32_t, CMPMODE::LT>(keep01, columns1, visible0, mask);
+            MicroAPI::Compare<int32_t, CMPMODE::LT>(keep11, columns1, visible1, mask);
+            MicroAPI::Select(acc01, acc01, reinterpret_cast<MicroAPI::RegTensor<float> &>(negativeInfinityBits), keep01);
+            MicroAPI::Select(acc11, acc11, reinterpret_cast<MicroAPI::RegTensor<float> &>(negativeInfinityBits), keep11);
+        }
+
+        MicroAPI::StoreAlign<float, MicroAPI::StoreDist::DIST_NORM>(
+            dst + row * dstRowStride, acc00, mask);
+        MicroAPI::StoreAlign<float, MicroAPI::StoreDist::DIST_NORM>(
+            dst + (row + 1U) * dstRowStride, acc10, mask);
+        if constexpr (SEGMENTS == 2U) {
+            MicroAPI::StoreAlign<float, MicroAPI::StoreDist::DIST_NORM>(
+                dst + row * dstRowStride + H4_VECTOR_LANES, acc01, mask);
+            MicroAPI::StoreAlign<float, MicroAPI::StoreDist::DIST_NORM>(
+                dst + (row + 1U) * dstRowStride + H4_VECTOR_LANES, acc11, mask);
+        }
+    }
+}
+
+template <uint32_t SEGMENTS, uint32_t WEIGHT_ROW_STRIDE = H4_HEADS,
+          uint32_t ROWS = H4_ROWS_PER_AIV>
+__aicore__ inline void WeightedReduceH4MaskedRowsVF(
+    const LocalTensor<float> &dst, const LocalTensor<float> &src,
+    const LocalTensor<float> &weights, uint32_t weightOffset,
+    uint32_t headStride, uint32_t dstRowStride,
+    const LocalTensor<int32_t> &visible, int32_t tileBegin)
+{
+    auto dstPtr = reinterpret_cast<__ubuf__ float *>(dst.GetPhyAddr());
+    auto srcPtr = reinterpret_cast<__ubuf__ float *>(src.GetPhyAddr());
+    auto weightPtr = reinterpret_cast<__ubuf__ float *>(weights.GetPhyAddr());
+    asc_vf_call<WeightedReduceH4MaskedRowsVFImpl<SEGMENTS, WEIGHT_ROW_STRIDE, ROWS>>(
+        dstPtr, srcPtr, weightPtr + weightOffset, headStride, dstRowStride,
+        reinterpret_cast<__ubuf__ int32_t *>(visible.GetPhyAddr()), tileBegin);
+}
+
 } // 命名空间 IndexerRegionScoreVector
 #endif // 结束保护 INDEXER_REGION_SCORE_COMMON_VECTOR_H
 
@@ -361,7 +448,7 @@ struct CausalH4BatchPolicy<ScalarPagedKeyResidentBringup<PARTIAL_PAGES>> {
     static constexpr bool ENABLED = kQkElementBytes == 1U;
 };
 
-template <typename KeyAdapter, bool QUERY_RESIDENT>
+template <typename KeyAdapter, bool QUERY_RESIDENT, bool ALLOW_H4_TAIL = false>
 class KeyResidentCompute final {
     using ComputePolicy = IndexerRegionScore::Block::ComputeStagePolicy<KeyAdapter, QUERY_RESIDENT>;
     using MmadBlock = IndexerRegionScore::Block::StageType<IndexerRegionScore::Block::Stage::Mmad, ComputePolicy>;
@@ -407,6 +494,7 @@ public:
             pipe_->ReleaseEventID<HardEvent::MTE2_S>(mte2ToScalar_);
             pipe_->ReleaseEventID<HardEvent::MTE2_V>(mte2ToVector_);
             pipe_->ReleaseEventID<HardEvent::V_S>(vectorToScalar_);
+            pipe_->ReleaseEventID<HardEvent::S_V>(scalarToVector_);
             pipe_->ReleaseEventID<HardEvent::V_MTE2>(vectorToMte2_);
             pipe_->ReleaseEventID<HardEvent::V_MTE3>(vectorToMte3_);
             for (uint32_t slot = 0U; slot < PAGED_PIPE_SLOTS; ++slot) {
@@ -476,6 +564,7 @@ private:
         mte2ToScalar_ = pipe_->AllocEventID<HardEvent::MTE2_S>();
         mte2ToVector_ = pipe_->AllocEventID<HardEvent::MTE2_V>();
         vectorToScalar_ = pipe_->AllocEventID<HardEvent::V_S>();
+        scalarToVector_ = pipe_->AllocEventID<HardEvent::S_V>();
         vectorToMte2_ = pipe_->AllocEventID<HardEvent::V_MTE2>();
         vectorToMte3_ = pipe_->AllocEventID<HardEvent::V_MTE3>();
         for (uint32_t slot = 0U; slot < PAGED_PIPE_SLOTS; ++slot) {
@@ -1608,7 +1697,7 @@ private:
         const uint32_t storeSlot = AcquireOutputStore();
         LocalTensor<float> accSlot =
             acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-        if (!fullyVisible) {
+        if (fullyMasked) {
             Duplicate(
                 accSlot.ReinterpretCast<uint32_t>(),
                 IndexerRegionScoreVector::H4_NEG_INF_BITS,
@@ -1714,6 +1803,12 @@ private:
         uint32_t localQCount, int32_t tileBegin,
         bool fullyVisible, bool fullyMasked)
     {
+        if constexpr (ALLOW_H4_TAIL) {
+            if (fullyVisible) {
+                ReduceFullRows(accSlot, mmSlot);
+                return;
+            }
+        }
         if (fullyVisible) {
             if constexpr (CausalH4BatchPolicy<KeyAdapter>::ENABLED) {
                 // This tile has a complete 128-column UB row even when logical R has a tail.
@@ -1725,6 +1820,18 @@ private:
             }
         }
         if (fullyMasked) {
+            return;
+        }
+        if (!fullyVisible) {
+            SetFlag<HardEvent::S_V>(scalarToVector_);
+            WaitFlag<HardEvent::S_V>(scalarToVector_);
+            IndexerRegionScoreVector::WeightedReduceH4MaskedRowsVF<
+                2U, PAGED_H4_WEIGHT_ROW_STRIDE>(
+                accSlot, mmSlot, weightUb_, 0U, PAGED_NR, PAGED_NR,
+                visibleUb_, tileBegin);
+            // Scalar may replace visible lengths for the next Q macro only after the VF reads them.
+            SetFlag<HardEvent::V_S>(vectorToScalar_);
+            WaitFlag<HardEvent::V_S>(vectorToScalar_);
             return;
         }
         for (uint32_t row = 0U; row < localQCount; ++row) {
@@ -1768,7 +1875,7 @@ private:
         const bool fullyMasked = tileBegin >= maxVisible;
         const uint32_t storeSlot = AcquireOutputStore();
         LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
-        if (!fullyVisible) {
+        if (fullyMasked) {
             Duplicate(accSlot.ReinterpretCast<uint32_t>(),
                       IndexerRegionScoreVector::H4_NEG_INF_BITS,
                       localQCount * PAGED_NR);
@@ -1832,6 +1939,27 @@ private:
         LocalTensor<float> mmSlot = MmOut(resultSlot * PAGED_RESULT_SLOT_ELEMENTS);
 
         if constexpr (CausalH4BatchPolicy<KeyAdapter>::ENABLED) {
+            // Retain the Q4 decode geometry and exclude completely masked tiles.
+            if (tiling_.groups == 1U && tiling_.qTile == 4U && tiling_.regionSize == 8U &&
+                qCount == 4U && localQCount == 4U && kCount == PAGED_NR &&
+                static_cast<int64_t>(kStart) < visibleUb_.GetValue(3U) &&
+                static_cast<int64_t>(kStart) + PAGED_NR > visibleUb_.GetValue(0U)) {
+                const uint32_t storeSlot = AcquireOutputStore();
+                LocalTensor<float> accSlot = acc_[storeSlot * PAGED_OUTPUT_SLOT_ELEMENTS];
+                RegionScoreSyncPolicy::AivWaitCubeDone(resultSlot);
+                SetFlag<HardEvent::S_V>(scalarToVector_);
+                WaitFlag<HardEvent::S_V>(scalarToVector_);
+                IndexerRegionScoreVector::WeightedReduceH4MaskedRowsVF<
+                    2U, PAGED_H4_WEIGHT_ROW_STRIDE, 4U>(
+                    accSlot, mmSlot, weightUb_, 0U, PAGED_NR, PAGED_NR,
+                    visibleUb_, static_cast<int32_t>(kStart));
+                SetFlag<HardEvent::V_S>(vectorToScalar_);
+                WaitFlag<HardEvent::V_S>(vectorToScalar_);
+                StoreRows(group, qStart + localQStart, kStart, kCount,
+                          4U, PAGED_NR, accSlot);
+                CommitOutputStore(storeSlot);
+                return;
+            }
             // A request's causal positions increase with its query rows.
             if (tiling_.groups == 1U && tiling_.qTile == 4U && tiling_.regionSize == 8U &&
                 qCount == 4U && localQCount == 4U && kCount == PAGED_NR &&
@@ -2143,6 +2271,7 @@ private:
     TEventID mte2ToScalar_;
     TEventID mte2ToVector_;
     TEventID vectorToScalar_;
+    TEventID scalarToVector_;
     TEventID vectorToMte2_;
     TEventID vectorToMte3_;
     TEventID outputStoreDone_[PAGED_PIPE_SLOTS];
@@ -2228,7 +2357,8 @@ __aicore__ inline void RunBoundedScoreBatches(
 }
 
 // 策略模式在编译期绑定行为，执行器管理资源生命周期。
-template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool QUERY_RESIDENT = false>
+template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool QUERY_RESIDENT = false,
+          bool ALLOW_H4_TAIL = false>
 class RegionScoreRunner final {
 public:
     __aicore__ inline void Run(GM_ADDR query, GM_ADDR weights, GM_ADDR keySummary,
@@ -2238,13 +2368,13 @@ public:
     {
         if (tiling.batchTokens != 0U) {
             RunBoundedScoreBatches<CacheStrategy, MaskStrategy, SelectionStrategy,
-                KeyResidentCompute<typename CacheStrategy::Adapter, QUERY_RESIDENT>>(
+                KeyResidentCompute<typename CacheStrategy::Adapter, QUERY_RESIDENT, ALLOW_H4_TAIL>>(
                 query, weights, keySummary, actualKvLengths, blockTable, cuSeqLens,
                 selectedRegionIds, workspace, tiling, scratchOffset, pipe);
             return;
         }
         typename CacheStrategy::Adapter keyAdapter;
-        KeyResidentCompute<typename CacheStrategy::Adapter, QUERY_RESIDENT> compute;
+        KeyResidentCompute<typename CacheStrategy::Adapter, QUERY_RESIDENT, ALLOW_H4_TAIL> compute;
         compute.Init(query, weights, actualKvLengths, output, &tiling, pipe, &keyAdapter);
         CacheStrategy::InitAdapter(keyAdapter, keySummary, blockTable, cuSeqLens, &tiling, pipe);
         MaskStrategy::Process(compute);
@@ -2260,8 +2390,8 @@ public:
 
 
 namespace IndexerRegionScorePaged {
-template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy>
-using D128QueryResidentRunner = RegionScoreRunner<CacheStrategy, MaskStrategy, SelectionStrategy, true>;
+template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
+using D128QueryResidentRunner = RegionScoreRunner<CacheStrategy, MaskStrategy, SelectionStrategy, true, ALLOW_H4_TAIL>;
 } // namespace IndexerRegionScorePaged
 
 // 版权所有 (c) 2026 华为技术有限公司，遵循 CANN 开源软件许可协议 2.0。

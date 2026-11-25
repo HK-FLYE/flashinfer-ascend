@@ -323,8 +323,15 @@ ge::graphStatus FiIndexerRegionScoreTiling(gert::TilingContext *context)
     const uint32_t kMacros = static_cast<uint32_t>(kMacros64);
     // Compile-time cache and mask strategies are encoded in the key.
     const uint32_t weightDtype = GetContinuousWeightDtype(weightsDtype);
-    const uint64_t tilingKey = IndexerRegionScore::MakeTilingKey(
+    uint64_t tilingKey = IndexerRegionScore::MakeTilingKey(
         0U, static_cast<uint32_t>(*maskMode));
+    const bool causalH4Tail = *maskMode == 3 && heads == 4 &&
+        static_cast<uint64_t>(seqQ) >= (groups == 1 ? 32U :
+            (16U + static_cast<uint64_t>(groups) - 1U) / static_cast<uint64_t>(groups)) &&
+        maxRegionLen >= 129 && (maxRegionLen % 128) != 0;
+    if (causalH4Tail) {
+        tilingKey |= IndexerRegionScore::TILING_KEY_H4_TAIL;
+    }
     context->SetTilingKey(tilingKey);
 
     size_t *workspace = context->GetWorkspaceSizes(1);

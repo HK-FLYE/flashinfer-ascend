@@ -338,8 +338,16 @@ ge::graphStatus IndexerRegionScorePagedTiling(gert::TilingContext *context)
     const auto selectionStrategy = useB8TopK
         ? IndexerRegionScore::TopKSelectionStrategy::ShortRow
         : IndexerRegionScore::TopKSelectionStrategy::Default;
-    const uint64_t tilingKey = IndexerRegionScore::MakeTilingKey(
+    uint64_t tilingKey = IndexerRegionScore::MakeTilingKey(
         1U, static_cast<uint32_t>(*maskMode), selectionStrategy);
+    const bool causalH4Tail = *maskMode == 3 && native16 && heads == 4 &&
+        static_cast<uint64_t>(totalTokens) >= (groups == 1 ? 32U :
+            (16U + static_cast<uint64_t>(groups) - 1U) / static_cast<uint64_t>(groups)) &&
+        *maxRegionLen >= 129 &&
+        (*maxRegionLen % 128) != 0 && !useB8TopK;
+    if (causalH4Tail) {
+        tilingKey |= IndexerRegionScore::TILING_KEY_H4_TAIL;
+    }
     context->SetTilingKey(tilingKey);
     size_t *workspace = context->GetWorkspaceSizes(1);
     OP_CHECK_NULL_WITH_CONTEXT(context, workspace);

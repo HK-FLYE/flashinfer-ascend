@@ -11,13 +11,16 @@
 #define INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_TOPK 12
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_TOPK 13
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_B8_TOPK 77ULL
+#define INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_H4_TAIL_TOPK 140ULL
+#define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_H4_TAIL_TOPK 141ULL
 
 namespace IndexerRegionScore {
 
 // 位 [1:0] 为缓存模式：0 连续、1 分页，2/3 保留。
 // 位 [5:2] 为 maskMode 原值，预留 0..9，目前支持 0/3。
 // 位 [6] 为 TopK 选择策略：0 默认选择，1 短行特化选择。
-// TopK 始终执行；位 [63:7] 必须为零。
+// 位 [7] 启用逻辑 R 尾块下完整 H4 tile 的批量归约。
+// TopK 始终执行；位 [63:8] 必须为零。
 // TopK 数量、排序/对齐标志和权重类型仍保存在 POD 中。
 constexpr uint32_t TILING_KEY_CACHE_SHIFT = 0U;
 constexpr uint32_t TILING_KEY_CACHE_WIDTH = 2U;
@@ -26,6 +29,7 @@ constexpr uint32_t TILING_KEY_MASK_SHIFT = TILING_KEY_CACHE_SHIFT + TILING_KEY_C
 constexpr uint32_t TILING_KEY_MASK_WIDTH = 4U;
 constexpr uint64_t TILING_KEY_MASK_VALUE_MASK = (1ULL << TILING_KEY_MASK_WIDTH) - 1ULL;
 constexpr uint32_t TILING_KEY_SELECTION_SHIFT = TILING_KEY_MASK_SHIFT + TILING_KEY_MASK_WIDTH;
+constexpr uint64_t TILING_KEY_H4_TAIL = 1ULL << 7U;
 enum class TopKSelectionStrategy : uint32_t { Default = 0U, ShortRow = 1U };
 // 调用方编码前校验模式；不得截断保留值或将 maskMode 折叠为布尔值，以免误选其他策略。
 inline constexpr uint64_t MakeTilingKey(uint32_t cacheMode, uint32_t maskMode,
