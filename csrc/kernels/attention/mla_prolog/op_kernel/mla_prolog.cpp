@@ -66,7 +66,8 @@ CATLASS_DEVICE void MlaPrologDevice(
     // OpDef attribute is parsed by host tiling and read here.
     Dsv41::NormQuantKernel::Arguments normArgs{
         qa, kv, kvNorm, gammaQa, gammaKv, qInt8, qScale, wQbScale, wScaleFp,
-        t, tilingData->projectionSplits, qr, tilingData->rmsNormEps, headNum};
+        t, tilingData->projectionSplits, tilingData->narrowM, qr,
+        tilingData->rmsNormEps, headNum};
     Dsv41::RopeScatterKernel::Arguments ropeArgs{
         qOutput, kvNorm, ropeCos, ropeSin, slotIndices, kvCache, t, headNum,
         updateKvCache, kvOutput};

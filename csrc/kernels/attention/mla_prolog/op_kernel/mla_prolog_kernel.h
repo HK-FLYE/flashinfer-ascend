@@ -99,6 +99,33 @@ static_assert(kProjectionSplitsMid >= 1U && kProjectionSplitsMid <= kMaxProjecti
 static_assert(kProjectionSplitsMid <= kProjectionSplitsSmall || kSplitProjectionMidMaxT <= kSplitProjectionMaxT,
     "split count should not increase with T");
 constexpr bool kEnableRopeScatter = true;
+// E1b / F21 single-stream M-chunk pipeline (S0 -> S1). Gate on both sides:
+// projectionSplits == 1 && t > 384 (excludes split=3 and narrow-M). Only the
+// Q stream is chunk-gated: AIC announces qa chunk g on flag 6 (mode 0x2 =
+// paired AIVs), once per chunk per core including empty chunks. Each AIV
+// waits its paired AIC's chunk flag and then runs an all-AIV barrier, which
+// aggregates the 24 AIC announcements; only then may it read the qa partials.
+// The KV stream uses ONE group: each AIC sets flag 7 once after its last tile
+// (flag 6 then flag 7 are the only cross-core sets S0 emits on this path), and
+// every AIV waits flag 7 once and runs one barrier before its first KV row.
+constexpr bool kE1Pipeline = true;
+constexpr Arch::FlagID kE1ChunkQaFlag = 6;
+constexpr Arch::FlagID kE1ChunkKvFlag = 7;
+constexpr uint32_t kE1ChunkMTiles = 3U;
+
+// narrowM is the host's 64-row M-tile tier (split=1, T in (128, 192]). AIC
+// chunks the Q stream by kE1ChunkMTiles * mTile while S1 always consumes
+// kE1ChunkMTiles * Bf16L1Tile::M rows per chunk, so the pipeline must never
+// engage on the narrow-M tier even if its T range is ever widened.
+CATLASS_HOST_DEVICE constexpr bool E1PipelineOn(
+    uint32_t splits, uint32_t t, uint32_t narrowM)
+{
+    return kE1Pipeline && (splits == 1U) && (t > 384U) && (narrowM == 0U);
+}
+// E1 owns flags 6/7; the QMM stage-2 ring also maps to 6/7 (see
+// QuantMatmulFullLoadAWorkspace below). The two must never be combined.
+static_assert(!kE1Pipeline || kWorkspaceStages == 2U,
+    "E1 chunk flags 6/7 alias the QMM stage-2 ring; a 3-stage QMM requires kE1Pipeline=false");
 constexpr float kProjectionUlpGuard = 1.000006F;
 constexpr float kProjectionGeneralGuard = 0.99999994F;
 constexpr float kRmsNormUlpGuard = 1.0000055F;
@@ -327,12 +354,47 @@ struct DualProjectionKernel {
         gmQa.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(params.qa));
         gmKv.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC *>(params.kv));
 
+        // E1b/F21 single-stream M-chunk pipeline: only the Q stream is chunk
+        // gated. qa chunk g = the 3 M-tiles [3g, 3g+3) x all qa N tiles (the Zn
+        // swizzle already enumerates the tiles chunk-major for chunk width 3).
+        // Each core announces every qa chunk exactly once, after its own tiles
+        // of that chunk are done, empty chunks included. The KV stream is a
+        // single group: every core runs all of its qa tiles before its kv
+        // tiles, and the measured kv group-ready curve is at the S0 tail, so
+        // one announcement after this core's last tile (see the tail) replaces
+        // the per-chunk kv announcements with no loss of overlap.
+        const bool pipeOn = E1PipelineOn(
+            params.projectionSplits, params.qaShape.m(), params.narrowM);
+        const uint32_t qaTilesPerChunk = kE1ChunkMTiles * qaScheduler.loopsMN.column();
+        const uint32_t qaChunks =
+            (qaScheduler.loopsMN.row() + kE1ChunkMTiles - 1U) / kE1ChunkMTiles;
+        Arch::CrossCoreFlag chunkQa{kE1ChunkQaFlag};
+        Arch::CrossCoreFlag chunkKv{kE1ChunkKvFlag};
+        uint32_t qaAnnounced = 0U;
+
         for (uint32_t loopIdx = AscendC::GetBlockIdx(); loopIdx < totalLoops;
              loopIdx += AscendC::GetBlockNum()) {
             const uint32_t splitId = loopIdx % params.projectionSplits;
             const uint32_t combinedLoop = loopIdx / params.projectionSplits;
             const bool isQa = combinedLoop < qaLoops;
             const uint32_t localLoop = isQa ? combinedLoop : combinedLoop - qaLoops;
+            if (pipeOn) {
+                if (isQa) {
+                    // All earlier qa chunks are complete on this core.
+                    const uint32_t chunk = localLoop / qaTilesPerChunk;
+                    while (qaAnnounced < chunk) {
+                        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkQa);
+                        ++qaAnnounced;
+                    }
+                } else {
+                    // First kv tile: the whole qa stream is complete here, so
+                    // drain the qa chunks this core never announced.
+                    while (qaAnnounced < qaChunks) {
+                        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkQa);
+                        ++qaAnnounced;
+                    }
+                }
+            }
             const uint32_t splitKBase =
                 ProjectionSplitKBase(params.projectionSplits, splitId);
             const uint32_t splitK =
@@ -374,6 +436,18 @@ struct DualProjectionKernel {
                     actualBlockShape);
             }
         }
+        if (pipeOn) {
+            // Tail: announce every qa chunk this core holds no tile for (a
+            // core with fewer than totalLoops/blockNum tiles also drains
+            // here), then the single kv group once, after this core's last
+            // tile. Exactly one kv set per AIC; the qa sets are one per chunk
+            // per AIC. Both stay within the 15-deep cross-core flag bound.
+            while (qaAnnounced < qaChunks) {
+                Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkQa);
+                ++qaAnnounced;
+            }
+            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(chunkKv);
+        }
     }
 
     template <>
@@ -394,6 +468,9 @@ struct NormQuantKernel {
         GM_ADDR wScaleFp;
         uint32_t t;
         uint32_t projectionSplits;
+        // Host narrow-M rebalance flag (split=1, T in (128, 192]); the E1 chunk
+        // pipeline must be mutually exclusive with it (see E1PipelineOn).
+        uint32_t narrowM;
         // Required BF16 [t,1280] output: the same normalized BF16 row that
         // feeds dynamic quantization, i.e. q_norm(wq_a(x)).
         GM_ADDR qr;
@@ -414,7 +491,8 @@ struct NormQuantKernel {
             args.t > 0 && args.t <= kMaxT &&
             args.headNum >= kMinHeads && args.headNum <= kMaxHeads &&
             args.projectionSplits > 0 &&
-            args.projectionSplits <= kMaxProjectionSplits;
+            args.projectionSplits <= kMaxProjectionSplits &&
+            args.narrowM <= 1U;
     }
 
     static size_t GetWorkspaceSize(const Arguments &)
@@ -548,14 +626,59 @@ struct NormQuantKernel {
         AscendC::Cast(gammaKvFp, gammaKvBf16, AscendC::RoundMode::CAST_NONE, kKv);
         AscendC::PipeBarrier<PIPE_V>();
 
-        Arch::CrossCoreFlag projectionReady{4};
-        Arch::CrossCoreWaitFlag(projectionReady);
-        Arch::CrossCoreBarrier<0x0, PIPE_MTE2>();
+        // E1b/F21 pipeline: S1 no longer waits for the whole projection before
+        // any row. The Q stream is gated per chunk on its own AIC announcement
+        // (flag 6); the all-AIV barrier after the wait is the aggregation layer
+        // that turns 24 per-pair notifications into "all AIC tiles of chunk g
+        // are done". The KV stream is a single group (flag 7, set once by each
+        // AIC after its last tile): one wait + one barrier instead of one per
+        // kv chunk. The measured kv group-ready curve is at the S0 tail, i.e.
+        // later than this AIV's last Q row, so the KV rows are not delayed.
+        // Every AIV executes exactly qaChunks + 1 barriers.
+        //
+        // Segment-major traversal: one segment per Q chunk (trailing chunks
+        // with no row on this AIV included) plus one KV segment. The chunk gate
+        // lives in the segment loop, not the row loop, so the non-pipelined
+        // path (t <= 384, narrow-M, split > 1) runs the unchanged row body with
+        // no per-row pipeline branch and no extra state live across it. The
+        // per-AIV row order is identical to the work-strided loop (ascending Q
+        // rows first, then ascending KV rows): 384 is a multiple of blockNum,
+        // so rowBegin + blockIdx hits the same residue class in every chunk.
+        const bool pipeOn = E1PipelineOn(
+            params.projectionSplits, params.t, params.narrowM);
+        // On the gated path narrowM == 0, so the AIC Q chunk is exactly
+        // kE1ChunkMTiles L1 M-tiles; derive S1's row window from the same tile
+        // constant instead of a bare 128.
+        static_assert(Bf16L1Tile::M == 128U, "E1 chunk row math expects the BM=128 L1 tile");
+        const uint32_t pipeChunkRows = kE1ChunkMTiles * Bf16L1Tile::M;
+        const uint32_t pipeChunks =
+            (params.t + pipeChunkRows - 1U) / pipeChunkRows;
+        Arch::CrossCoreFlag chunkQa{kE1ChunkQaFlag};
+        Arch::CrossCoreFlag chunkKv{kE1ChunkKvFlag};
+        if (!pipeOn) {
+            Arch::CrossCoreFlag projectionReady{4};
+            Arch::CrossCoreWaitFlag(projectionReady);
+            Arch::CrossCoreBarrier<0x0, PIPE_MTE2>();
+        }
 
-        const uint32_t workCount = params.t * 2U;
-        for (uint32_t work = blockIdx; work < workCount; work += blockNum) {
-            const bool isQ = work < params.t;
-            const uint32_t row = isQ ? work : work - params.t;
+        const uint32_t qaSegments = pipeOn ? pipeChunks : 1U;
+        for (uint32_t seg = 0; seg <= qaSegments; ++seg) {
+            const bool isQ = seg < qaSegments;
+            if (pipeOn) {
+                if (isQ) {
+                    Arch::CrossCoreWaitFlag(chunkQa);
+                    Arch::CrossCoreBarrier<0x0, PIPE_MTE3>();
+                } else {
+                    Arch::CrossCoreWaitFlag(chunkKv);
+                    Arch::CrossCoreBarrier<0x0, PIPE_MTE3>();
+                }
+            }
+            const uint32_t rowBegin = isQ ? seg * pipeChunkRows : 0U;
+            uint32_t rowEnd = isQ ? rowBegin + pipeChunkRows : params.t;
+            if (rowEnd > params.t) {
+                rowEnd = params.t;
+            }
+            for (uint32_t row = rowBegin + blockIdx; row < rowEnd; row += blockNum) {
             const uint32_t dim = isQ ? kQa : kKv;
             const uint64_t offset = static_cast<uint64_t>(row) * dim;
             auto gmProjection = isQ ? gmQa : gmKv;
@@ -798,6 +921,7 @@ struct NormQuantKernel {
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(vMte2);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(vMte2);
             }
+            }
         }
 
         pipe->ReleaseEventID<AscendC::HardEvent::MTE2_V>(mte2V);
@@ -810,7 +934,344 @@ struct NormQuantKernel {
     }
 };
 
-using QuantDispatch = Gemm::MmadAtlasA2PreloadAsyncWithCallback<1, 2, 2, 2, 1, true, true>;
+// E2/F13 "full-load-A" variant of Catlass::Gemm::Kernel::QuantMatmulMultiStageWorkspace.
+//
+// Mechanism: the contract QMM has loopsM * loopsN tiles (M = tokens, N = 128
+// head-dim tiles). The stock workspace kernel streams the A tile from GM to L1
+// once per N tile, i.e. loopsN times per M row. This variant uses the CATLASS
+// full-load-A block MMAD, which keeps a whole (L1_TILE_M x K) A tile resident in
+// L1 and skips the GM->L1 A copy whenever the next tile on the same core reuses
+// the same A (needLoadL1). Skipping only fires if a core's consecutive tiles
+// stay inside one M row, which is exactly what
+// GemmIdentityBlockSwizzleL1FullLoad<1, 0> guarantees (Zn order, offset 1:
+// innerIdx = mIdx * loopsN + nIdx for one core's contiguous innerIdx range).
+// Everything else - workspace staging, cross-core flags, the per-token dequant
+// epilogue, the zN B layout - is the stock QuantMatmulMultiStageWorkspace
+// dataflow, so the INT32 workspace content and the BF16 output are unchanged.
+template <class BlockMmad_, class BlockEpilogue_, class BlockScheduler_, uint32_t WORKSPACE_STAGES_>
+class QuantMatmulFullLoadAWorkspace {
+public:
+    using BlockMmad = BlockMmad_;
+    using ArchTag = typename BlockMmad::ArchTag;
+    using L1TileShape = typename BlockMmad::L1TileShape;
+    using ElementA = typename BlockMmad::ElementA;
+    using LayoutA = typename BlockMmad::LayoutA;
+    using ElementB = typename BlockMmad::ElementB;
+    using LayoutB = typename BlockMmad::LayoutB;
+    using ElementC = typename BlockMmad::ElementC;
+    using LayoutC = typename BlockMmad::LayoutC;
+    using ElementAccumulator = typename BlockMmad::ElementAccumulator;
+
+    using BlockEpilogue = BlockEpilogue_;
+    using ElementScale = typename BlockEpilogue::ElementScale;
+    using LayoutScale = typename BlockEpilogue::LayoutScale;
+    using ElementPerTokenScale = typename BlockEpilogue::ElementPerTokenScale;
+    using LayoutPerTokenScale = typename BlockEpilogue::LayoutPerTokenScale;
+    using ElementD = typename BlockEpilogue::ElementD;
+    using LayoutD = typename BlockEpilogue::LayoutD;
+    using EpilogueParams = typename BlockEpilogue::Params;
+
+    using BlockScheduler = BlockScheduler_;
+    static constexpr uint32_t WORKSPACE_STAGES = WORKSPACE_STAGES_;
+
+    /// Parameters structure (identical to QuantMatmulMultiStageWorkspace)
+    struct Params {
+        // Data members
+        GemmCoord problemShape;
+        __gm__ ElementA* ptrA;
+        LayoutA layoutA;
+        __gm__ ElementB* ptrB;
+        LayoutB layoutB;
+        __gm__ ElementScale* ptrScale;
+        LayoutScale layoutScale;
+        __gm__ ElementPerTokenScale* ptrPerTokenScale;
+        LayoutPerTokenScale layoutPerTokenScale;
+        __gm__ ElementD* ptrD;
+        LayoutD layoutD;
+        GM_ADDR ptrWorkspace;
+
+        // Methods
+        CATLASS_HOST_DEVICE
+        Params()
+        {}
+
+        CATLASS_HOST_DEVICE
+        Params(
+            GemmCoord problemShape_, GM_ADDR ptrA_, LayoutA layoutA_, GM_ADDR ptrB_, LayoutB layoutB_,
+            GM_ADDR ptrScale_, LayoutScale layoutScale_, GM_ADDR ptrPerTokenScale_,
+            LayoutPerTokenScale layoutPerTokenScale_, GM_ADDR ptrD_, LayoutD layoutD_, GM_ADDR ptrWorkspace_)
+            : problemShape(problemShape_),
+              ptrA(reinterpret_cast<__gm__ ElementA*>(ptrA_)),
+              layoutA(layoutA_),
+              ptrB(reinterpret_cast<__gm__ ElementB*>(ptrB_)),
+              layoutB(layoutB_),
+              ptrScale(reinterpret_cast<__gm__ ElementScale*>(ptrScale_)),
+              layoutScale(layoutScale_),
+              ptrPerTokenScale(reinterpret_cast<__gm__ ElementPerTokenScale*>(ptrPerTokenScale_)),
+              layoutPerTokenScale(layoutPerTokenScale_),
+              ptrD(reinterpret_cast<__gm__ ElementD*>(ptrD_)),
+              layoutD(layoutD_),
+              ptrWorkspace(ptrWorkspace_)
+        {}
+    };
+
+    struct Arguments {
+        GemmCoord problemShape;
+        uint32_t aicCoreNum;
+        uint8_t* ptrA;
+        uint8_t* ptrB;
+        uint8_t* ptrScale;
+        uint8_t* ptrPerTokenScale;
+        uint8_t* ptrD;
+    };
+
+    static bool CanImplement(const Arguments& args)
+    {
+        return true;
+    }
+
+    static size_t GetWorkspaceSize(const Arguments& args)
+    {
+        size_t lenWorkspace = static_cast<size_t>(L1TileShape::M) * L1TileShape::N * args.aicCoreNum * WORKSPACE_STAGES;
+        size_t sizeWorkspace = lenWorkspace * sizeof(uint32_t);
+        return sizeWorkspace;
+    }
+
+    static Params ToUnderlyingArguments(const Arguments& args, uint8_t* workspace)
+    {
+        uint32_t m = args.problemShape.m();
+        uint32_t n = args.problemShape.n();
+        uint32_t k = args.problemShape.k();
+        LayoutA layoutA = LayoutA::template MakeLayout<ElementA>(m, k);
+        LayoutB layoutB = LayoutB::template MakeLayout<ElementB>(k, n);
+        LayoutScale layoutScale{n};
+        LayoutPerTokenScale layoutPerTokenScale{m};
+        LayoutD layoutD = LayoutD::template MakeLayout<ElementD>(m, n);
+        Params params{
+            args.problemShape,     args.ptrA,           layoutA,   args.ptrB, layoutB,  args.ptrScale, layoutScale,
+            args.ptrPerTokenScale, layoutPerTokenScale, args.ptrD, layoutD,   workspace};
+        return params;
+    }
+
+    // Cross-core flag IDs are an op-global resource. UnifiedMlaPrologKernel owns
+    // 4 (projectionReady) and 5 (normReady); 8..10 are Arch barrier IDs and
+    // FFTS_MAX_FLAG is 7. The stock 2-stage ring used 0..3 - keep stage 0/1
+    // exactly there. Stage 2 is placed at 6/7, which avoids 4/5 but aliases the
+    // E1 Q/KV chunk gates (kE1ChunkQaFlag/kE1ChunkKvFlag); a 3-stage ring is
+    // therefore only legal with the E1 pipeline off, enforced below.
+    static constexpr Arch::FlagID kProjectionReadyFlag = 4;
+    static constexpr Arch::FlagID kNormReadyFlag = 5;
+    static constexpr Arch::FlagID QmmFlagId(uint32_t stageId, uint32_t kind)
+    {
+        return static_cast<Arch::FlagID>((stageId < 2) ? (2 * stageId + kind) : (6 + kind));
+    }
+    static constexpr bool QmmFlagIdsValid()
+    {
+        for (uint32_t stageId = 0; stageId < WORKSPACE_STAGES; ++stageId) {
+            for (uint32_t kind = 0; kind < 2; ++kind) {
+                uint32_t id = QmmFlagId(stageId, kind);
+                if (id == kProjectionReadyFlag || id == kNormReadyFlag || id > 7) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+    static_assert(WORKSPACE_STAGES <= 3, "only two free cross-core flag IDs beyond the 2-stage ring");
+    static_assert(
+        QmmFlagIdsValid(),
+        "QMM cross-core flag IDs must avoid 4/5 (projectionReady/normReady) and stay <= FFTS_MAX_FLAG");
+    static_assert(!kE1Pipeline || WORKSPACE_STAGES == 2,
+        "E1 chunk flags 6/7 alias QMM stage-2 flags; a 3-stage ring requires kE1Pipeline=false");
+
+    // Methods
+    CATLASS_DEVICE
+    QuantMatmulFullLoadAWorkspace()
+    {
+        for (uint32_t stageId = 0; stageId < WORKSPACE_STAGES; ++stageId) {
+            flagAicFinishStoreList[stageId] = Arch::CrossCoreFlag(QmmFlagId(stageId, 0));
+            flagAivFinishComputeList[stageId] = Arch::CrossCoreFlag(QmmFlagId(stageId, 1));
+            aicWaitFuncList[stageId] = {this, stageId};
+            aicSetFuncList[stageId] = {this, stageId};
+        }
+    }
+
+    template <int32_t CORE_TYPE = g_coreType>
+    CATLASS_DEVICE void operator()(Params const& params);
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIC>(Params const& params)
+    {
+        BlockScheduler blockScheduler;
+        blockScheduler.Update(params.problemShape, MakeCoord(L1TileShape::M, L1TileShape::N));
+        uint32_t coreLoops = blockScheduler.GetCoreLoops();
+
+        BlockMmad blockMmad(resource);
+
+        // Represent the full gm
+        AscendC::GlobalTensor<ElementA> gmA;
+        gmA.SetGlobalBuffer(params.ptrA);
+        AscendC::GlobalTensor<ElementB> gmB;
+        gmB.SetGlobalBuffer(params.ptrB);
+
+        uint32_t coreIdx = AscendC::GetBlockIdx();
+        uint32_t coreNum = AscendC::GetBlockNum();
+
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC*>(params.ptrWorkspace));
+        auto layoutC = layout::RowMajor{L1TileShape::M * coreNum * WORKSPACE_STAGES, L1TileShape::N};
+
+        uint32_t stageId = 0;
+        uint32_t stageUsed = 0;
+        int64_t gmOffsetAPreload{0};
+
+        // Loop through the matmul of each groupIdx
+        for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+            // Compute block location
+            GemmCoord blockCoord = blockScheduler.GetBlockCoord(loopIdx);
+            GemmCoord actualBlockShape = blockScheduler.GetActualBlockShape(blockCoord);
+
+            Callback callbackBeforeFixpipe{};
+            if (stageUsed == WORKSPACE_STAGES) {
+                callbackBeforeFixpipe = MakeCallback(&aicWaitFuncList[stageId]);
+            } else {
+                ++stageUsed;
+            }
+            Callback callbackAfterFixpipe = MakeCallback(&aicSetFuncList[stageId]);
+
+            // Compute initial location in logical coordinates
+            MatrixCoord offsetA{blockCoord.m() * L1TileShape::M, blockCoord.k() * L1TileShape::K};
+            MatrixCoord offsetB{blockCoord.k() * L1TileShape::K, blockCoord.n() * L1TileShape::N};
+            MatrixCoord offsetC{(stageId * coreNum + coreIdx) * L1TileShape::M, 0};
+            int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+            int64_t gmOffsetB = params.layoutB.GetOffset(offsetB);
+            int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+
+            // Judge whether the current blockA is already on L1Cache
+            bool isFirstBlock = (loopIdx == coreIdx);
+            bool needLoadL1 = true;
+            if (isFirstBlock) {
+                gmOffsetAPreload = gmOffsetA;
+            } else {
+                if (gmOffsetA == gmOffsetAPreload) {
+                    needLoadL1 = false;
+                } else {
+                    gmOffsetAPreload = gmOffsetA;
+                }
+            }
+
+            // Compute block-scoped matrix multiply-add
+            callbackBeforeFixpipe();
+            blockMmad(
+                gmA[gmOffsetA], params.layoutA, gmB[gmOffsetB], params.layoutB, gmC[gmOffsetC], layoutC,
+                actualBlockShape, needLoadL1);
+            callbackAfterFixpipe();
+
+            stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+        }
+
+        while (stageUsed > 0) {
+            uint32_t aivComputeStageId =
+                (stageId >= stageUsed) ? (stageId - stageUsed) : (stageId + WORKSPACE_STAGES - stageUsed);
+            Arch::CrossCoreWaitFlag(flagAivFinishComputeList[aivComputeStageId]);
+            --stageUsed;
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+    template <>
+    CATLASS_DEVICE void operator()<AscendC::AIV>(Params const& params)
+    {
+        BlockScheduler blockScheduler;
+        BlockEpilogue blockEpilogue(resource);
+
+        uint32_t coreIdx = AscendC::GetBlockIdx() / AscendC::GetSubBlockNum();
+        uint32_t coreNum = AscendC::GetBlockNum();
+
+        AscendC::GlobalTensor<ElementC> gmC;
+        gmC.SetGlobalBuffer(reinterpret_cast<__gm__ ElementC*>(params.ptrWorkspace));
+        auto layoutC = layout::RowMajor{L1TileShape::M * coreNum * WORKSPACE_STAGES, L1TileShape::N};
+
+        uint32_t stageId = 0;
+
+        LayoutScale layoutScale = params.layoutScale;
+        LayoutPerTokenScale layoutPerTokenScale =
+            params.layoutPerTokenScale.GetTileLayout(params.problemShape.template GetCoordByAxis<0>());
+        LayoutD layoutD = params.layoutD.GetTileLayout(params.problemShape.GetCoordMN());
+
+        EpilogueParams epilogueParams{params.ptrScale,     layoutScale, params.ptrPerTokenScale,
+                                      layoutPerTokenScale, params.ptrD, layoutD};
+
+        blockScheduler.Update(params.problemShape, L1TileShape::ToCoordMN());
+        blockEpilogue.UpdateParams(epilogueParams);
+        uint32_t coreLoops = blockScheduler.GetCoreLoops();
+
+        GemmCoord blockShapeMNK = L1TileShape::ToCoord();
+        for (uint32_t loopIdx = coreIdx; loopIdx < coreLoops; loopIdx += coreNum) {
+            GemmCoord blockCoordMNK = blockScheduler.GetBlockCoord(loopIdx);
+            GemmCoord actualBlockShapeMNK = blockScheduler.GetActualBlockShape(blockCoordMNK);
+
+            MatrixCoord offsetC{(stageId * coreNum + coreIdx) * L1TileShape::M, 0};
+            int64_t gmOffsetC = layoutC.GetOffset(offsetC);
+            auto gmBlockC = gmC[gmOffsetC];
+            auto layoutBlockC = layoutC.GetTileLayout(actualBlockShapeMNK.GetCoordMN());
+
+            Arch::CrossCoreWaitFlag(flagAicFinishStoreList[stageId]);
+            blockEpilogue(blockShapeMNK, blockCoordMNK, actualBlockShapeMNK, gmBlockC, layoutBlockC);
+            Arch::CrossCoreSetFlag<0x2, PIPE_MTE3>(flagAivFinishComputeList[stageId]);
+
+            stageId = (stageId + 1 < WORKSPACE_STAGES) ? (stageId + 1) : 0;
+        }
+
+        AscendC::PipeBarrier<PIPE_ALL>();
+    }
+
+private:
+    friend struct AicWaitFunc;
+    friend struct AicSetFunc;
+
+    struct AicWaitFunc {
+        using MatmulKernel = QuantMatmulFullLoadAWorkspace<BlockMmad, BlockEpilogue, BlockScheduler, WORKSPACE_STAGES>;
+
+        CATLASS_DEVICE
+        AicWaitFunc() = default;
+
+        CATLASS_DEVICE
+        void operator()() const
+        {
+            Arch::CrossCoreWaitFlag(ptr->flagAivFinishComputeList[stageId]);
+        }
+
+        MatmulKernel* ptr{nullptr};
+        uint32_t stageId;
+    };
+
+    struct AicSetFunc {
+        using MatmulKernel = QuantMatmulFullLoadAWorkspace<BlockMmad, BlockEpilogue, BlockScheduler, WORKSPACE_STAGES>;
+
+        CATLASS_DEVICE
+        AicSetFunc() = default;
+
+        CATLASS_DEVICE
+        void operator()() const
+        {
+            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(ptr->flagAicFinishStoreList[stageId]);
+        }
+
+        MatmulKernel* ptr{nullptr};
+        uint32_t stageId;
+    };
+
+    Arch::CrossCoreFlag flagAicFinishStoreList[WORKSPACE_STAGES];
+    Arch::CrossCoreFlag flagAivFinishComputeList[WORKSPACE_STAGES];
+
+    AicWaitFunc aicWaitFuncList[WORKSPACE_STAGES];
+    AicSetFunc aicSetFuncList[WORKSPACE_STAGES];
+    Arch::Resource<ArchTag> resource;
+};
+
+using QuantDispatch = Gemm::MmadAtlasA2FullLoadA<true>;
 using QuantL1Tile = GemmShape<128, 256, 512>;
 using QuantL0Tile = GemmShape<128, 256, 128>;
 using QuantA = Gemm::GemmType<int8_t, layout::RowMajor>;
@@ -839,8 +1300,10 @@ using QuantBlockEpilogue = Epilogue::Block::BlockEpilogue<
     QuantEpilogueDispatch, QuantC, QuantScale, QuantTokenScale, QuantD,
     QuantTileRowMul, QuantTileOneBlock, QuantTileColumnMul, QuantEpilogueCopy,
     QuantTileScheduler>;
-using QuantScheduler = Gemm::Block::GemmIdentityBlockSwizzle<3, 0>;
-using QuantMatmul = Gemm::Kernel::QuantMatmulMultiStageWorkspace<
+// F13: Zn order with offset 1 keeps each core's consecutive tiles inside one M
+// row, so the full-load-A block can skip the GM->L1 A copy (needLoadL1).
+using QuantScheduler = Gemm::Block::GemmIdentityBlockSwizzleL1FullLoad<1, 0>;
+using QuantMatmul = QuantMatmulFullLoadAWorkspace<
     QuantBlockMmad, QuantBlockEpilogue, QuantScheduler, kWorkspaceStages>;
 
 struct RopeScatterKernel {
@@ -1166,7 +1629,12 @@ struct UnifiedMlaPrologKernel {
     {
         DualProjectionKernel projection;
         projection.template operator()<AscendC::AIC>(params.projection);
-        Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(projectionReady);
+        // On the E1/F21 pipeline path S1 is gated per chunk instead, so the
+        // single global announcement would be an unconsumed set (flag depth).
+        if (!E1PipelineOn(params.projection.projectionSplits,
+                          params.projection.qaShape.m(), params.projection.narrowM)) {
+            Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(projectionReady);
+        }
 
         Arch::CrossCoreWaitFlag(normReady);
         quantMatmul.template operator()<AscendC::AIC>(params.quantMatmul);
