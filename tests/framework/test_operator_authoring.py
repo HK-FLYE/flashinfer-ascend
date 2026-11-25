@@ -725,6 +725,7 @@ def test_import_and_source_generation_work_without_torch_or_sdk():
 import sys
 sys.modules['torch'] = None
 sys.modules['torch_npu'] = None
+sys.modules['catlass'] = None
 import flashinfer
 from flashinfer.operators.authoring import generate
 assert callable(flashinfer.grouped_matmul_swiglu_quant)

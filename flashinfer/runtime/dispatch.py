@@ -85,6 +85,7 @@ _BACKEND_GROUPS = {
     Backend.CANN: "cann",
     Backend.ASCENDC: None,
     Backend.TRITON: None,
+    Backend.CATLASS_DSL: None,
     Backend.EXTERNAL: "external",
     Backend.CUSTOM: None,
     Backend.REFERENCE: "reference",
