@@ -44,14 +44,8 @@ With ``update_kv_cache=True`` the cache rows not addressed by ``slot_indices``
 are untouched sentinels. With ``update_kv_cache=False`` the whole cache is
 untouched.
 
-IMPORTANT: ``kv_cache`` is an input Tensor that the device kernel updates in
-place. The generated functional/out schema path rejects mutation of an input
-that is not declared as a mutated argument. This module deliberately keeps the
-metadata hook complete, but the final public entry (``public_entry`` plus
-``torch_declarations`` with ``mutates_args=("kv_cache",)``, or an explicit
-maintainer-approved schema extension) is still unresolved. See
-``post_final/flashinfer_submission/gap_analysis.md`` in the evolution output
-for the open items; do not treat this declaration as a verified public API.
+The public Torch schemas declare the in-place update of the ``kv_cache`` input.
+The direct operator capability binding includes these schemas and their write aliases.
 """
 
 import math
@@ -434,6 +428,7 @@ OPERATOR = OperatorDefinition(
     domain="attention",
     op=OP,
     public_entry="flashinfer.attention.mla_prolog:mla_prolog",
+    torch_declarations=torch_declarations,
     output_names=OUTPUT_NAMES,
     infer=infer,
     validate_values=validate_values,

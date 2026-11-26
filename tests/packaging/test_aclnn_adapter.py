@@ -113,10 +113,18 @@ with tempfile.TemporaryDirectory() as temporary:
  root=Path(temporary);os.environ['FLASHINFER_ACLNN_ADAPTER_PATH']=temporary
  (root/'libflashinfer_aclnn.so').write_bytes(b'invalid fixture ELF')
  (root/'manifest.json').write_text(json.dumps(dict(schema_version=1,library='libflashinfer_aclnn.so',torch_version=torch.__version__,torch_npu_version='fixture',sha256='0'*64)))
- assert _native.available()
+ assert not hasattr(_native, "available")
  try: _native.load_adapter()
  except RuntimeError as error: assert 'digest mismatch' in str(error)
  else: raise AssertionError('corrupt native adapter accepted')
+ import hashlib
+ manifest=root/'manifest.json'
+ record=json.loads(manifest.read_text())
+ record['sha256']=hashlib.sha256((root/'libflashinfer_aclnn.so').read_bytes()).hexdigest()
+ manifest.write_text(json.dumps(record))
+ try: _native.load_adapter()
+ except RuntimeError as error: assert 'lacks queued submission' in str(error)
+ else: raise AssertionError('synchronous adapter accepted')
 ''')
 
 
@@ -126,7 +134,7 @@ import os,sys,tempfile,types
 from flashinfer.aclnn import _native
 sys.modules['torch_npu']=types.SimpleNamespace(__version__='fixture')
 os.environ.pop('FLASHINFER_ACLNN_ADAPTER_PATH',None)
-assert _native.available(), 'the native Torch bridge is the only execution path'
+assert not hasattr(_native, "available")
 with tempfile.TemporaryDirectory() as temporary:
  os.environ['FLASHINFER_ACLNN_ADAPTER_PATH']=temporary
  try: _native.load_adapter()
