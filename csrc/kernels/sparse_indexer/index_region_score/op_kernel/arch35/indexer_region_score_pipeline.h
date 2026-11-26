@@ -1779,6 +1779,53 @@ private:
         }
     }
 
+    __aicore__ inline void StoreSkippedCausalScores()
+    {
+        // IDs-only selection reads the visible prefix of its private score pool.
+        if (tiling_.batchTokens != 0U) {
+            return;
+        }
+        const auto state = RegionScoreRequestPolicy<true, QUERY_RESIDENT>::Init(tiling_, PairCore());
+        const auto &range = state.range;
+        if (range.qBegin >= range.qEnd || range.kBegin >= range.kEnd) {
+            return;
+        }
+        for (uint32_t request = 0U; request < tiling_.numRequests; ++request) {
+            uint32_t requestQBegin = 0U;
+            uint32_t requestQEnd = 0U;
+            if (!LoadRequestSpan<true>(request, requestQBegin, requestQEnd)) {
+                continue;
+            }
+            const uint32_t qBegin = PagedMax(requestQBegin, range.qBegin);
+            const uint32_t qEnd = PagedMin(requestQEnd, range.qEnd);
+            if (qBegin >= qEnd) {
+                continue;
+            }
+            const uint32_t visible = static_cast<uint32_t>(
+                VisibleRegions(request, requestQBegin, qEnd - 1U));
+            const uint32_t kBegin = PagedMax(range.kBegin, PagedAlignUp(visible, PAGED_K_MACRO));
+            if (kBegin >= range.kEnd) {
+                continue;
+            }
+            // Causal scheduling only computes complete macros below this boundary.
+            // Static Q/K shards and alternating AIV rows own the remaining suffix once.
+            for (uint32_t token = qBegin + GetSubBlockIdx(); token < qEnd; token += 2U) {
+                for (uint32_t group = 0U; group < tiling_.groups; ++group) {
+                    for (uint32_t key = kBegin; key < range.kEnd; key += PAGED_OUTPUT_SLOT_ELEMENTS) {
+                        const uint32_t count = PagedMin(PAGED_OUTPUT_SLOT_ELEMENTS, range.kEnd - key);
+                        const uint32_t slot = AcquireOutputStore();
+                        LocalTensor<float> source = acc_[slot * PAGED_OUTPUT_SLOT_ELEMENTS];
+                        Duplicate(source.ReinterpretCast<uint32_t>(),
+                                  IndexerRegionScoreVector::H4_NEG_INF_BITS,
+                                  PagedAlignUp(count, 32U / sizeof(float)));
+                        StoreRows(group, token, key, count, 1U, PAGED_OUTPUT_SLOT_ELEMENTS, source);
+                        CommitOutputStore(slot);
+                    }
+                }
+            }
+        }
+    }
+
     template <bool CAUSAL>
     __aicore__ inline void ProcessVector()
     {
@@ -1791,6 +1838,9 @@ private:
 
         uint32_t streamLoop = 0U;
         ProcessVectorRequests<CAUSAL>(streamLoop);
+        if constexpr (CAUSAL) {
+            StoreSkippedCausalScores();
+        }
         CrossCoreWaitFlag<PAGED_SYNC_MODE, PIPE_V>(PAGED_WORK_DRAINED_EVENT);
         if constexpr (PAGED_DEBUG_SYNC_TRACE) {
             AscendC::PRINTF("[PagedRegionScore][V%u] drained\n", GetSubBlockIdx());
@@ -1922,6 +1972,9 @@ private:
         const uint32_t qMacroTile = GroupFusedQMacroTile();
 
         ProcessGroupFusedVectorRequests<CAUSAL>(groupTile, qMacroTile, qMicroTile, streamLoop);
+        if constexpr (CAUSAL) {
+            StoreSkippedCausalScores();
+        }
         CrossCoreWaitFlag<PAGED_SYNC_MODE, PIPE_V>(PAGED_WORK_DRAINED_EVENT);
     }
 
