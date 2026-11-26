@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <limits>
+#include "../../include/arch35/tiling_data_def.h"
 
 namespace IndexerRegionScoreHost {
 // This cap applies to the IRS algorithm layout, including its platform library
@@ -60,6 +61,33 @@ inline bool PlanBoundedWorkspace(uint64_t budget, uint64_t libraryBytes,
         uint64_t(groups) * batchTokens * plan.regionStride * sizeof(float);
     return plan.totalBytes <= budget - kBoundedExecutorReserve &&
         plan.totalBytes <= std::numeric_limits<size_t>::max();
+}
+
+// The weighted runner reserves its plan before the existing data workspace.
+// Reduce only the available budget so both runners retain the same data offsets.
+inline bool PlanBoundedScoreWorkspace(uint64_t budget, uint64_t libraryBytes,
+    uint64_t fixedAuxBytes, uint32_t groups, uint32_t tokens, uint32_t regions,
+    uint32_t topK, uint32_t qMicroTile, uint32_t requests, uint32_t pairs,
+    BoundedWorkspacePlan &plan)
+{
+    uint64_t reserved = 0U;
+    for (uint64_t attempt = 0U; attempt <= static_cast<uint64_t>(pairs); ++attempt) {
+        if (reserved > budget || !PlanBoundedWorkspace(budget - reserved, libraryBytes,
+                fixedAuxBytes, groups, tokens, regions, topK, qMicroTile, plan)) {
+            plan = {};
+            return false;
+        }
+        const uint64_t planBytes = IndexerRegionScore::ScorePlanWorkspaceBytes(
+            requests, pairs, tokens, plan.batchTokens);
+        if (planBytes <= reserved) {
+            plan.totalBytes += planBytes;
+            return true;
+        }
+        // A smaller batch can increase only the bounded number of cut slots.
+        reserved = planBytes;
+    }
+    plan = {};
+    return false;
 }
 
 constexpr uint32_t kProxyDim = 256;

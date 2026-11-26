@@ -424,10 +424,10 @@ ge::graphStatus IndexerRegionScorePagedTiling(gert::TilingContext *context)
     }
     if (topkOnly) {
         IndexerRegionScoreHost::BoundedWorkspacePlan bounded;
-        OP_CHECK_IF(!IndexerRegionScoreHost::PlanBoundedWorkspace(
+        OP_CHECK_IF(!IndexerRegionScoreHost::PlanBoundedScoreWorkspace(
                         IndexerRegionScoreHost::kTopKOnlyWorkspaceBudgetBytes, platform.GetLibApiWorkSpaceSize(), 0U,
                         data.groups, data.totalTokens, data.seqK,
-                        static_cast<uint32_t>(*topK), qMicroTile, bounded),
+                        static_cast<uint32_t>(*topK), qMicroTile, data.numRequests, usedCubeCores, bounded),
                     OP_LOGE(context, "internal workspace budget cannot fit the minimum TopK-only batch"),
                     return ge::GRAPH_FAILED);
         data.batchTokens = bounded.batchTokens;
@@ -439,6 +439,12 @@ ge::graphStatus IndexerRegionScorePagedTiling(gert::TilingContext *context)
             IndexerRegionScore::kSelectionRegionIdOrder |
             (static_cast<uint32_t>(*topK % 8 != 0) << 17U);
         workspace[0] = static_cast<size_t>(bounded.totalBytes);
+    }
+    if (!topkOnly) {
+        const uint64_t planBytes = IndexerRegionScore::ScorePlanWorkspaceBytes(data.numRequests, usedCubeCores, data.totalTokens, data.batchTokens);
+        OP_CHECK_IF(planBytes > SIZE_MAX - workspace[0],
+                    OP_LOGE(context, "score plan workspace size overflow"), return ge::GRAPH_FAILED);
+        workspace[0] += static_cast<size_t>(planBytes);
     }
     auto *raw = context->GetRawTilingData();
     OP_CHECK_NULL_WITH_CONTEXT(context, raw);

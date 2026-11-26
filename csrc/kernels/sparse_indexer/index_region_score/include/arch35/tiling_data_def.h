@@ -16,6 +16,40 @@
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_H4_TAIL_TOPK 141ULL
 
 namespace IndexerRegionScore {
+constexpr uint32_t SCORE_PLAN_LINE_BYTES = 128U;
+
+#if defined(__CCE_AICORE__)
+#define IRS_SCORE_PLAN_INLINE __aicore__ inline constexpr
+#else
+#define IRS_SCORE_PLAN_INLINE inline constexpr
+#endif
+
+IRS_SCORE_PLAN_INLINE uint32_t LimitScorePlanSlots(uint32_t epochs, uint32_t pairs)
+{
+    return epochs < pairs ? epochs : pairs;
+}
+
+// Bounded execution retains one immutable cut slot per epoch in a core-sized window.
+IRS_SCORE_PLAN_INLINE uint32_t ScorePlanWindowSlots(uint32_t totalTokens, uint32_t batchTokens, uint32_t pairs)
+{
+    return LimitScorePlanSlots(batchTokens == 0U ? 1U :
+        totalTokens / batchTokens + (totalTokens % batchTokens != 0U), pairs);
+}
+
+IRS_SCORE_PLAN_INLINE uint64_t ScorePlanWorkspaceBytes(uint32_t requests, uint32_t pairs,
+    uint32_t totalTokens = 0U, uint32_t batchTokens = 0U)
+{
+    return requests <= 1U || pairs <= 1U ? 0U :
+        (static_cast<uint64_t>(pairs) + 2U) * SCORE_PLAN_LINE_BYTES *
+            ScorePlanWindowSlots(totalTokens, batchTokens, pairs) +
+        static_cast<uint64_t>(pairs) * SCORE_PLAN_LINE_BYTES +
+        (static_cast<uint64_t>(requests) * 8U * sizeof(uint32_t) + SCORE_PLAN_LINE_BYTES - 1U) /
+            SCORE_PLAN_LINE_BYTES * SCORE_PLAN_LINE_BYTES;
+}
+
+#undef IRS_SCORE_PLAN_INLINE
+
+
 
 // Preserve the region-ID order bit in the existing selectionConfig POD layout.
 inline constexpr uint32_t kSelectionRegionIdOrder = 1U << 16U;
