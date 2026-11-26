@@ -9,6 +9,11 @@
 
 namespace IndexerRegionScore::Block {
 
+// Bit fields shared by the IRS TopK tiling and device dispatch.
+inline constexpr uint32_t kSelectionKeepMask = 0xffffU;
+inline constexpr uint32_t kSelectionSortIds = 1U << 16U;
+inline constexpr uint32_t kSelectionAlignedOutput = 1U << 17U;
+
 template <class Tiling>
 struct TopKArguments {
     GM_ADDR output;
@@ -26,9 +31,9 @@ struct TopKArguments {
             tiling.groups, tiling.totalTokens,
             tiling.outputStrideGroup, tiling.outputStrideToken,
             static_cast<uint32_t>(tiling.outputStrideToken),
-            tiling.seqK, tiling.selectionConfig & 0xffffU,
+            tiling.seqK, tiling.selectionConfig & kSelectionKeepMask,
             tiling.maskMode, tiling.regionSize,
-            (tiling.selectionConfig & 0x10000U) != 0U,
+            (tiling.selectionConfig & IndexerRegionScore::Block::kSelectionSortIds) != 0U,
             tiling.numRequests, tiling.usedCubeCores, pipe,
             alignedSelection, tiling.batchBegin, tiling.batchCount);
     }
@@ -42,7 +47,7 @@ struct BlockTopK {
         const Tiling &tiling, uint64_t scratchOffset, AscendC::TPipe *pipe)
     {
         SparseIndexer::Common::SubblockPairBlockBarrierSyncPolicy::GlobalBarrier();
-        const bool alignedSelection = (tiling.selectionConfig & 0x20000U) != 0U;
+        const bool alignedSelection = (tiling.selectionConfig & IndexerRegionScore::Block::kSelectionAlignedOutput) != 0U;
         GM_ADDR scratch = alignedSelection ? workspace + scratchOffset : selectedRegionIds;
         if ASCEND_IS_AIV {
             pipe->Reset();
@@ -54,7 +59,7 @@ struct BlockTopK {
             if ASCEND_IS_AIV {
                 pipe->Reset();
                 Compact(scratch, selectedRegionIds, tiling.groups,
-                    tiling.totalTokens, tiling.selectionConfig & 0xffffU,
+                    tiling.totalTokens, tiling.selectionConfig & kSelectionKeepMask,
                     tiling.usedCubeCores, pipe, tiling.batchBegin, tiling.batchCount);
             }
         }
@@ -69,17 +74,22 @@ struct StageImplementation<Stage::TopK, SelectionStagePolicy<SelectionPolicy, Co
 } // namespace IndexerRegionScore::Block
 
 namespace IndexerRegionScorePaged {
+template <IndexerRegionScore::FusedSelect::Implementation implementation>
 struct FusedTopKPolicy {
     template <class Arguments>
     __aicore__ static inline void Select(const Arguments &arguments)
     {
-        arguments.template SelectRows<IndexerRegionScore::FusedSelect::Run>();
+        arguments.template SelectRows<IndexerRegionScore::FusedSelect::Run<implementation>>();
     }
 };
 
-using FusedTopKStrategy = IndexerRegionScore::Block::StageType<
+template <IndexerRegionScore::FusedSelect::Implementation implementation>
+using FusedTopKStrategyFor = IndexerRegionScore::Block::StageType<
     IndexerRegionScore::Block::Stage::TopK,
-    IndexerRegionScore::Block::SelectionStagePolicy<FusedTopKPolicy, IndexerRegionScore::FusedSelect::Compact>>;
+    IndexerRegionScore::Block::SelectionStagePolicy<FusedTopKPolicy<implementation>,
+        IndexerRegionScore::FusedSelect::Compact>>;
+
+using FusedTopKStrategy = FusedTopKStrategyFor<IndexerRegionScore::FusedSelect::kDefaultImplementation>;
 
 } // 命名空间结束。
 
@@ -91,7 +101,7 @@ struct IdCompactBatchTopKPolicy {
     template <class Arguments>
     __aicore__ static inline void Select(const Arguments &arguments)
     {
-        if ((arguments.tiling.selectionConfig & 0x10000U) != 0U) {
+        if ((arguments.tiling.selectionConfig & IndexerRegionScore::Block::kSelectionSortIds) != 0U) {
             arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunIdCompactBatch>();
         } else {
             arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunSingleWindow>();
@@ -117,11 +127,11 @@ struct B8Native512TopKPolicy {
     __aicore__ static inline void Select(const Arguments &arguments)
     {
         const auto &tiling = arguments.tiling;
-        if ((tiling.selectionConfig & 0x10000U) != 0U) {
+        if ((tiling.selectionConfig & IndexerRegionScore::Block::kSelectionSortIds) != 0U) {
             arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunIdCompactBatch>();
         } else if (IndexerRegionScore::FusedSelect::Min(
             tiling.seqK, static_cast<uint32_t>(tiling.outputStrideToken)) <=
-            IndexerRegionScore::FusedSelect::kShortRowCapacity) {
+            IndexerRegionScore::FusedSelect::kNativeShortRowCapacity) {
             arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunShortRows>();
         } else {
             arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunSingleWindow>();

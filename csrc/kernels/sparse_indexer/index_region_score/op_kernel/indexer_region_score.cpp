@@ -169,7 +169,8 @@ extern "C" __global__ __aicore__ void fi_indexer_region_score(
         auto data = reinterpret_cast<__gm__ uint32_t *>(tiling);
         const uint32_t proxyDim = data[offsetof(PagedTilingData, proxyDim) / sizeof(uint32_t)];
         const uint32_t selection = data[offsetof(PagedTilingData, selectionConfig) / sizeof(uint32_t)];
-        if (proxyDim == 256U && (selection & 0xffffU) == 512U) {
+        if (proxyDim == 256U && (selection & IndexerRegionScore::Block::kSelectionKeepMask) ==
+            IndexerRegionScore::FusedSelect::kNativeTopK) {
             RunWithStrategies<PagedCacheStrategy, RightDownCausalMaskStrategy, Native512TopKStrategy, true>(
                 query, weights, keySummary, actualKvLengths, pagedKeySummary, blockTable,
                 cuSeqLens, output, selectedRegionIds, workspace, tiling, &pipe);
@@ -219,7 +220,8 @@ extern "C" __global__ __aicore__ void fi_indexer_region_score(
             auto data = reinterpret_cast<__gm__ uint32_t *>(tiling);
             const uint32_t proxyDim = data[offsetof(PagedTilingData, proxyDim) / sizeof(uint32_t)];
             const uint32_t selection = data[offsetof(PagedTilingData, selectionConfig) / sizeof(uint32_t)];
-            if (proxyDim == 256U && (selection & 0xffffU) == 512U) {
+            if (proxyDim == 256U && (selection & IndexerRegionScore::Block::kSelectionKeepMask) ==
+            IndexerRegionScore::FusedSelect::kNativeTopK) {
                 RunWithStrategies<PagedCacheStrategy, RightDownCausalMaskStrategy, Native512TopKStrategy>(
                     query, weights, keySummary, actualKvLengths, pagedKeySummary, blockTable,
                     cuSeqLens, output, selectedRegionIds, workspace, tiling, &pipe);
