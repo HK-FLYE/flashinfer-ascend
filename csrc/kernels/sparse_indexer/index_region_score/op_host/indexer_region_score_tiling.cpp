@@ -173,7 +173,7 @@ ge::graphStatus ConfigureContinuousSelectionWorkspace(gert::TilingContext *conte
 ge::graphStatus ValidateContinuousSelectionConfig(gert::TilingContext *context, int64_t topK, int64_t sortMode,
     int64_t maxRegionLen, int64_t groups, int64_t seqQ)
 {
-    OP_CHECK_IF(topK <= 0 || topK > 4096 || (sortMode != 0 && sortMode != 1) ||
+    OP_CHECK_IF(topK <= 0 || topK > 4096 || sortMode != 0 ||
                     (maxRegionLen > 16777216 ||
                      static_cast<uint64_t>(groups) * static_cast<uint64_t>(seqQ) > UINT32_MAX),
                 OP_LOGE(context, "invalid TopK/Sort configuration or row/region extent"),
@@ -397,7 +397,7 @@ ge::graphStatus FiIndexerRegionScoreTiling(gert::TilingContext *context)
     data.outStrideT = outputRegions;
     data.regionSize = static_cast<uint32_t>(*regionSize);
     data.selectionConfig = static_cast<uint32_t>(*topK) |
-        (static_cast<uint32_t>(*sortMode) << 16U) |
+        IndexerRegionScore::kSelectionRegionIdOrder |
         (static_cast<uint32_t>(useAlignedSelection) << 17U);
     data.numRequests = lengths == nullptr ? 1U : static_cast<uint32_t>((lengths->GetOriginShape()).GetDim(0));
     data.lengthStrideT = 0;
@@ -416,7 +416,7 @@ ge::graphStatus FiIndexerRegionScoreTiling(gert::TilingContext *context)
         data.outStrideT = bounded.regionStride;
         data.outStrideG = uint64_t(data.batchTokens) * bounded.regionStride;
         data.selectionConfig = static_cast<uint32_t>(*topK) |
-            (static_cast<uint32_t>(*sortMode) << 16U) |
+            IndexerRegionScore::kSelectionRegionIdOrder |
             (static_cast<uint32_t>(*topK % 8 != 0) << 17U);
         workspace[0] = static_cast<size_t>(bounded.totalBytes);
     }

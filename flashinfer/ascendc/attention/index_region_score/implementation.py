@@ -77,7 +77,7 @@ IMPLEMENTATION = AscendCImplementation(
             AttributeParameter("max_region_len", "int64", -1, -1, 2**31 - 1),
             AttributeParameter("region_size", "int64", 8, 1, 2**31 - 1),
             AttributeParameter("top_k", "int64", 512, 1, 4096),
-            AttributeParameter("sort_mode", "int64", 1, 0, 1),
+            AttributeParameter("sort_mode", "int64", 0, 0, 0),
             AttributeParameter("return_score", "bool", True),
             AttributeParameter("graph_key_pages", "int64", 0, 0),
             AttributeParameter("graph_key_summaries", "int64", 0, 0, 1024),

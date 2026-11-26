@@ -202,16 +202,6 @@ extern "C" __global__ __aicore__ void fi_indexer_region_score(
             cuSeqLens, output, selectedRegionIds, workspace, tiling, &pipe);
         return;
     }
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && \
-    defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
-    ((ORIG_DTYPE_QUERY == DT_FLOAT16) || (ORIG_DTYPE_QUERY == DT_BF16))
-    if (TILING_KEY_IS(INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_B8_TOPK)) {
-        RunWithStrategies<PagedCacheStrategy, RightDownCausalMaskStrategy, B8Native512TopKStrategy>(
-            query, weights, keySummary, actualKvLengths, pagedKeySummary, blockTable,
-            cuSeqLens, output, selectedRegionIds, workspace, tiling, &pipe);
-        return;
-    }
-#endif
     if (TILING_KEY_IS(INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_TOPK)) {
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && \
     defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \

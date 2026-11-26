@@ -11,7 +11,6 @@ namespace IndexerRegionScore::Block {
 
 // Bit fields shared by the IRS TopK tiling and device dispatch.
 inline constexpr uint32_t kSelectionKeepMask = 0xffffU;
-inline constexpr uint32_t kSelectionSortIds = 1U << 16U;
 inline constexpr uint32_t kSelectionAlignedOutput = 1U << 17U;
 
 template <class Tiling>
@@ -33,7 +32,6 @@ struct TopKArguments {
             static_cast<uint32_t>(tiling.outputStrideToken),
             tiling.seqK, tiling.selectionConfig & kSelectionKeepMask,
             tiling.maskMode, tiling.regionSize,
-            (tiling.selectionConfig & IndexerRegionScore::Block::kSelectionSortIds) != 0U,
             tiling.numRequests, tiling.usedCubeCores, pipe,
             alignedSelection, tiling.batchBegin, tiling.batchCount);
     }
@@ -101,11 +99,7 @@ struct IdCompactBatchTopKPolicy {
     template <class Arguments>
     __aicore__ static inline void Select(const Arguments &arguments)
     {
-        if ((arguments.tiling.selectionConfig & IndexerRegionScore::Block::kSelectionSortIds) != 0U) {
-            arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunIdCompactBatch>();
-        } else {
-            arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunSingleWindow>();
-        }
+        arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunIdCompactBatch>();
     }
 };
 
@@ -116,34 +110,6 @@ using Native512TopKStrategy = IdCompactBatchTopKStrategy;
 
 } // 命名空间结束。
 
-#endif
-
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && \
-    defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
-    ((ORIG_DTYPE_QUERY == DT_FLOAT16) || (ORIG_DTYPE_QUERY == DT_BF16))
-namespace IndexerRegionScorePaged {
-struct B8Native512TopKPolicy {
-    template <class Arguments>
-    __aicore__ static inline void Select(const Arguments &arguments)
-    {
-        const auto &tiling = arguments.tiling;
-        if ((tiling.selectionConfig & IndexerRegionScore::Block::kSelectionSortIds) != 0U) {
-            arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunIdCompactBatch>();
-        } else if (IndexerRegionScore::FusedSelect::Min(
-            tiling.seqK, static_cast<uint32_t>(tiling.outputStrideToken)) <=
-            IndexerRegionScore::FusedSelect::kNativeShortRowCapacity) {
-            arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunShortRows>();
-        } else {
-            arguments.template SelectRows<IndexerRegionScore::FusedSelect::RunSingleWindow>();
-        }
-    }
-};
-
-using B8Native512TopKStrategy = IndexerRegionScore::Block::StageType<
-    IndexerRegionScore::Block::Stage::TopK,
-    IndexerRegionScore::Block::SelectionStagePolicy<B8Native512TopKPolicy, IndexerRegionScore::FusedSelect::Compact>>;
-
-}
 #endif
 
 #endif

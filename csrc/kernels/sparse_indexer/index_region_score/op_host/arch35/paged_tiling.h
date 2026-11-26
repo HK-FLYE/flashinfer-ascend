@@ -120,7 +120,7 @@ ge::graphStatus ValidatePagedRegionExtent(gert::TilingContext *context, int64_t 
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus ConfigurePagedSelectionWorkspace(gert::TilingContext *context, int64_t topK, int64_t sortMode,
+ge::graphStatus ConfigurePagedSelectionWorkspace(gert::TilingContext *context, int64_t topK,
     uint64_t selectedRows, uint32_t usedCubeCores, size_t libApiWorkspace,
     size_t *workspace, IndexerRegionScorePaged::PagedTilingData &data)
 {
@@ -148,7 +148,7 @@ ge::graphStatus ConfigurePagedSelectionWorkspace(gert::TilingContext *context, i
         workspace[0] = alignedOffset + selectedRows * paddedK * sizeof(int32_t);
     }
     data.selectionConfig = static_cast<uint32_t>(topK) |
-        (static_cast<uint32_t>(sortMode) << 16U) |
+        IndexerRegionScore::kSelectionRegionIdOrder |
         (static_cast<uint32_t>(useAlignedSelection) << 17U);
 
     return ge::GRAPH_SUCCESS;
@@ -157,7 +157,7 @@ ge::graphStatus ConfigurePagedSelectionWorkspace(gert::TilingContext *context, i
 ge::graphStatus ValidatePagedSelectionConfig(gert::TilingContext *context, int64_t topK, int64_t sortMode,
     int64_t maxRegionLen, int64_t groups, int64_t totalTokens)
 {
-    OP_CHECK_IF(topK <= 0 || topK > 4096 || (sortMode != 0 && sortMode != 1) ||
+    OP_CHECK_IF(topK <= 0 || topK > 4096 || sortMode != 0 ||
                     (maxRegionLen > 16777216 ||
                      static_cast<uint64_t>(groups) * static_cast<uint64_t>(totalTokens) > UINT32_MAX),
                 OP_LOGE(context, "invalid TopK/Sort configuration or row/region extent"),
@@ -330,21 +330,12 @@ ge::graphStatus IndexerRegionScorePagedTiling(gert::TilingContext *context)
     context->SetScheduleMode(1);
     // Compile-time cache, mask and TopK selection strategies are encoded in the key.
     const uint32_t weightDtype = GetPagedWeightDtype(weightsDtype);
-    const bool useB8TopK =
-        platform.GetSocVersion() == platform_ascendc::SocVersion::ASCEND950 &&
-        native16 && *maskMode == 3 &&
-        *topK == 512 && *sortMode == 0 &&
-        *maxRegionLen <= 128;
-    const auto selectionStrategy = useB8TopK
-        ? IndexerRegionScore::TopKSelectionStrategy::ShortRow
-        : IndexerRegionScore::TopKSelectionStrategy::Default;
-    uint64_t tilingKey = IndexerRegionScore::MakeTilingKey(
-        1U, static_cast<uint32_t>(*maskMode), selectionStrategy);
+    uint64_t tilingKey = IndexerRegionScore::MakeTilingKey(1U, static_cast<uint32_t>(*maskMode));
     const bool causalH4Tail = *maskMode == 3 && native16 && heads == 4 &&
         static_cast<uint64_t>(totalTokens) >= (groups == 1 ? 32U :
             (16U + static_cast<uint64_t>(groups) - 1U) / static_cast<uint64_t>(groups)) &&
         *maxRegionLen >= 129 &&
-        (*maxRegionLen % 128) != 0 && !useB8TopK;
+        (*maxRegionLen % 128) != 0;
     if (causalH4Tail) {
         tilingKey |= IndexerRegionScore::TILING_KEY_H4_TAIL;
     }
@@ -428,7 +419,7 @@ ge::graphStatus IndexerRegionScorePagedTiling(gert::TilingContext *context)
         static_cast<uint64_t>(out.GetDim(2));
     data.outputStrideGroup = static_cast<uint64_t>(data.totalTokens) * data.outputStrideToken;
     data.regionSize = static_cast<uint32_t>(*regionSize);
-    if (!topkOnly && ConfigurePagedSelectionWorkspace(context, *topK, *sortMode, static_cast<uint64_t>(groups) * totalTokens, usedCubeCores, platform.GetLibApiWorkSpaceSize(), workspace, data) != ge::GRAPH_SUCCESS) {
+    if (!topkOnly && ConfigurePagedSelectionWorkspace(context, *topK, static_cast<uint64_t>(groups) * totalTokens, usedCubeCores, platform.GetLibApiWorkSpaceSize(), workspace, data) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
     if (topkOnly) {
@@ -445,7 +436,7 @@ ge::graphStatus IndexerRegionScorePagedTiling(gert::TilingContext *context)
         data.outputStrideToken = bounded.regionStride;
         data.outputStrideGroup = uint64_t(data.batchTokens) * bounded.regionStride;
         data.selectionConfig = static_cast<uint32_t>(*topK) |
-            (static_cast<uint32_t>(*sortMode) << 16U) |
+            IndexerRegionScore::kSelectionRegionIdOrder |
             (static_cast<uint32_t>(*topK % 8 != 0) << 17U);
         workspace[0] = static_cast<size_t>(bounded.totalBytes);
     }

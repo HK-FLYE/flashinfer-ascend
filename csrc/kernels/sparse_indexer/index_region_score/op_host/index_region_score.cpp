@@ -77,8 +77,8 @@ static ge::graphStatus InferShapeIndexerRegionScore(gert::InferShapeContext *con
     OP_CHECK_NULL_WITH_CONTEXT(context, sortMode);
     OP_CHECK_IF(*regionSize <= 0,
                 OP_LOGE(context, "region_size must be positive"), return ge::GRAPH_FAILED);
-    OP_CHECK_IF(*topK <= 0 || *topK > 4096 || (*sortMode != 0 && *sortMode != 1),
-                OP_LOGE(context, "top_k must be in [1,4096] and sort_mode must be 0 or 1"),
+    OP_CHECK_IF(*topK <= 0 || *topK > 4096 || *sortMode != 0,
+                OP_LOGE(context, "top_k must be in [1,4096] and sort_mode must be 0 (ascending region ID)"),
                 return ge::GRAPH_FAILED);
     if (isPaged) {
         int64_t maxRegions = 0;
@@ -186,9 +186,9 @@ public:
         // Number of uncompressed KV tokens represented by one region.
         this->Attr("region_size").AttrType(OPTIONAL).Int(8);
         // Required selection count [1,4096]; retain the unified attribute order.
-        // sort_mode: 0 score-descending, 1 logical-ID ascending.
+        // sort_mode: 0, ascending logical region ID.
         this->Attr("top_k").AttrType(OPTIONAL).Int(512);
-        this->Attr("sort_mode").AttrType(OPTIONAL).Int(1);
+        this->Attr("sort_mode").AttrType(OPTIONAL).Int(0);
         // The IDs-only tiler gives the required Score slot a one-element placeholder.
         this->Attr("return_score").AttrType(OPTIONAL).Bool(true);
         // Preserve the page pitch when the runner binds a flat physical Key span.

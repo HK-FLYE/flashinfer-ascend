@@ -20,8 +20,6 @@ constexpr uint32_t kRadixTile = 8192U;
 constexpr uint32_t kRadixMaxTopK = SparseTopK::kMaxKeepCount;
 constexpr uint32_t kMaxTopK = kRadixMaxTopK;
 constexpr uint32_t kNativeTopK = 512U;
-constexpr uint32_t kNativeShortRowCapacity = 128U;
-constexpr uint32_t kNativeShortRowBatch = kScoreTile / kNativeShortRowCapacity;
 constexpr uint32_t kSmallHeapMaxTopK = 7U;
 constexpr uint32_t kDmaBlockBytes = 32U;
 constexpr uint32_t kWorkspaceAlignment = 4U * 1024U;
@@ -44,13 +42,10 @@ struct SelectionWorkspace {
     static constexpr uint32_t kOrderValues = kMerge + (kRadixTile + kJointExtra) * sizeof(uint32_t);
     static constexpr uint32_t kOrderIds = kOrderValues + kMaxTopK * sizeof(float);
     static constexpr uint32_t kBytes = AlignUp(kOrderIds + kMaxTopK * sizeof(uint32_t), kWorkspaceAlignment);
-    static constexpr uint32_t kSingleWindowCapacity = kChunk / sizeof(uint32_t);
 };
 static_assert(SelectionWorkspace::kOrderIds >= SparseTopK::kWorkspaceBytes);
-static_assert(kNativeShortRowBatch * kNativeTopK <= kRadixTile);
 constexpr float kInvalidScore = -1.0e29F;
 // 相同分数保留逻辑编号升序，稳定基数排序维持平局次序。
-constexpr SortConfig kSortKeysDescending{SortType::RADIX_SORT, true};
 constexpr Reg::CastTrait kIdIntToFloat = {Reg::RegLayout::UNKNOWN, Reg::SatMode::NO_SAT,
                                           Reg::MaskMergeMode::ZEROING, RoundMode::CAST_ROUND};
 
@@ -146,96 +141,6 @@ __simd_vf__ void ExtractAscendingIds(__ubuf__ uint32_t *indices,
         Reg::Adds(gatherIndex, gatherIndex, 1U, all);
         Reg::Gather(ids, sortedPairs, gatherIndex, all);
         Reg::StoreAlign<uint32_t>(indices + offset, ids, all);
-    }
-}
-
-__simd_vf__ void ExtractScoreOrderedIds(__ubuf__ uint32_t *indices,
-                                        __ubuf__ uint32_t *sortedPairs,
-                                        uint32_t retained, uint32_t topK)
-{
-    Reg::MaskReg all = Reg::CreateMask<uint32_t, Reg::MaskPattern::ALL>();
-    Reg::RegTensor<uint32_t> retainedLimit;
-    Reg::RegTensor<uint32_t> zero;
-    Reg::RegTensor<uint32_t> invalidId;
-    Reg::Duplicate(retainedLimit, retained);
-    Reg::Duplicate(zero, 0U);
-    Reg::Duplicate(invalidId, 0xffffffffU);
-    for (uint32_t offset = 0U; offset < topK; offset += 64U) {
-        Reg::RegTensor<uint32_t> lanes;
-        Reg::RegTensor<uint32_t> positions;
-        Reg::RegTensor<uint32_t> ids;
-        Reg::MaskReg valid;
-        Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t> &>(lanes),
-                    static_cast<int32_t>(offset));
-        Reg::Compare<uint32_t, CMPMODE::LT>(valid, lanes, retainedLimit, all);
-        Reg::Muls(positions, lanes, 2U, all);
-        Reg::Adds(positions, positions, 1U, all);
-        Reg::Select(positions, positions, zero, valid);
-        if (retained != 0U) {
-            Reg::Gather(ids, sortedPairs, positions, all);
-        } else {
-            Reg::Duplicate(ids, 0U);
-        }
-        Reg::Select(ids, ids, invalidId, valid);
-        Reg::StoreAlign<uint32_t>(indices + offset, ids, all);
-    }
-}
-
-__simd_vf__ void PackScoreRadixInput(__ubuf__ uint32_t *dstIds,
-                                     __ubuf__ uint32_t *dstKeys,
-                                     __ubuf__ uint32_t *srcIds,
-                                     __ubuf__ uint32_t *srcKeys,
-                                     uint32_t retained, uint32_t alignedCount)
-{
-    Reg::MaskReg all = Reg::CreateMask<uint32_t, Reg::MaskPattern::ALL>();
-    Reg::RegTensor<uint32_t> zero;
-    Reg::RegTensor<uint32_t> invalidId;
-    Reg::RegTensor<uint32_t> retainedLimit;
-    Reg::Duplicate(zero, 0U);
-    Reg::Duplicate(invalidId, 0xffffffffU);
-    Reg::Duplicate(retainedLimit, retained);
-    Reg::LocalMemBar<Reg::MemType::VEC_STORE, Reg::MemType::VEC_LOAD>();
-    for (uint32_t offset = 0U; offset < alignedCount; offset += 64U) {
-        Reg::RegTensor<uint32_t> positions;
-        Reg::RegTensor<uint32_t> keys;
-        Reg::RegTensor<uint32_t> ids;
-        Reg::MaskReg inRange;
-        Reg::MaskReg hasKey;
-        Reg::MaskReg keep;
-        Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t> &>(positions),
-                    static_cast<int32_t>(offset));
-        Reg::LoadAlign<uint32_t>(keys, srcKeys + offset);
-        Reg::LoadAlign<uint32_t>(ids, srcIds + offset);
-        Reg::Compare<uint32_t, CMPMODE::LT>(inRange, positions, retainedLimit, all);
-        Reg::Compare<uint32_t, CMPMODE::GT>(hasKey, keys, zero, all);
-        Reg::And(keep, inRange, hasKey, all);
-        Reg::Select(keys, keys, zero, keep);
-        Reg::Select(ids, ids, invalidId, keep);
-        Reg::StoreAlign<uint32_t>(dstIds + offset, ids, all);
-        Reg::StoreAlign<uint32_t>(dstKeys + offset, keys, all);
-    }
-}
-
-__simd_vf__ void UnpackScoreRadixIds(__ubuf__ uint32_t *dstIds,
-                                     __ubuf__ uint32_t *sortedIds,
-                                     __ubuf__ uint32_t *sortedKeys,
-                                     uint32_t topK)
-{
-    Reg::MaskReg all = Reg::CreateMask<uint32_t, Reg::MaskPattern::ALL>();
-    Reg::RegTensor<uint32_t> zero;
-    Reg::RegTensor<uint32_t> invalidId;
-    Reg::Duplicate(zero, 0U);
-    Reg::Duplicate(invalidId, 0xffffffffU);
-    Reg::LocalMemBar<Reg::MemType::VEC_STORE, Reg::MemType::VEC_LOAD>();
-    for (uint32_t offset = 0U; offset < (topK + 63U) / 64U * 64U; offset += 64U) {
-        Reg::RegTensor<uint32_t> ids;
-        Reg::RegTensor<uint32_t> keys;
-        Reg::MaskReg hasKey;
-        Reg::LoadAlign<uint32_t>(ids, sortedIds + offset);
-        Reg::LoadAlign<uint32_t>(keys, sortedKeys + offset);
-        Reg::Compare<uint32_t, CMPMODE::GT>(hasKey, keys, zero, all);
-        Reg::Select(ids, ids, invalidId, hasKey);
-        Reg::StoreAlign<uint32_t>(dstIds + offset, ids, all);
     }
 }
 
@@ -505,92 +410,6 @@ __aicore__ inline bool ScoreWorse(float a, uint32_t ai, float b, uint32_t bi)
     return a < b || (a == b && ai > bi);
 }
 
-#if defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
-    ((ORIG_DTYPE_QUERY == DT_FLOAT16) || (ORIG_DTYPE_QUERY == DT_BF16))
-// 短行中的零分与正分候选处理。
-namespace UnderKVectorZero {
-enum class Result : uint32_t { NumericFallback=0, Ready=1, ImplementationFailure=2 };
-__aicore__ inline LocalTensor<float> Merge(LocalTensor<float> ping,LocalTensor<float> pong,uint32_t a){
- auto src=ping,dst=pong;
- for(uint32_t run=32;run<a;run*=4){
-  for(uint32_t start=0;start<a;start+=4*run){uint16_t count[4]={0,0,0,0};uint32_t offset[4]={start,start,start,start};uint32_t lists=0,total=0;
-   for(uint32_t j=0;j<4;++j)if(start+j*run<a){offset[j]=start+j*run;count[j]=uint16_t(Min(run,a-offset[j]));++lists;total+=count[j];}
-   if(lists==1){Adds<int32_t>(dst[start*2].ReinterpretCast<int32_t>(),src[start*2].ReinterpretCast<int32_t>(),0,total*2);}
-   else {MrgSortSrcList<float> input(src[offset[0]*2],src[offset[1]*2],src[offset[2]*2],src[offset[3]*2]);uint32_t consumed[4]={0,0,0,0};MrgSort<float,false>(dst[start*2],input,count,consumed,uint16_t((1U<<lists)-1U),1);}
-   PipeBarrier<PIPE_V>();
-  }
-  auto tmp=src;src=dst;dst=tmp;
- }
- return src;
-}
-// Isolated mechanism only. Numeric fallback is not an implementation-error recovery.
-__simd_vf__ void VZCompact(__ubuf__ uint32_t* out,__ubuf__ uint32_t* keys,
- __ubuf__ uint32_t* raw,__ubuf__ uint32_t* meta,uint32_t h,uint32_t kind,bool values){
- auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();uint32_t oneLane=1;auto single=Reg::UpdateMask<uint32_t>(oneLane);
- Reg::RegTensor<uint32_t> zero,one,zkey,limit,count;Reg::Duplicate(zero,0U);Reg::Duplicate(one,1U);Reg::Duplicate(zkey,0x80000000U);Reg::Duplicate(limit,h);Reg::Duplicate(count,0U);
- Reg::ClearSpr<SpecialPurposeReg::AR>();Reg::UnalignRegForStore align;
- for(uint32_t o=0;o < kNativeTopK; o += SparseTopK::kKeyLanes){Reg::RegTensor<uint32_t> k,lane,bits,packed,inc;Reg::MaskReg range,valid,eq,select;
-  Reg::LoadAlign(k,keys+o);Reg::LoadAlign(bits,raw+o);Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),int32_t(o));
-  Reg::Compare<uint32_t,CMPMODE::LT>(range,lane,limit,all);Reg::Compare<uint32_t,CMPMODE::GT>(valid,k,zero,all);Reg::Compare<uint32_t,CMPMODE::EQ>(eq,k,zkey,all);
-  if(kind==0)select=eq;else {Reg::Compare<uint32_t,CMPMODE::NE>(select,k,zkey,all);}
-  Reg::And(select,select,valid,all);Reg::And(select,select,range,all);Reg::Select(inc,one,zero,select);Reg::Add(count,count,inc,all);
-  Reg::Squeeze<uint32_t,Reg::GatherMaskMode::STORE_REG>(packed,values?bits:lane,select);Reg::StoreUnAlign<uint32_t,Reg::PostLiteral::POST_MODE_UPDATE>(out,packed,align);
- }Reg::StoreUnAlignPost(out,align);Reg::RegTensor<uint32_t> sum;Reg::Reduce<Reg::ReduceType::SUM>(sum,count,all);Reg::StoreAlign(meta,sum,single);
-}
-__simd_vf__ void VZOne(__ubuf__ uint32_t* pairs,__ubuf__ uint32_t* values,__ubuf__ uint32_t* ids){
- auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();Reg::RegTensor<uint32_t> zero,one,lane,odd,v,id,result;Reg::Duplicate(zero,0U);Reg::Duplicate(one,1U);Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),0);Reg::And(odd,lane,one,all);Reg::MaskReg chooseId;Reg::Compare<uint32_t,CMPMODE::NE>(chooseId,odd,zero,all);Reg::Gather(v,values,zero,all);Reg::Gather(id,ids,zero,all);Reg::Select(result,id,v,chooseId);Reg::StoreAlign(pairs,result,all);
-}
-__simd_vf__ void VZPad(__ubuf__ uint32_t* values,__ubuf__ uint32_t* ids,uint32_t n){
- auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();Reg::RegTensor<uint32_t> limit,negInf,invalid;Reg::Duplicate(limit,n);Reg::Duplicate(negInf,0xff800000U);Reg::Duplicate(invalid,0xffffffffU);
- for(uint32_t o=0;o < kNativeTopK; o += SparseTopK::kKeyLanes){Reg::RegTensor<uint32_t> lane,v,id;Reg::MaskReg keep;Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),int32_t(o));Reg::Compare<uint32_t,CMPMODE::LT>(keep,lane,limit,all);Reg::LoadAlign(v,values+o);Reg::LoadAlign(id,ids+o);Reg::Select(v,v,negInf,keep);Reg::Select(id,id,invalid,keep);Reg::StoreAlign(values+o,v,all);Reg::StoreAlign(ids+o,id,all);}
-}
-__simd_vf__ void VZFlags(__ubuf__ uint32_t* raw,__ubuf__ uint32_t* keys,__ubuf__ uint32_t* meta,uint32_t h){
- auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();uint32_t oneLane=1;auto single=Reg::UpdateMask<uint32_t>(oneLane);Reg::RegTensor<uint32_t> zero,one,limit,magmask,expmask,zkey,sub,pos;Reg::Duplicate(zero,0U);Reg::Duplicate(one,1U);Reg::Duplicate(limit,h);Reg::Duplicate(magmask,0x7fffffffU);Reg::Duplicate(expmask,0x7f800000U);Reg::Duplicate(zkey,0x80000000U);Reg::Duplicate(sub,0U);Reg::Duplicate(pos,0U);
- for(uint32_t o=0;o < kNativeTopK; o += SparseTopK::kKeyLanes){Reg::RegTensor<uint32_t> bits,k,lane,mag,exp,inc;Reg::MaskReg range,a,b,c;Reg::LoadAlign(bits,raw+o);Reg::LoadAlign(k,keys+o);Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),int32_t(o));Reg::Compare<uint32_t,CMPMODE::LT>(range,lane,limit,all);Reg::And(mag,bits,magmask,all);Reg::And(exp,bits,expmask,all);Reg::Compare<uint32_t,CMPMODE::EQ>(a,exp,zero,all);Reg::Compare<uint32_t,CMPMODE::GT>(b,mag,zero,all);Reg::And(c,a,b,all);Reg::And(c,c,range,all);Reg::Select(inc,one,zero,c);Reg::Add(sub,sub,inc,all);Reg::Compare<uint32_t,CMPMODE::GT>(a,k,zkey,all);Reg::And(a,a,range,all);Reg::Select(inc,one,zero,a);Reg::Add(pos,pos,inc,all);}
- Reg::RegTensor<uint32_t> sum;Reg::Reduce<Reg::ReduceType::SUM>(sum,pos,all);Reg::StoreAlign(meta+16,sum,single);Reg::Reduce<Reg::ReduceType::SUM>(sum,sub,all);Reg::StoreAlign(meta+24,sum,single);
-}
-__simd_vf__ void VZCheck(__ubuf__ uint32_t* pairs,__ubuf__ uint32_t* keys,__ubuf__ uint32_t* raw,__ubuf__ uint32_t* meta,uint32_t n,uint32_t h){
- auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();uint32_t oneLane=1;auto single=Reg::UpdateMask<uint32_t>(oneLane);Reg::RegTensor<uint32_t> zero,one,limit,hlimit,two,bad,ties;Reg::Duplicate(zero,0U);Reg::Duplicate(one,1U);Reg::Duplicate(limit,n);Reg::Duplicate(hlimit,h);Reg::Duplicate(two,2U);Reg::Duplicate(bad,0U);Reg::Duplicate(ties,0U);
- for(uint32_t o=0;o < kNativeTopK; o += SparseTopK::kKeyLanes){Reg::RegTensor<uint32_t> lane,idx,prev,id,pid,key,pkey,safe,inc,pairbits,expectedbits;Reg::MaskReg range,nonfirst,good,error,equal;Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),int32_t(o));Reg::Compare<uint32_t,CMPMODE::LT>(range,lane,limit,all);Reg::Mul(idx,lane,two,all);Reg::Add(idx,idx,one,all);Reg::Gather(id,pairs,idx,all);Reg::Compare<uint32_t,CMPMODE::LT>(good,id,hlimit,all);Reg::Select(safe,id,zero,good);Reg::Gather(key,keys,safe,all);Reg::Gather(expectedbits,raw,safe,all);Reg::Mul(idx,lane,two,all);Reg::Gather(pairbits,pairs,idx,all);Reg::Compare<uint32_t,CMPMODE::NE>(error,pairbits,expectedbits,all);Reg::And(error,error,range,all);Reg::Select(inc,one,zero,error);Reg::Add(bad,bad,inc,all);Reg::Compare<uint32_t,CMPMODE::GE>(error,id,hlimit,all);Reg::And(error,error,range,all);Reg::Select(inc,one,zero,error);Reg::Add(bad,bad,inc,all);
-  Reg::Compare<uint32_t,CMPMODE::GT>(nonfirst,lane,zero,all);Reg::Sub(prev,lane,one,all);Reg::Select(prev,prev,zero,nonfirst);Reg::Mul(idx,prev,two,all);Reg::Add(idx,idx,one,all);Reg::Gather(pid,pairs,idx,all);Reg::Compare<uint32_t,CMPMODE::LT>(good,pid,hlimit,all);Reg::Select(safe,pid,zero,good);Reg::Gather(pkey,keys,safe,all);Reg::And(nonfirst,nonfirst,range,all);Reg::Compare<uint32_t,CMPMODE::EQ>(error,id,pid,all);Reg::And(error,error,nonfirst,all);Reg::Select(inc,one,zero,error);Reg::Add(bad,bad,inc,all);Reg::Compare<uint32_t,CMPMODE::GT>(error,key,pkey,all);Reg::And(error,error,nonfirst,all);Reg::Select(inc,one,zero,error);Reg::Add(bad,bad,inc,all);Reg::Compare<uint32_t,CMPMODE::EQ>(equal,key,pkey,all);Reg::And(equal,equal,nonfirst,all);Reg::Select(inc,one,zero,equal);Reg::Add(ties,ties,inc,all);
- }Reg::RegTensor<uint32_t> sum;Reg::Reduce<Reg::ReduceType::SUM>(sum,bad,all);Reg::StoreAlign(meta,sum,single);Reg::Reduce<Reg::ReduceType::SUM>(sum,ties,all);Reg::StoreAlign(meta+8,sum,single);
-}
-__simd_vf__ void VZSplice(__ubuf__ uint32_t* output,__ubuf__ uint32_t* pairs,__ubuf__ uint32_t* zeros,uint32_t p,uint32_t z,uint32_t n){
- auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();uint32_t oneLane=1;auto single=Reg::UpdateMask<uint32_t>(oneLane);Reg::RegTensor<uint32_t> zero,one,two,pv,pz,total,invalid,zv,nv;Reg::Duplicate(zero,0U);Reg::Duplicate(one,1U);Reg::Duplicate(two,2U);Reg::Duplicate(pv,p);Reg::Duplicate(zv,z);Reg::Duplicate(nv,n);Reg::Duplicate(pz,p+z);Reg::Duplicate(total,n+z);Reg::Duplicate(invalid,0xffffffffU);
- for(uint32_t o=0;o < kNativeTopK; o += SparseTopK::kKeyLanes){Reg::RegTensor<uint32_t> lane,npos,zpos,idx,nid,zid,result;Reg::MaskReg positive,zeroRange,valid;Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),int32_t(o));Reg::Compare<uint32_t,CMPMODE::LT>(positive,lane,pv,all);Reg::Compare<uint32_t,CMPMODE::LT>(zeroRange,lane,pz,all);Reg::Compare<uint32_t,CMPMODE::LT>(valid,lane,total,all);Reg::Sub(npos,lane,zv,all);Reg::Select(npos,lane,npos,positive);Reg::Compare<uint32_t,CMPMODE::LT>(positive,npos,nv,all);Reg::Select(npos,npos,zero,positive);Reg::Mul(idx,npos,two,all);Reg::Add(idx,idx,one,all);Reg::Gather(nid,pairs,idx,all);Reg::Sub(zpos,lane,pv,all);Reg::Compare<uint32_t,CMPMODE::LT>(positive,zpos,zv,all);Reg::Select(zpos,zpos,zero,positive);Reg::Gather(zid,zeros,zpos,all);Reg::Compare<uint32_t,CMPMODE::GE>(positive,lane,pv,all);Reg::And(zeroRange,zeroRange,positive,all);Reg::Select(result,zid,nid,zeroRange);Reg::Select(result,result,invalid,valid);Reg::StoreAlign(output+o,result,all);}
-}
-__aicore__ inline Result Try(LocalTensor<uint8_t> b, GlobalTensor<float>& scores, uint64_t rowOffset, LocalTensor<uint32_t> outputIds, uint32_t h){
-    constexpr uint32_t kRowBytes = kNativeTopK * sizeof(uint32_t);
-    constexpr uint32_t kRawOffset = 0U;
-    constexpr uint32_t kKeysOffset = kRawOffset + kRowBytes;
-    constexpr uint32_t kValuesOffset = kKeysOffset + kRowBytes;
-    constexpr uint32_t kIdsOffset = kValuesOffset + kRowBytes;
-    constexpr uint32_t kZerosOffset = kIdsOffset + kRowBytes;
-    constexpr uint32_t kPingOffset = kZerosOffset + kRowBytes;
-    constexpr uint32_t kPongOffset = kPingOffset + kPairElements * kRowBytes;
-    constexpr uint32_t kMetaOffset = kPongOffset + kPairElements * kRowBytes;
-    static_assert(kMetaOffset + 4U * kDmaBlockBytes <= SelectionWorkspace::kOrderIds);
-    auto raw = b[kRawOffset].ReinterpretCast<uint32_t>();
-    auto keys = b[kKeysOffset].ReinterpretCast<uint32_t>();
-    auto values = b[kValuesOffset].ReinterpretCast<float>();
-    auto ids = b[kIdsOffset].ReinterpretCast<uint32_t>();
-    auto zeros = b[kZerosOffset].ReinterpretCast<uint32_t>();
-    auto ping = b[kPingOffset].ReinterpretCast<float>();
-    auto pong = b[kPongOffset].ReinterpretCast<float>();
-    auto meta = b[kMetaOffset].ReinterpretCast<uint32_t>();
- Duplicate(raw,0U,kNativeTopK);Duplicate(values.ReinterpretCast<uint32_t>(),0xff800000U,kNativeTopK);Duplicate(ids,0xffffffffU,kNativeTopK);Duplicate(zeros,0xffffffffU,kNativeTopK);PipeBarrier<PIPE_V>();SetFlag<HardEvent::V_MTE2>(EVENT_ID0);WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);DataCopyExtParams cp{1U,static_cast<uint32_t>(h * sizeof(float)),0U,0U,0U};DataCopyPadExtParams<float> pad{false,0U,0U,0.f};DataCopyPad(raw.ReinterpretCast<float>(),scores[rowOffset],cp,pad);SetFlag<HardEvent::MTE2_V>(EVENT_ID0);WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);Adds<int32_t>(keys.ReinterpretCast<int32_t>(),raw.ReinterpretCast<int32_t>(),0,kNativeTopK);PipeBarrier<PIPE_V>();VZFlags((__ubuf__ uint32_t*)raw.GetPhyAddr(),(__ubuf__ uint32_t*)keys.GetPhyAddr(),(__ubuf__ uint32_t*)meta.GetPhyAddr(),h);PipeBarrier<PIPE_V>();SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);if(meta.GetValue(24)){return Result::NumericFallback;}SparseTopK::PrepareFp32Keys((__ubuf__ uint32_t*)keys.GetPhyAddr(), h, kNativeTopK, kInvalidScore);PipeBarrier<PIPE_V>();VZFlags((__ubuf__ uint32_t*)raw.GetPhyAddr(),(__ubuf__ uint32_t*)keys.GetPhyAddr(),(__ubuf__ uint32_t*)meta.GetPhyAddr(),h);PipeBarrier<PIPE_V>();SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);
- if(meta.GetValue(24)){return Result::NumericFallback;}
- VZCompact((__ubuf__ uint32_t*)zeros.GetPhyAddr(),(__ubuf__ uint32_t*)keys.GetPhyAddr(),(__ubuf__ uint32_t*)raw.GetPhyAddr(),(__ubuf__ uint32_t*)meta.GetPhyAddr(),h,0,false);PipeBarrier<PIPE_V>();VZCompact((__ubuf__ uint32_t*)ids.GetPhyAddr(),(__ubuf__ uint32_t*)keys.GetPhyAddr(),(__ubuf__ uint32_t*)raw.GetPhyAddr(),(__ubuf__ uint32_t*)meta[8].GetPhyAddr(),h,1,false);PipeBarrier<PIPE_V>();VZCompact((__ubuf__ uint32_t*)values.GetPhyAddr(),(__ubuf__ uint32_t*)keys.GetPhyAddr(),(__ubuf__ uint32_t*)raw.GetPhyAddr(),(__ubuf__ uint32_t*)meta[8].GetPhyAddr(),h,1,true);PipeBarrier<PIPE_V>();SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);uint32_t z=meta.GetValue(0),n=meta.GetValue(8),p=meta.GetValue(16);uint32_t a=(n+31)/32*32;
- VZPad((__ubuf__ uint32_t*)values.GetPhyAddr(),(__ubuf__ uint32_t*)ids.GetPhyAddr(),n);PipeBarrier<PIPE_V>();
- if(n==1){VZOne((__ubuf__ uint32_t*)ping.GetPhyAddr(),(__ubuf__ uint32_t*)values.GetPhyAddr(),(__ubuf__ uint32_t*)ids.GetPhyAddr());PipeBarrier<PIPE_V>();}else if(n>1){Sort32<float>(ping,values,ids,a/32);PipeBarrier<PIPE_V>();}else{Duplicate(ping.ReinterpretCast<uint32_t>(),0xffffffffU,kNativeTopK * kPairElements);PipeBarrier<PIPE_V>();}auto sorted=n?Merge(ping,pong,a):ping;
- VZCheck((__ubuf__ uint32_t*)sorted.GetPhyAddr(),(__ubuf__ uint32_t*)keys.GetPhyAddr(),(__ubuf__ uint32_t*)raw.GetPhyAddr(),(__ubuf__ uint32_t*)meta.GetPhyAddr(),n,h);PipeBarrier<PIPE_V>();SetFlag<HardEvent::V_S>(EVENT_ID0);WaitFlag<HardEvent::V_S>(EVENT_ID0);if(meta.GetValue(0)){return Result::ImplementationFailure;}if(meta.GetValue(8)){return Result::NumericFallback;}
- VZSplice((__ubuf__ uint32_t*)outputIds.GetPhyAddr(),(__ubuf__ uint32_t*)sorted.GetPhyAddr(),(__ubuf__ uint32_t*)zeros.GetPhyAddr(),p,z,n);PipeBarrier<PIPE_V>();return Result::Ready;
-}
-
-}
-
-#endif
-
 // IRS chooses the radix implementation when instantiating its device entry.
 enum class Implementation : uint8_t {
     RadixMerge,
@@ -605,8 +424,6 @@ class Selector final {
     defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
     ((ORIG_DTYPE_QUERY == DT_FLOAT16) || (ORIG_DTYPE_QUERY == DT_BF16))
     friend struct IdCompactBatchPolicy;
-    friend struct SingleWindowPolicy;
-    friend struct ShortRowPolicy;
     friend struct JointRadixPolicy;
     __aicore__ inline void SelectHistoryTopKJoint(uint32_t group, uint32_t token,
         uint32_t history, uint32_t &retained);
@@ -620,7 +437,7 @@ public:
                                 uint64_t scoreStrideToken, uint32_t rout,
                                 uint32_t maxRegionLen, uint32_t topK,
                                 uint32_t maskMode, uint32_t regionSize,
-                                bool sortIds, uint32_t numRequests,
+                                uint32_t numRequests,
                                 uint32_t usedCubeCores, TPipe *pipe,
                                 bool alignedSelection = false,
                                 uint32_t batchBegin = 0U, uint32_t batchCount = 0U)
@@ -638,7 +455,6 @@ public:
         selectedStride_ = alignedSelection ? (topK + 7U) / 8U * 8U : topK;
         maskMode_ = maskMode;
         regionSize_ = regionSize;
-        sortIds_ = sortIds;
         numRequests_ = numRequests;
         cachedRequest_ = numRequests;
         usedCubeCores_ = usedCubeCores;
@@ -828,7 +644,7 @@ private:
         // IRS owns the row-length choice between independent TopK entries.
         if (topK_ > kSmallHeapMaxTopK) {
             if constexpr (implementation == Implementation::HighPrefixFp32) {
-                if (sortIds_ && history > topK_ &&
+                if (history > topK_ &&
                     history <= SparseIndexer::Common::Primitive::TopK::kMaxElements &&
                     TryHighPrefixTopK(group, token, history, retained)) {
                     return;
@@ -968,35 +784,6 @@ private:
                 }
             }
         }
-    }
-
-    __aicore__ inline void SortFinalRadixScores(uint32_t retained, LocalTensor<uint32_t> rankedKeys)
-    {
-        const uint32_t sortAligned = Align32(topK_);
-        LocalTensor<uint32_t> inputIds = sortTmp_.ReinterpretCast<uint32_t>();
-        LocalTensor<uint32_t> inputKeys = inputIds[kMaxTopK];
-        LocalTensor<uint32_t> outputIds = retained_.ReinterpretCast<uint32_t>();
-        LocalTensor<uint32_t> outputKeys = outputIds[kMaxTopK];
-        LocalTensor<uint8_t> radixScratch = merge_.ReinterpretCast<uint8_t>();
-        SetFlag<HardEvent::S_V>(EVENT_ID0);
-        WaitFlag<HardEvent::S_V>(EVENT_ID0);
-        PackScoreRadixInput(
-            reinterpret_cast<__ubuf__ uint32_t *>(inputIds.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(inputKeys.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(orderIndices_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(rankedKeys.GetPhyAddr()),
-            retained, sortAligned);
-        PipeBarrier<PIPE_V>();
-        Sort<uint32_t, uint32_t, false, kSortKeysDescending>(
-            outputKeys, outputIds, inputKeys, inputIds, radixScratch, sortAligned);
-        PipeBarrier<PIPE_V>();
-        UnpackScoreRadixIds(
-            reinterpret_cast<__ubuf__ uint32_t *>(orderIndices_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(outputIds.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(outputKeys.GetPhyAddr()), topK_);
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        scoreIdsReady_ = true;
     }
 
     __aicore__ inline void MergeRadixCandidates(LocalTensor<uint32_t> ids, LocalTensor<uint32_t> keys,
@@ -1177,89 +964,6 @@ private:
         }
     }
 
-    __aicore__ inline void SortSingleRadixSelection(LocalTensor<uint32_t> keys, LocalTensor<uint32_t> selected,
-        uint32_t retained)
-    {
-        const uint32_t alignedK = Align32(topK_);
-        for (uint32_t i = 0U; i < alignedK; ++i) {
-            if (i < retained) {
-                const uint32_t id = selected.GetValue(2U * i + 1U);
-                score_.SetValue(i, DecodeRadixKey(keys.GetValue(id)));
-                index_.SetValue(i, id);
-            } else {
-                score_.SetValue(i, -__builtin_inff());
-                index_.SetValue(i, 0xffffffffU);
-            }
-        }
-        SetFlag<HardEvent::S_V>(EVENT_ID0);
-        WaitFlag<HardEvent::S_V>(EVENT_ID0);
-        Sort<float, true>(chunkSorted_, score_, index_, sortTmp_, alignedK / 32U);
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        LocalTensor<uint32_t> sorted = chunkSorted_.ReinterpretCast<uint32_t>();
-        RestoreScoreTieOrder(sorted, selected, retained);
-    }
-
-    __aicore__ inline void RestoreScoreTieOrder(LocalTensor<uint32_t> sorted, LocalTensor<uint32_t> selected,
-        uint32_t retained)
-    {
-        // 排序无稳定平局保证，单独恢复同分候选的小编号优先。
-        uint32_t begin = 0U;
-        while (begin < retained) {
-            const float value = chunkSorted_.GetValue(2U * begin);
-            uint32_t end = begin + 1U;
-            while (end < retained && chunkSorted_.GetValue(2U * end) == value) {
-                ++end;
-            }
-            if (end - begin >= 32U) {
-                // 长同分段使用负编号向量排序，避免标量插入的平方开销。
-                SortLongScoreTie(sorted, selected, begin, end);
-            } else {
-                SortShortScoreTie(sorted, selected, begin, end);
-            }
-            begin = end;
-        }
-    }
-
-    __aicore__ inline void SortLongScoreTie(LocalTensor<uint32_t> sorted, LocalTensor<uint32_t> selected,
-        uint32_t begin, uint32_t end)
-    {
-        const uint32_t tieCount = end - begin;
-        const uint32_t tieAligned = Align32(tieCount);
-        for (uint32_t i = 0U; i < tieAligned; ++i) {
-            const uint32_t id = i < tieCount
-                ? sorted.GetValue(2U * (begin + i) + 1U) : 0xffffffffU;
-            score_.SetValue(i, i < tieCount
-                ? -static_cast<float>(id) : -__builtin_inff());
-            index_.SetValue(i, id);
-        }
-        SetFlag<HardEvent::S_V>(EVENT_ID0);
-        WaitFlag<HardEvent::S_V>(EVENT_ID0);
-        Sort<float, true>(merge_, score_, index_, sortTmp_, tieAligned / 32U);
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        LocalTensor<uint32_t> sortedTie = merge_.ReinterpretCast<uint32_t>();
-        for (uint32_t i = 0U; i < tieCount; ++i) {
-            selected.SetValue(2U * (begin + i) + 1U,
-                              sortedTie.GetValue(2U * i + 1U));
-        }
-    }
-
-    __aicore__ inline void SortShortScoreTie(LocalTensor<uint32_t> sorted, LocalTensor<uint32_t> selected,
-        uint32_t begin, uint32_t end)
-    {
-        for (uint32_t i = begin; i < end; ++i) {
-            const uint32_t id = sorted.GetValue(2U * i + 1U);
-            uint32_t pos = i;
-            while (pos > begin && selected.GetValue(2U * (pos - 1U) + 1U) > id) {
-                selected.SetValue(2U * pos + 1U,
-                                  selected.GetValue(2U * (pos - 1U) + 1U));
-                --pos;
-            }
-            selected.SetValue(2U * pos + 1U, id);
-        }
-    }
-
     __aicore__ inline void LoadRadixScoreTile(uint64_t offset, uint32_t count)
     {
         DataCopyExtParams copy{1U, static_cast<uint32_t>(count * sizeof(float)), 0U, 0U, 0U};
@@ -1340,7 +1044,7 @@ private:
         PrepareIncomingRadixCandidates(ScoreOffset(group, token), 0U, history,
             ids, keys, incomingKeys, incomingIds, retained);
         AppendRadixCandidates(rankedKeys, incomingKeys, incomingIds, 0U, retained);
-        FinishRankedCandidates(retained, rankedKeys);
+        FinishRankedCandidates();
     }
 
     // Select one window directly; no window-candidate merge is needed.
@@ -1364,17 +1068,12 @@ private:
                 ids, keys, incomingKeys, incomingIds, retained);
             AppendRadixCandidates(rankedKeys, incomingKeys, incomingIds, 0U, retained);
         }
-        FinishRankedCandidates(retained, rankedKeys);
+        FinishRankedCandidates();
     }
 
-    __aicore__ inline void FinishRankedCandidates(uint32_t retained,
-        LocalTensor<uint32_t> rankedKeys)
+    __aicore__ inline void FinishRankedCandidates()
     {
-        if (sortIds_) {
-            rankedIdsReady_ = true;
-        } else {
-            SortFinalRadixScores(retained, rankedKeys);
-        }
+        rankedIdsReady_ = true;
     }
 
     // The caller chooses this path only when more than one window is needed.
@@ -1415,7 +1114,7 @@ private:
                 mergedIds, retained, combined);
             retained = topK_;
         }
-        FinishRankedCandidates(retained, rankedKeys);
+        FinishRankedCandidates();
     }
 
     __aicore__ inline void SelectHistoryTopKRadix(uint32_t group, uint32_t token,
@@ -1446,7 +1145,7 @@ private:
             SparseTopK::PrepareFp32Keys(reinterpret_cast<__ubuf__ uint32_t *>(keys.GetPhyAddr()), count, aligned, kInvalidScore);
             PipeBarrier<PIPE_V>();
             FilterRadixCandidates(ids, keys, aligned);
-            if (singleTrunk && sortIds_) {
+            if (singleTrunk) {
                 TryAscendingRadixIds(ids, keys, count, retained, directMode);
                 if (directMode == 2U) {
                     continue;
@@ -1455,9 +1154,6 @@ private:
             SetFlag<HardEvent::V_S>(EVENT_ID0);
             WaitFlag<HardEvent::V_S>(EVENT_ID0);
             CollectRadixSelection(ids, keys, selected, count, start, singleTrunk, retained);
-            if (singleTrunk && !sortIds_ && retained != 0U) {
-                SortSingleRadixSelection(keys, selected, retained);
-            }
         }
         if (singleTrunk) {
             return;
@@ -1533,21 +1229,10 @@ private:
             WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
         } else {
             LocalTensor<uint32_t> retainedIds = retained_.ReinterpretCast<uint32_t>();
-            if (sortIds_) {
-                if (rankedIdsReady_) {
-                    SortRankedIds(retained);
-                } else {
-                    SortSelectedIds(retained);
-                }
-            } else if (!scoreIdsReady_) {
-                SetFlag<HardEvent::S_V>(EVENT_ID0);
-                WaitFlag<HardEvent::S_V>(EVENT_ID0);
-                ExtractScoreOrderedIds(
-                    reinterpret_cast<__ubuf__ uint32_t *>(orderIndices_.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t *>(retainedIds.GetPhyAddr()),
-                    retained, topK_);
-                SetFlag<HardEvent::V_S>(EVENT_ID0);
-                WaitFlag<HardEvent::V_S>(EVENT_ID0);
+            if (rankedIdsReady_) {
+                SortRankedIds(retained);
+            } else {
+                SortSelectedIds(retained);
             }
             DataCopyExtParams copy{1U, static_cast<uint32_t>(topK_ * sizeof(int32_t)), 0U, 0U, 0U};
             SetFlag<HardEvent::S_MTE3>(EVENT_ID0);
@@ -1563,33 +1248,11 @@ private:
     __aicore__ inline void ProcessRow(uint32_t row)
     {
         rankedIdsReady_ = false;
-        scoreIdsReady_ = false;
         prefixIdsReady_ = false;
         const uint32_t group = row / tokens_;
         const uint32_t token = row - group * tokens_ + batchBegin_;
         const uint32_t history = HistoryLength(token);
-#if defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
-    ((ORIG_DTYPE_QUERY == DT_FLOAT16) || (ORIG_DTYPE_QUERY == DT_BF16))
-        if (!sortIds_ && topK_ == kNativeTopK && history > 0U && history <= topK_) {
-            const uint64_t rowOffset = ScoreOffset(group, token);
-            const auto result = UnderKVectorZero::Try(ub_.Get<uint8_t>(), scores_,
-                rowOffset, orderIndices_, history);
-            if (result == UnderKVectorZero::Result::Ready) {
-                Store(row, 0U, 2U);
-                return;
-            }
-            if (result == UnderKVectorZero::Result::ImplementationFailure) {
-                Trap();
-                return;
-            }
-            // Discard every fast view before original SelectHistory reloads GM.
-            PipeBarrier<PIPE_ALL>();
-            SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            rankedIdsReady_ = false;
-            scoreIdsReady_ = false;
-        }
-#endif
+
         uint32_t retained = 0U;
         uint32_t directMode = 0U;
         if (history != 0U) {
@@ -1627,7 +1290,6 @@ private:
     uint32_t selectedStride_ = 0U;
     uint32_t maskMode_ = 0U;
     uint32_t regionSize_ = 0U;
-    bool sortIds_ = false;
     bool rankedIdsReady_ = false;
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && \
     defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
@@ -1635,7 +1297,6 @@ private:
     bool terminalIdOnly_ = false;
 #endif
     bool prefixIdsReady_ = false;
-    bool scoreIdsReady_ = false;
     uint32_t numRequests_ = 0U;
     uint32_t usedCubeCores_ = 0U;
     TPipe *pipe_ = nullptr;
@@ -1753,7 +1414,7 @@ struct JointRadixPolicy {
             PipeBarrier<PIPE_V>();
             s.FilterRadixCandidates(positions, keys, aligned);
             PipeBarrier<PIPE_V>();
-            const bool terminal = s.sortIds_ && start + n == history;
+            const bool terminal = start + n == history;
             GatherWindow(s, terminal, positions, keys, ranked, temporaryIds, retained, combined, start);
             PipeBarrier<PIPE_V>();
             CopyMergedIds(reinterpret_cast<__ubuf__ uint32_t *>(s.orderIndices_.GetPhyAddr()),
@@ -1762,7 +1423,7 @@ struct JointRadixPolicy {
             retained = s.topK_;
             s.terminalIdOnly_ = terminal;
         }
-        if (s.sortIds_) { s.rankedIdsReady_ = true; } else { s.SortFinalRadixScores(retained, ranked); }
+        s.rankedIdsReady_ = true;
     }
 
     __aicore__ static inline void GatherWindow(Selector &s, bool terminal,
@@ -1984,7 +1645,6 @@ struct IdCompactBatchPolicy {
     __aicore__ static inline void ProcessRow(Selector &selector, uint32_t row)
     {
         selector.rankedIdsReady_ = false;
-        selector.scoreIdsReady_ = false;
         selector.prefixIdsReady_ = false;
         const uint32_t group = row / selector.tokens_;
         const uint32_t token = row - group * selector.tokens_ + selector.batchBegin_;
@@ -2018,7 +1678,7 @@ __aicore__ __attribute__((noinline)) static void RunIdCompactBatch(GM_ADDR score
                             uint32_t groups, uint32_t tokens,
                             uint64_t scoreStrideGroup, uint64_t scoreStrideToken,
                             uint32_t rout, uint32_t maxRegionLen, uint32_t topK,
-                            uint32_t maskMode, uint32_t regionSize, bool sortIds,
+                            uint32_t maskMode, uint32_t regionSize,
                             uint32_t numRequests, uint32_t usedCubeCores,
                             TPipe *pipe, bool alignedSelection = false,
                             uint32_t batchBegin = 0U, uint32_t batchCount = 0U)
@@ -2029,101 +1689,11 @@ __aicore__ __attribute__((noinline)) static void RunIdCompactBatch(GM_ADDR score
     Selector selector;
     selector.Init(scores, actualKvLengths, cuSeqLens, selectedIds,
                   groups, tokens, scoreStrideGroup, scoreStrideToken, rout,
-                  maxRegionLen, topK, maskMode, regionSize, sortIds,
+                  maxRegionLen, topK, maskMode, regionSize,
                   numRequests, usedCubeCores, pipe, alignedSelection, batchBegin, batchCount);
     IdCompactBatchPolicy::Process(selector);
 }
 
-// SPDX-License-Identifier: LicenseRef-CANN-Open-Software-License-Agreement-2.0
-// Native resource-bounded score selector.
-struct SingleWindowPolicy final {
-    __aicore__ static inline void PrepareSingleWindowCandidates(Selector &selector, uint32_t group, uint32_t token,
-                                                         uint32_t history, uint32_t &retained)
-    {
-        const uint32_t aligned = AlignUp(history, kRadixBlockElements);
-        LocalTensor<uint8_t> base = selector.ub_.Get<uint8_t>();
-        LocalTensor<uint32_t> keys = base[SelectionWorkspace::kScore].ReinterpretCast<uint32_t>();
-        LocalTensor<uint32_t> positions = base[SelectionWorkspace::kRetained].ReinterpretCast<uint32_t>();
-        const uint64_t rowOffset = selector.ScoreOffset(group, token);
-        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        DataCopyExtParams copy{1U, static_cast<uint32_t>(history * sizeof(float)), 0U, 0U, 0U};
-        DataCopyPadExtParams<float> pad{false, 0U, 0U, 0.0F};
-        DataCopyPad(keys.ReinterpretCast<float>(), selector.scores_[rowOffset], copy, pad);
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        SparseTopK::PrepareFp32Keys(reinterpret_cast<__ubuf__ uint32_t *>(keys.GetPhyAddr()), history, aligned, kInvalidScore);
-        PipeBarrier<PIPE_V>();
-        selector.FilterRadixCandidates(positions, keys, aligned);
-        PipeBarrier<PIPE_V>();
-        GatherChunkCandidates(
-            reinterpret_cast<__ubuf__ uint32_t *>(selector.orderValues_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(selector.orderIndices_.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(positions.GetPhyAddr()),
-            reinterpret_cast<__ubuf__ uint32_t *>(keys.GetPhyAddr()), history, selector.topK_, 0U, true);
-        SetFlag<HardEvent::V_S>(EVENT_ID0);
-        WaitFlag<HardEvent::V_S>(EVENT_ID0);
-        retained = selector.topK_;
-    }
-
-    __aicore__ static inline void SelectHistoryTopKSingleWindow(Selector &selector, uint32_t group, uint32_t token,
-                                                        uint32_t history, uint32_t &retained)
-    {
-        PrepareSingleWindowCandidates(selector, group, token, history, retained);
-        // Raw keys, positions and histogram are dead; original Pack/Sort may reuse them.
-        selector.SortFinalRadixScores(retained, selector.orderValues_.ReinterpretCast<uint32_t>());
-    }
-
-    __aicore__ static inline void ProcessRow(Selector &selector, uint32_t row)
-    {
-        const uint32_t group = row / selector.tokens_;
-        const uint32_t token = row - group * selector.tokens_ + selector.batchBegin_;
-        const uint32_t history = selector.HistoryLength(token);
-        if (!selector.sortIds_ && selector.topK_ == kNativeTopK && history > kRadixTile &&
-            history <= SelectionWorkspace::kSingleWindowCapacity) {
-            selector.rankedIdsReady_ = false;
-            selector.scoreIdsReady_ = false;
-            uint32_t retained = 0U;
-            SelectHistoryTopKSingleWindow(selector, group, token, history, retained);
-            selector.Store(row, retained, 0U);
-            return;
-        }
-        selector.ProcessRow(row);
-    }
-
-    __aicore__ static inline void Process(Selector &selector)
-    {
-        // HistoryLength is bounded by maxRegionLen_: no window can match this arena.
-        if (selector.maxRegionLen_ <= kRadixTile || selector.sortIds_ || selector.topK_ != kNativeTopK) {
-            selector.Process();
-            return;
-        }
-        SingleWindowPolicy policy;
-        selector.ProcessRows(policy);
-    }
-
-};
-
-__aicore__ __attribute__((noinline)) static void RunSingleWindow(GM_ADDR scores, GM_ADDR actualKvLengths,
-                            GM_ADDR cuSeqLens, GM_ADDR selectedIds,
-                            uint32_t groups, uint32_t tokens,
-                            uint64_t scoreStrideGroup, uint64_t scoreStrideToken,
-                            uint32_t rout, uint32_t maxRegionLen, uint32_t topK,
-                            uint32_t maskMode, uint32_t regionSize, bool sortIds,
-                            uint32_t numRequests, uint32_t usedCubeCores,
-                            TPipe *pipe, bool alignedSelection = false,
-                            uint32_t batchBegin = 0U, uint32_t batchCount = 0U)
-{
-    if ASCEND_IS_AIC {
-        return;
-    }
-    Selector selector;
-    selector.Init(scores, actualKvLengths, cuSeqLens, selectedIds,
-                  groups, tokens, scoreStrideGroup, scoreStrideToken, rout,
-                  maxRegionLen, topK, maskMode, regionSize, sortIds,
-                  numRequests, usedCubeCores, pipe, alignedSelection, batchBegin, batchCount);
-    SingleWindowPolicy::Process(selector);
-}
 
 #endif
 
@@ -2134,7 +1704,7 @@ __aicore__ inline void Run(GM_ADDR scores, GM_ADDR actualKvLengths,
                             uint32_t groups, uint32_t tokens,
                             uint64_t scoreStrideGroup, uint64_t scoreStrideToken,
                             uint32_t rout, uint32_t maxRegionLen, uint32_t topK,
-                            uint32_t maskMode, uint32_t regionSize, bool sortIds,
+                            uint32_t maskMode, uint32_t regionSize,
                             uint32_t numRequests, uint32_t usedCubeCores,
                             TPipe *pipe, bool alignedSelection = false,
                             uint32_t batchBegin = 0U, uint32_t batchCount = 0U)
@@ -2145,7 +1715,7 @@ __aicore__ inline void Run(GM_ADDR scores, GM_ADDR actualKvLengths,
     Selector selector;
     selector.Init(scores, actualKvLengths, cuSeqLens, selectedIds,
                   groups, tokens, scoreStrideGroup, scoreStrideToken, rout,
-                  maxRegionLen, topK, maskMode, regionSize, sortIds,
+                  maxRegionLen, topK, maskMode, regionSize,
                   numRequests, usedCubeCores, pipe, alignedSelection, batchBegin, batchCount);
     selector.Process<implementation>();
 }
@@ -2241,317 +1811,5 @@ __aicore__ inline void Compact(GM_ADDR scratch, GM_ADDR selectedIds,
 
 } // 命名空间结束。
 } // 命名空间结束。
-
-#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && \
-    defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
-    ((ORIG_DTYPE_QUERY == DT_FLOAT16) || (ORIG_DTYPE_QUERY == DT_BF16))
-namespace IndexerRegionScore {
-namespace FusedSelect {
-// SPDX-License-Identifier: LicenseRef-CANN-Open-Software-License-Agreement-2.0
-// Native-only short-row backend.
-#ifndef IRS_D2_PREPARED_KEY_RANK_H
-#define IRS_D2_PREPARED_KEY_RANK_H
-// Prepared-key ranking for the short-row selector.
-// Preconditions: h<=128, keys point to ceil(h/64)*64 initialized uint32s,
-// out points to 512 uint32s, aligned UB, nonoverlapping, original contiguous IDs.
-// The caller prepares the keys using the shared FP32 conversion.
-__simd_vf__ void ShortRowPreparedKeyRank(__ubuf__ uint32_t* out,
-                                       __ubuf__ uint32_t* keys, uint32_t h)
-{
-    auto all = Reg::CreateMask<uint32_t, Reg::MaskPattern::ALL>();
-    Reg::RegTensor<uint32_t> zero, one, invalid;
-    Reg::Duplicate(zero, 0U);
-    Reg::Duplicate(one, 1U);
-    Reg::Duplicate(invalid, 0xffffffffU);
-    for (uint32_t o = 0; o < kNativeTopK; o += SparseTopK::kKeyLanes) {
-        Reg::StoreAlign(out + o, invalid, all);
-    }
-    // Finish caller's prepared-key stores before the first vector/broadcast load.
-    Reg::LocalMemBar<Reg::MemType::VEC_STORE, Reg::MemType::VEC_LOAD>();
-    // A late fill must not overwrite Scatter. Scatter indices are ELEMENTS.
-    Reg::LocalMemBar<Reg::MemType::VEC_STORE, Reg::MemType::VEC_STORE>();
-    for (uint32_t o = 0; o < h; o += 64) {
-        Reg::RegTensor<uint32_t> keyI, ids, rank;
-        Reg::MaskReg inRange, positive, valid;
-        Reg::LoadAlign(keyI, keys + o);
-        // SDK Arange supports signed int32; IDs 0..127 have identical bits.
-        Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(ids), static_cast<int32_t>(o));
-        Reg::Duplicate(rank, 0U);
-        Reg::Compares<uint32_t, CMPMODE::LT>(inRange, ids, h, all);
-        Reg::Compare<uint32_t, CMPMODE::GT>(positive, keyI, zero, all);
-        Reg::And(valid, inRange, positive, all);
-        // All candidates before this register win ties. All candidates
-        // after it lose ties, so those chunks need only one comparison.
-        for (uint32_t j = 0; j < o; ++j) {
-            Reg::RegTensor<uint32_t> keyJ, inc;
-            Reg::MaskReg wins;
-            Reg::LoadAlign<uint32_t, Reg::LoadDist::DIST_BRC_B32>(keyJ, keys + j);
-            Reg::Compare<uint32_t, CMPMODE::GE>(wins, keyJ, keyI, all);
-            Reg::Select(inc, one, zero, wins);
-            Reg::Add(rank, rank, inc, all);
-        }
-        const uint32_t groupEnd = h < o + 64U ? h : o + 64U;
-        for (uint32_t j = o; j < groupEnd; ++j) {
-            Reg::RegTensor<uint32_t> keyJ, inc;
-            Reg::MaskReg greater, equal, earlier, tie, wins;
-            Reg::LoadAlign<uint32_t, Reg::LoadDist::DIST_BRC_B32>(keyJ, keys + j);
-            Reg::Compare<uint32_t, CMPMODE::GT>(greater, keyJ, keyI, all);
-            Reg::Compare<uint32_t, CMPMODE::EQ>(equal, keyJ, keyI, all);
-            Reg::Compares<uint32_t, CMPMODE::GT>(earlier, ids, j, all);
-            Reg::And(tie, equal, earlier, all);
-            Reg::Or(wins, greater, tie, all);
-            Reg::Select(inc, one, zero, wins);
-            Reg::Add(rank, rank, inc, all);
-        }
-        for (uint32_t j = groupEnd; j < h; ++j) {
-            Reg::RegTensor<uint32_t> keyJ, inc;
-            Reg::MaskReg wins;
-            Reg::LoadAlign<uint32_t, Reg::LoadDist::DIST_BRC_B32>(keyJ, keys + j);
-            Reg::Compare<uint32_t, CMPMODE::GT>(wins, keyJ, keyI, all);
-            Reg::Select(inc, one, zero, wins);
-            Reg::Add(rank, rank, inc, all);
-        }
-        Reg::Scatter<uint32_t, uint32_t>(out, ids, rank, valid);
-    }
-}
-
-#endif
-
-#ifndef IRS_D2_PREPARED_KEY_NETWORK_UNROLLED_H
-#define IRS_D2_PREPARED_KEY_NETWORK_UNROLLED_H
-// No runtime K/J/group loops. All stages and group identity are constants.
-template<uint32_t K,uint32_t J,uint32_t BASE>
-__simd_callee__ inline void NetworkStage(Reg::RegTensor<uint32_t>& keys,
-                                        Reg::RegTensor<uint32_t>& ids,
-                                        Reg::RegTensor<uint32_t>& lane,
-                                        Reg::MaskReg& all)
-{
-    Reg::RegTensor<uint32_t> index,tmp,constant,partnerK,partnerI,zero;
-    Reg::Duplicate(zero,0U);
-    Reg::Duplicate(constant,J);Reg::Xor(index,lane,constant,all);
-    Reg::Gather(partnerK,keys,index);Reg::Gather(partnerI,ids,index);
-    Reg::MaskReg gt,eq,lt,tie,better,kZero,jNonZero,wantBest,take;
-    Reg::Compare<uint32_t,CMPMODE::GT>(gt,keys,partnerK,all);
-    Reg::Compare<uint32_t,CMPMODE::EQ>(eq,keys,partnerK,all);
-    Reg::Compare<uint32_t,CMPMODE::LT>(lt,ids,partnerI,all);
-    Reg::And(tie,eq,lt,all);Reg::Or(better,gt,tie,all);
-    if constexpr(K<64) {
-        Reg::Duplicate(constant,K);Reg::And(tmp,lane,constant,all);
-        Reg::Compare<uint32_t,CMPMODE::EQ>(kZero,tmp,zero,all);
-    } else {
-        // Global position's K bit is constant within each 64-lane group.
-        if constexpr((BASE&K)==0) Reg::Compare<uint32_t,CMPMODE::EQ>(kZero,zero,zero,all);
-        else Reg::Compare<uint32_t,CMPMODE::GT>(kZero,zero,zero,all);
-    }
-    Reg::Duplicate(constant,J);Reg::And(tmp,lane,constant,all);
-    Reg::Compare<uint32_t,CMPMODE::GT>(jNonZero,tmp,zero,all);
-    Reg::Xor(wantBest,kZero,jNonZero,all);Reg::Xor(take,better,wantBest,all);
-    Reg::Select(keys,partnerK,keys,take);Reg::Select(ids,partnerI,ids,take);
-}
-
-template<uint32_t C,uint32_t K,uint32_t J>
-__simd_callee__ inline void NetworkStages(Reg::RegTensor<uint32_t>& k0,
-                                         Reg::RegTensor<uint32_t>& i0,
-                                         Reg::RegTensor<uint32_t>& k1,
-                                         Reg::RegTensor<uint32_t>& i1,
-                                         Reg::RegTensor<uint32_t>& lane,
-                                         Reg::MaskReg& all)
-{
-    if constexpr(J==64) {
-        Reg::MaskReg gt,eq,lt,tie,better;
-        Reg::Compare<uint32_t,CMPMODE::GT>(gt,k0,k1,all);
-        Reg::Compare<uint32_t,CMPMODE::EQ>(eq,k0,k1,all);
-        Reg::Compare<uint32_t,CMPMODE::LT>(lt,i0,i1,all);
-        Reg::And(tie,eq,lt,all);Reg::Or(better,gt,tie,all);
-        Reg::RegTensor<uint32_t> lowK,lowI,highK,highI;
-        Reg::Select(lowK,k0,k1,better);Reg::Select(lowI,i0,i1,better);
-        Reg::Select(highK,k1,k0,better);Reg::Select(highI,i1,i0,better);
-        Reg::Move(k0,lowK);Reg::Move(i0,lowI);
-        Reg::Move(k1,highK);Reg::Move(i1,highI);
-    } else {
-        NetworkStage<K,J,0>(k0,i0,lane,all);
-        if constexpr(C==128) NetworkStage<K,J,64>(k1,i1,lane,all);
-    }
-    if constexpr(J>1) NetworkStages<C,K,J/2>(k0,i0,k1,i1,lane,all);
-    else if constexpr(K<C) NetworkStages<C,K*2,K>(k0,i0,k1,i1,lane,all);
-}
-
-template<uint32_t C>
-__simd_vf__ void ShortRowPreparedKeyNetworkFixed(__ubuf__ uint32_t* out,
-                                               __ubuf__ uint32_t* keys,uint32_t h)
-{
-    auto all=Reg::CreateMask<uint32_t,Reg::MaskPattern::ALL>();
-    Reg::RegTensor<uint32_t> invalid,zero;
-    Reg::Duplicate(invalid,0xffffffffU);Reg::Duplicate(zero,0U);
-    for(uint32_t o=0;o < kNativeTopK; o += SparseTopK::kKeyLanes) Reg::StoreAlign(out+o,invalid,all);
-    if(h==0) return;
-    Reg::LocalMemBar<Reg::MemType::VEC_STORE,Reg::MemType::VEC_LOAD>();
-    Reg::LocalMemBar<Reg::MemType::VEC_STORE,Reg::MemType::VEC_STORE>();
-    Reg::RegTensor<uint32_t> k0,i0,k1,i1,lane;
-    Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(lane),0);
-    Reg::Move(i0,lane);
-    Reg::LoadAlign(k0,keys);
-    Reg::MaskReg valid;
-    Reg::Compares<uint32_t,CMPMODE::LT>(valid,i0,h,all);
-    Reg::Select(k0,k0,zero,valid);
-    if constexpr(C==128) {
-        Reg::Arange(reinterpret_cast<Reg::RegTensor<int32_t>&>(i1),64);
-        Reg::LoadAlign(k1,keys+64);
-        Reg::Compares<uint32_t,CMPMODE::LT>(valid,i1,h,all);
-        Reg::Select(k1,k1,zero,valid);
-    }
-    NetworkStages<C,2,1>(k0,i0,k1,i1,lane,all);
-    Reg::Compare<uint32_t,CMPMODE::GT>(valid,k0,zero,all);
-    if constexpr(C==32) {
-        Reg::MaskReg low;
-        Reg::Compares<uint32_t,CMPMODE::LT>(low,lane,32U,all);
-        Reg::And(valid,valid,low,all);
-    }
-    Reg::Select(i0,i0,invalid,valid);Reg::StoreAlign(out,i0,all);
-    if constexpr(C==128) {
-        Reg::Compare<uint32_t,CMPMODE::GT>(valid,k1,zero,all);
-        Reg::Select(i1,i1,invalid,valid);Reg::StoreAlign(out+64,i1,all);
-    }
-}
-
-#endif
-
-// Measured conservative switch point; not a claim of the exact crossover in81..95.
-constexpr uint32_t kShortRowNetworkBegin = 96U;
-struct ShortRowPolicy final {
-    // Only scalar descriptors persist between phases (8 * (4 + 4 + 8) bytes).
-    __aicore__ static inline void Flush(Selector &selector, const uint32_t *rows,
-                                      const uint32_t *histories, const uint64_t *scoreOffsets,
-                                      uint32_t &count)
-    {
-        if (count == 0U) {
-            return;
-        }
-        SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-        const uint32_t rowStep = selector.usedCubeCores_ * GetTaskRation();
-        const bool stridedBatch = count >= 4U && selector.groups_ == 1U &&
-            selector.scoreStrideToken_ == kNativeShortRowCapacity;
-        DataCopyPadExtParams<float> pad{false, 0U, 0U, 0.0F};
-        if (stridedBatch) {
-            constexpr uint32_t rowBytes = kNativeShortRowCapacity * sizeof(float);
-            DataCopyExtParams copy{static_cast<uint16_t>(count), rowBytes, (rowStep - 1U) * rowBytes, 0U, 0U};
-            DataCopyPad(selector.score_, selector.scores_[scoreOffsets[0]], copy, pad);
-        } else {
-            for (uint32_t slot = 0U; slot < count; ++slot) {
-                if (histories[slot] == 0U) {
-                    continue;
-                }
-                LocalTensor<uint32_t> keys = selector.score_.ReinterpretCast<uint32_t>()[slot * kNativeShortRowCapacity];
-                keys.SetSize(kNativeShortRowCapacity);
-                DataCopyExtParams copy{1U, static_cast<uint32_t>(histories[slot] * sizeof(float)),
-                                       0U, 0U, 0U};
-                DataCopyPad(keys.ReinterpretCast<float>(), selector.scores_[scoreOffsets[slot]], copy, pad);
-            }
-        }
-        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        for (uint32_t slot = 0U; slot < count; ++slot) {
-            if (histories[slot] == 0U) {
-                continue;
-            }
-            LocalTensor<uint32_t> keys = selector.score_.ReinterpretCast<uint32_t>()[slot * kNativeShortRowCapacity];
-            keys.SetSize(kNativeShortRowCapacity);
-            const uint32_t history = histories[slot];
-            const uint32_t aligned = (history + 63U) / 64U * 64U;
-            SparseTopK::PrepareFp32Keys(reinterpret_cast<__ubuf__ uint32_t *>(keys.GetPhyAddr()), history, aligned, kInvalidScore);
-        }
-        PipeBarrier<PIPE_V>();
-        for (uint32_t slot = 0U; slot < count; ++slot) {
-            LocalTensor<uint32_t> keys = selector.score_.ReinterpretCast<uint32_t>()[slot * kNativeShortRowCapacity];
-            keys.SetSize(kNativeShortRowCapacity);
-            LocalTensor<uint32_t> outputIds = selector.index_[slot * kNativeTopK];
-            outputIds.SetSize(kNativeTopK);
-            const uint32_t history = histories[slot];
-            if (history < kShortRowNetworkBegin) {
-                ShortRowPreparedKeyRank(
-                    reinterpret_cast<__ubuf__ uint32_t *>(outputIds.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t *>(keys.GetPhyAddr()), history);
-            } else {
-                ShortRowPreparedKeyNetworkFixed<kNativeShortRowCapacity>(
-                    reinterpret_cast<__ubuf__ uint32_t *>(outputIds.GetPhyAddr()),
-                    reinterpret_cast<__ubuf__ uint32_t *>(keys.GetPhyAddr()), history);
-            }
-        }
-        PipeBarrier<PIPE_V>();
-        SetFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        WaitFlag<HardEvent::V_MTE3>(EVENT_ID0);
-        constexpr uint32_t idsRowBytes = kNativeTopK * sizeof(int32_t);
-        if (stridedBatch) {
-            DataCopyExtParams copy{static_cast<uint16_t>(count), idsRowBytes, 0U, (rowStep - 1U) * idsRowBytes, 0U};
-            DataCopyPad(selector.selectedIds_[selector.SelectedOffset(rows[0])],
-                        selector.index_.ReinterpretCast<int32_t>(), copy);
-        } else {
-            for (uint32_t slot = 0U; slot < count; ++slot) {
-                LocalTensor<uint32_t> outputIds = selector.index_[slot * kNativeTopK];
-                outputIds.SetSize(kNativeTopK);
-                DataCopyExtParams copy{1U, idsRowBytes, 0U, 0U, 0U};
-                DataCopyPad(selector.selectedIds_[selector.SelectedOffset(rows[slot])],
-                            outputIds.ReinterpretCast<int32_t>(), copy);
-            }
-        }
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE3_S>(EVENT_ID0);
-        count = 0U;
-    }
-
-    struct RowBatch {
-        uint32_t rows[kNativeShortRowBatch];
-        uint32_t histories[kNativeShortRowBatch];
-        uint64_t scoreOffsets[kNativeShortRowBatch];
-        uint32_t count = 0U;
-
-        __aicore__ inline void ProcessRow(Selector &selector, uint32_t row)
-        {
-            const uint32_t group = row / selector.tokens_;
-            const uint32_t token = row - group * selector.tokens_ + selector.batchBegin_;
-            // The unchanged outer dispatch guarantees history <=128.
-            rows[count] = row;
-            histories[count] = selector.HistoryLength(token);
-            scoreOffsets[count] = selector.ScoreOffset(group, token);
-            ++count;
-            if (count == kNativeShortRowBatch) {
-                Flush(selector, rows, histories, scoreOffsets, count);
-            }
-        }
-    };
-
-    __aicore__ static inline void Process(Selector &selector)
-    {
-        RowBatch batch;
-        selector.ProcessRows(batch);
-        Flush(selector, batch.rows, batch.histories, batch.scoreOffsets, batch.count);
-    }
-
-};
-
-__aicore__ __attribute__((noinline)) static void RunShortRows(GM_ADDR scores, GM_ADDR actualKvLengths,
-                            GM_ADDR cuSeqLens, GM_ADDR selectedIds,
-                            uint32_t groups, uint32_t tokens,
-                            uint64_t scoreStrideGroup, uint64_t scoreStrideToken,
-                            uint32_t rout, uint32_t maxRegionLen, uint32_t topK,
-                            uint32_t maskMode, uint32_t regionSize, bool sortIds,
-                            uint32_t numRequests, uint32_t usedCubeCores,
-                            TPipe *pipe, bool alignedSelection = false,
-                            uint32_t batchBegin = 0U, uint32_t batchCount = 0U)
-{
-    if ASCEND_IS_AIC {
-        return;
-    }
-    Selector selector;
-    selector.Init(scores, actualKvLengths, cuSeqLens, selectedIds,
-                  groups, tokens, scoreStrideGroup, scoreStrideToken, rout,
-                  maxRegionLen, topK, maskMode, regionSize, sortIds,
-                  numRequests, usedCubeCores, pipe, alignedSelection, batchBegin, batchCount);
-    ShortRowPolicy::Process(selector);
-}
-}
-}
-#endif
 
 #endif // 头文件保护结束。

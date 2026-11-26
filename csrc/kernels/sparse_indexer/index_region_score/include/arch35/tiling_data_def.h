@@ -10,15 +10,19 @@
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK0_TOPK 1
 #define INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_TOPK 12
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_TOPK 13
+// Legacy score-order key. Reserved after removal of that output mode.
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_B8_TOPK 77ULL
 #define INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_H4_TAIL_TOPK 140ULL
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_H4_TAIL_TOPK 141ULL
 
 namespace IndexerRegionScore {
 
+// Preserve the region-ID order bit in the existing selectionConfig POD layout.
+inline constexpr uint32_t kSelectionRegionIdOrder = 1U << 16U;
+
 // 位 [1:0] 为缓存模式：0 连续、1 分页，2/3 保留。
 // 位 [5:2] 为 maskMode 原值，预留 0..9，目前支持 0/3。
-// 位 [6] 为 TopK 选择策略：0 默认选择，1 短行特化选择。
+// 位 [6] 保留，原用于分数降序的短行特化。
 // 位 [7] 启用逻辑 R 尾块下完整 H4 tile 的批量归约。
 // TopK 始终执行；位 [63:8] 必须为零。
 // TopK 数量、排序/对齐标志和权重类型仍保存在 POD 中。

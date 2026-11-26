@@ -6,7 +6,9 @@ from itertools import accumulate
 def golden(torch, query, weights, key_summary, *, actual_kv_lengths=None,
            block_table=None, cu_seq_lens=None, mask_mode=0, head_scale=1.0,
            cache_mode=0, max_region_len=-1, region_size=8, top_k=512,
-           sort_mode=1, return_score=True):
+           sort_mode=0, return_score=True):
+    if sort_mode != 0:
+        raise ValueError("sort_mode must be 0 (ascending region ID)")
     tokens, groups, heads, dim = query.shape
     regions = key_summary.shape[0] if max_region_len == -1 else max_region_len
     scores = torch.full((groups, tokens, regions), -float("inf"), dtype=torch.float32)
@@ -35,15 +37,14 @@ def golden(torch, query, weights, key_summary, *, actual_kv_lengths=None,
                 scores[group, token, :visible] = values.float()
                 valid = [index for index, value in enumerate(values.tolist()) if value > -1.0e29]
                 ranked = sorted(valid, key=lambda index: (-float(values[index]), index))[:top_k]
-                if sort_mode == 1:
-                    ranked.sort()
+                ranked.sort()
                 selected[group, token, :len(ranked)] = torch.tensor(ranked, dtype=torch.int32)
     return (scores if return_score else torch.empty(0, dtype=torch.float32)), selected
 
 
 def sample(torch, torch_npu, *, dtype="bfloat16", weight_dtype="float32", paged=False,
            causal=True, return_score=True, dim=256, heads=4, groups=1,
-           request_lengths=(3, 2), regions=33, page_size=16, top_k=8, sort_mode=1,
+           request_lengths=(3, 2), regions=33, page_size=16, top_k=8,
            pitched=False, max_region_len=None):
     tokens = sum(request_lengths)
     rng = torch.Generator().manual_seed(20261124 + dim + regions + top_k)
@@ -70,7 +71,7 @@ def sample(torch, torch_npu, *, dtype="bfloat16", weight_dtype="float32", paged=
     effective_regions = regions if max_region_len is None else max_region_len
     options = dict(mask_mode=3 if causal else 0, head_scale=0.5, cache_mode=int(paged),
                    max_region_len=effective_regions, region_size=8, top_k=top_k,
-                   sort_mode=sort_mode, return_score=return_score)
+                   sort_mode=0, return_score=return_score)
     cpu_options = dict(options, actual_kv_lengths=lengths if causal else None,
                        block_table=table, cu_seq_lens=cu)
     expected = golden(torch, q, weights, key, **cpu_options)
@@ -89,10 +90,10 @@ def sample(torch, torch_npu, *, dtype="bfloat16", weight_dtype="float32", paged=
 CASE_PARAMETERS = (
     dict(),
     dict(return_score=False),
-    dict(paged=True, pitched=True, dim=128, dtype="float16", sort_mode=0),
+    dict(paged=True, pitched=True, dim=128, dtype="float16"),
     dict(paged=True, pitched=True, return_score=False, dim=128, top_k=64),
     dict(paged=True, causal=False, dtype="float8_e4m3fn", regions=48, page_size=16, weight_dtype="bfloat16"),
-    dict(causal=False, groups=4, heads=8, weight_dtype="float16", sort_mode=0),
+    dict(causal=False, groups=4, heads=8, weight_dtype="float16"),
     dict(paged=True, max_region_len=0, top_k=512),
 )
 TOLERANCES = ((0.02, 0.003), (0, 0))

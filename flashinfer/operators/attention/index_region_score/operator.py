@@ -22,8 +22,10 @@ def infer(arguments, layouts):
             raise ValueError(name + " must be an integer")
     if attrs["mask_mode"] not in (0, 3) or attrs["cache_mode"] not in (0, 1):
         raise ValueError("mask_mode must be 0 or 3 and cache_mode must be 0 or 1")
-    if not 1 <= attrs["top_k"] <= 4096 or attrs["sort_mode"] not in (0, 1):
-        raise ValueError("top_k must be in [1,4096] and sort_mode must be 0 or 1")
+    if not 1 <= attrs["top_k"] <= 4096:
+        raise ValueError("top_k must be in [1,4096]")
+    if attrs["sort_mode"] != 0:
+        raise ValueError("sort_mode must be 0 (ascending region ID)")
     if not 1 <= attrs["region_size"] <= 2**31 - 1:
         raise ValueError("region_size must be in [1,2147483647]")
     scale = attrs["head_scale"]
@@ -98,8 +100,13 @@ def infer(arguments, layouts):
 
 OPERATOR = OperatorDefinition(
     name="index_region_score", domain="attention", op=OP,
-    schema="(Tensor query, Tensor weights, Tensor key_summary, *, Tensor? actual_kv_lengths=None, Tensor? block_table=None, Tensor? cu_seq_lens=None, int mask_mode=0, float head_scale=1.0, int cache_mode=0, int max_region_len=-1, int region_size=8, int top_k=512, int sort_mode=1, bool return_score=True) -> (Tensor, Tensor)",
+    schema="(Tensor query, Tensor weights, Tensor key_summary, *, Tensor? actual_kv_lengths=None, Tensor? block_table=None, Tensor? cu_seq_lens=None, int mask_mode=0, float head_scale=1.0, int cache_mode=0, int max_region_len=-1, int region_size=8, int top_k=512, int sort_mode=0, bool return_score=True) -> (Tensor, Tensor)",
     output_names=("score", "selected_region_ids"), infer=infer,
     tensor_shapes=(("T", "G", "H", "D"), ("T", "G", "H")),
-    description="Sum weighted ReLU query-key products over heads, then select request-local regions. sort_mode=0 orders by descending score and sort_mode=1 by ascending region ID. IDs are padded with -1. return_score=False returns an empty score Tensor and bounded-workspace IDs.",
+    description=(
+        "Sum weighted ReLU query-key products over heads, then select request-local regions. "
+        "The only supported sort_mode is 0, which returns selected IDs in ascending region ID order. "
+        "IDs are padded with -1. "
+        "return_score=False returns an empty score Tensor and bounded-workspace IDs."
+    ),
 )
