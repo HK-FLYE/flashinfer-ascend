@@ -108,7 +108,10 @@ def test_all_missing_dependency_reports_unbuilt_kernel_before_compilation(monkey
     monkeypatch.setattr(build, "_publish", lambda *args: pytest.fail("must not compile a partial all release"))
     with pytest.raises(SchemaError, match="not built due to missing dependency catlass") as caught:
         build.build_production_packages(output_dir=tmp_path / "release", source_root=tmp_path)
-    assert FLASH_ATTENTION_KERNEL_ID in str(caught.value)
+    assert str(caught.value).startswith(
+        "ascendc/attention/index_region_score/catlass/Ascend950"
+        " not built due to missing dependency catlass:"
+    )
     assert "FLASHINFER_CATLASS_ROOT" in str(caught.value)
     assert not (tmp_path / "release").exists()
 
