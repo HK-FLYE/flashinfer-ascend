@@ -10,7 +10,7 @@ import flashinfer
 from flashinfer.operators.catalog import cases_module, definition, entries
 from flashinfer.operators.implementation import implementations
 from flashinfer.operators.pytest_support import aot_params, implementation_param
-from flashinfer.operators.testing import case_parameters, case_tolerances, numerical_cases
+from flashinfer.operators.testing import case_parameters, case_tolerances, comparison_values, numerical_cases
 from flashinfer.runtime import Backend, CompileMode, KernelRegistry, get_global_registry, kernel_registry_scope
 
 
@@ -37,12 +37,13 @@ def test_public_default_route(npu_runtime, aot_runtime, op, configuration):
     if len(tolerances) == 1:
         actual, expected = (actual,), (expected,)
     assert len(actual) == len(expected) == len(tolerances)
-    for output, golden, (atol, rtol) in zip(actual, expected, tolerances):
+    for index, (output, golden, (atol, rtol)) in enumerate(zip(actual, expected, tolerances)):
         if operator.schema:
             assert torch_npu.get_npu_format(output) == 2  # Typed public calls allocate ND outputs.
         if atol == rtol == 0:
             assert output.dtype == golden.dtype
-        torch.testing.assert_close(output.cpu().double(), golden.double(), atol=atol, rtol=rtol)
+        output, golden = comparison_values(cases, index, output, golden)
+        torch.testing.assert_close(output, golden, atol=atol, rtol=rtol)
 
 
 def _cases():

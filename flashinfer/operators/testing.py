@@ -60,6 +60,18 @@ def case_tolerances(cases, configuration):
     return cases.TOLERANCES
 
 
+def comparison_values(cases, output_index, actual, reference):
+    """Compare the entire output unless the author declares a valid range."""
+    assert actual.shape == reference.shape, "reference output shape differs"
+    actual = actual.cpu()
+    mask_for = getattr(cases, "comparison_mask", None)
+    if mask_for is not None:
+        mask = mask_for(output_index, reference)
+        if mask is not None:
+            actual, reference = actual[mask], reference[mask]
+    return actual.double(), reference.double()
+
+
 def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None, backend=None):
     operator = definition(name)
     cases = cases_module(name)
@@ -90,14 +102,14 @@ def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None,
         assert output_pointers == tuple(t.data_ptr() for t in supplied), "out storage changed"
         assert pointers == tuple(t.data_ptr() for t in originals), "input storage changed"
         errors = []
-        for actual, reference in zip(outputs, expected):
-            assert actual.shape == reference.shape, "reference output shape differs"
-            errors.append(float((actual.cpu().double() - reference.double()).abs().max())
-                          if actual.numel() else 0.0)
+        for output_index, (actual, reference, (atol, rtol)) in enumerate(zip(outputs, expected, tolerances)):
+            actual, reference = comparison_values(cases, output_index, actual, reference)
+            errors.append(float((actual - reference).abs().max()) if actual.numel() else 0.0)
+            torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
         print(json.dumps(dict(case=configuration, max_abs=errors), sort_keys=True), flush=True)
-        for output_tuple in (outputs, returned):
-            for actual, reference, (atol, rtol) in zip(output_tuple, expected, tolerances):
-                torch.testing.assert_close(actual.cpu().double(), reference.double(), atol=atol, rtol=rtol)
+        for output_index, (actual, reference, (atol, rtol)) in enumerate(zip(returned, expected, tolerances)):
+            actual, reference = comparison_values(cases, output_index, actual, reference)
+            torch.testing.assert_close(actual, reference, atol=atol, rtol=rtol)
         observations[str(index)] = dict(case=configuration, max_abs=errors)
     return observations
 

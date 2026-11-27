@@ -97,3 +97,8 @@ CASE_PARAMETERS = (
     dict(paged=True, max_region_len=0, top_k=512),
 )
 TOLERANCES = ((0.02, 0.003), (0, 0))
+
+
+def comparison_mask(output_index, reference):
+    """The CPU sample's -inf marks Score positions outside the visible range."""
+    return ~reference.isneginf() if output_index == 0 else None

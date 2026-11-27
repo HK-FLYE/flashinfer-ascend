@@ -106,7 +106,8 @@ OPERATOR = OperatorDefinition(
     description=(
         "Sum weighted ReLU query-key products over heads, then select request-local regions. "
         "The only supported sort_mode is 0, which returns selected IDs in ascending region ID order. "
-        "IDs are padded with -1. "
+        "IDs are padded with -1. Score values are defined only for visible regions "
+        "within the logical region extent. Values outside that range are unspecified. "
         "return_score=False returns an empty score Tensor and bounded-workspace IDs."
     ),
 )
