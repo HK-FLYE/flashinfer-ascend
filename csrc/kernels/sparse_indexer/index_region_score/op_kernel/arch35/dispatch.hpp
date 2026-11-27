@@ -15,7 +15,8 @@ struct DispatchShape {
 // Every participant reads the same immutable metadata and reaches the same branch.
 // Only equal complete requests with matching grid boundaries are certified here.
 template <bool CAUSAL>
-__aicore__ inline bool IsUniformRequestGrid(const DispatchShape &t, GM_ADDR cu, GM_ADDR kv)
+__aicore__ inline bool IsUniformRequestGrid(const DispatchShape &t, GM_ADDR cu, GM_ADDR kv,
+    IndexerRegionScoreWeighted::ScoreUniformPrefix &prefix)
 {
     if (t.numRequests == 0U || cu == nullptr || t.qShardCount == 0U || t.qTile == 0U ||
         t.totalTokens % t.numRequests != 0U || t.numRequests % t.qShardCount != 0U) {
@@ -49,18 +50,23 @@ __aicore__ inline bool IsUniformRequestGrid(const DispatchShape &t, GM_ADDR cu, 
         firstKv = lengths[0];
     }
     uint32_t expected = 0U;
-    for (uint32_t request = 0U; request < t.numRequests; ++request) {
+    uint32_t request = 0U;
+    for (; request < t.numRequests; ++request) {
         expected += rows;
         if (bounds[request + 1U] != static_cast<int32_t>(expected)) {
-            return false;
+            break;
         }
         if constexpr (CAUSAL) {
             if (lengths[request] != firstKv) {
-                return false;
+                break;
             }
         }
     }
-    return true;
+    if (request == t.numRequests) {
+        return true;
+    }
+    prefix = {request, rows, firstKv};
+    return false;
 }
 
 template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
@@ -70,6 +76,7 @@ __aicore__ inline void RunWithStrategies(GM_ADDR query, GM_ADDR weights, GM_ADDR
     AscendC::TPipe *pipe)
 {
     DispatchShape decoded{};
+    PagedTilingData schedule;
     if constexpr (CacheStrategy::IS_PAGED) {
         const auto words = reinterpret_cast<__gm__ const uint32_t *>(tiling);
         decoded.numRequests = words[offsetof(PagedTilingData, numRequests) / sizeof(uint32_t)];
@@ -80,11 +87,33 @@ __aicore__ inline void RunWithStrategies(GM_ADDR query, GM_ADDR weights, GM_ADDR
     } else {
         // Continuous qTile is derived by normalization, rather than its POD qTile field.
         GET_TILING_DATA_WITH_STRUCT(RegionScoreTilingData, data, tiling);
-        const auto normalized = NormalizeContinuousTiling(data);
-        decoded = {normalized.numRequests, normalized.totalTokens, normalized.qShardCount,
-            normalized.qTile, normalized.batchTokens};
+        schedule = NormalizeContinuousTiling(data);
+        decoded = {schedule.numRequests, schedule.totalTokens, schedule.qShardCount,
+            schedule.qTile, schedule.batchTokens};
     }
-    const bool direct = IsUniformRequestGrid<MaskStrategy::CAUSAL>(decoded, cuSeqLens, actualKvLengths);
+    IndexerRegionScoreWeighted::ScoreUniformPrefix prefix{};
+    bool direct = IsUniformRequestGrid<MaskStrategy::CAUSAL>(decoded, cuSeqLens, actualKvLengths, prefix);
+    if (!direct) {
+        if constexpr (CacheStrategy::IS_PAGED) {
+            const auto words = reinterpret_cast<__gm__ const uint32_t *>(tiling);
+            schedule.numRequests = decoded.numRequests;
+            schedule.totalTokens = decoded.totalTokens;
+            schedule.qShardCount = decoded.qShardCount;
+            schedule.qTile = decoded.qTile;
+            schedule.batchTokens = decoded.batchTokens;
+            schedule.kShardCount = words[offsetof(PagedTilingData, kShardCount) / sizeof(uint32_t)];
+            schedule.usedCubeCores = words[offsetof(PagedTilingData, usedCubeCores) / sizeof(uint32_t)];
+            schedule.seqK = words[offsetof(PagedTilingData, seqK) / sizeof(uint32_t)];
+            schedule.regionSize = words[offsetof(PagedTilingData, regionSize) / sizeof(uint32_t)];
+            schedule.groups = words[offsetof(PagedTilingData, groups) / sizeof(uint32_t)];
+            schedule.headsPerGroup = words[offsetof(PagedTilingData, headsPerGroup) / sizeof(uint32_t)];
+            schedule.pageCols = words[offsetof(PagedTilingData, pageCols) / sizeof(uint32_t)];
+            schedule.summariesPerPage = words[offsetof(PagedTilingData, summariesPerPage) / sizeof(uint32_t)];
+        }
+        GM_ADDR planCu = (blockTable == nullptr && schedule.numRequests == 1U) ? nullptr : cuSeqLens;
+        direct = !IndexerRegionScoreWeighted::ShouldPrepareScorePartition<MaskStrategy::CAUSAL>(
+            schedule, planCu, actualKvLengths, IndexerRegionScoreWeighted::ScoreQueryBand(schedule), prefix);
+    }
     if (direct) {
         RunGridWithStrategies<CacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
             query, weights, keySummary, actualKvLengths, pagedKeySummary, blockTable,

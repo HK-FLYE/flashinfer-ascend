@@ -1953,7 +1953,7 @@ template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrat
 __aicore__ inline void RunBoundedScoreBatches(
     GM_ADDR query, GM_ADDR weights, GM_ADDR keySummary, GM_ADDR actualKvLengths,
     GM_ADDR blockTable, GM_ADDR cuSeqLens, GM_ADDR selectedRegionIds, GM_ADDR workspace,
-    const PagedTilingData &tiling, uint64_t scratchOffset, AscendC::TPipe *pipe, GM_ADDR scorePlan, bool prepare)
+    const PagedTilingData &tiling, uint64_t scratchOffset, AscendC::TPipe *pipe, GM_ADDR scorePlan)
 {
     PagedTilingData batch = tiling;
     GM_ADDR scorePool = workspace + tiling.scorePoolOffset;
@@ -1970,9 +1970,7 @@ __aicore__ inline void RunBoundedScoreBatches(
         compute.Init(query, weights, actualKvLengths, scorePool, &batch, pipe, &keyAdapter);
         CacheStrategy::InitAdapter(keyAdapter, keySummary, blockTable, cuSeqLens, &batch, pipe);
         GM_ADDR planCu = (blockTable == nullptr && batch.numRequests == 1U) ? nullptr : cuSeqLens;
-        if (prepare) {
-            compute.template ConfigureDeviceSchedule<MaskStrategy::CAUSAL>(planCu, actualKvLengths, scorePlan);
-        }
+        compute.template ConfigureDeviceSchedule<MaskStrategy::CAUSAL>(planCu, actualKvLengths, scorePlan);
         MaskStrategy::Process(compute);
         compute.Release();
         keyAdapter.Release();
@@ -2011,14 +2009,11 @@ public:
     {
         GM_ADDR scorePlan = workspace;
         workspace += DeviceScorePlanBytes(tiling.numRequests, tiling.usedCubeCores, tiling.totalTokens, tiling.batchTokens);
-        GM_ADDR prepareCu = (blockTable == nullptr && tiling.numRequests == 1U) ? nullptr : cuSeqLens;
-        const bool prepare = ShouldPrepareScorePartition<MaskStrategy::CAUSAL>(
-            tiling, prepareCu, actualKvLengths, ScoreQueryBand(tiling));
         if (tiling.batchTokens != 0U) {
             RunBoundedScoreBatches<CacheStrategy, MaskStrategy, SelectionStrategy,
                 KeyResidentCompute<typename CacheStrategy::Adapter, QUERY_RESIDENT, ALLOW_H4_TAIL>>(
                 query, weights, keySummary, actualKvLengths, blockTable, cuSeqLens,
-                selectedRegionIds, workspace, tiling, scratchOffset, pipe, scorePlan, prepare);
+                selectedRegionIds, workspace, tiling, scratchOffset, pipe, scorePlan);
             return;
         }
         typename CacheStrategy::Adapter keyAdapter;
@@ -2026,9 +2021,7 @@ public:
         compute.Init(query, weights, actualKvLengths, output, &tiling, pipe, &keyAdapter);
         CacheStrategy::InitAdapter(keyAdapter, keySummary, blockTable, cuSeqLens, &tiling, pipe);
         GM_ADDR planCu = (blockTable == nullptr && tiling.numRequests == 1U) ? nullptr : cuSeqLens;
-        if (prepare) {
-            compute.template ConfigureDeviceSchedule<MaskStrategy::CAUSAL>(planCu, actualKvLengths, scorePlan);
-        }
+        compute.template ConfigureDeviceSchedule<MaskStrategy::CAUSAL>(planCu, actualKvLengths, scorePlan);
         MaskStrategy::Process(compute);
         compute.Release();
         keyAdapter.Release();

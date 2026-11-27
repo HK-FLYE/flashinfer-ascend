@@ -173,6 +173,14 @@ struct ScoreWorkCosts {
     uint32_t tile;
 };
 
+__aicore__ inline ScoreWorkCosts GetScoreWorkCosts(const PagedTilingData &tiling, uint32_t qBand)
+{
+    const uint32_t keyLoadCost = tiling.pageCols == 0U ? 1U :
+        SparseIndexer::Common::CeilDiv(PAGED_NR, PagedMax(1U, tiling.summariesPerPage));
+    return {keyLoadCost,
+        PagedMax(1U, tiling.groups * ((qBand * tiling.headsPerGroup + 15U) / 16U))};
+}
+
 __aicore__ inline uint32_t ScoreGridQEnd(const PagedTilingData &tiling,
     const DeviceScoreEpoch &epoch, uint32_t shardEnd)
 {
@@ -208,16 +216,18 @@ __aicore__ inline uint64_t ShareScoreGridWork(uint64_t cost, uint32_t kShards)
     return cost / kShards + (cost % kShards != 0U);
 }
 
+__aicore__ inline uint64_t ScoreCutBoundaryCost(ScoreWorkCosts costs)
+{
+    // A target rounds forward by at most one complete Q band. The following
+    // pair may reload the same K macro. Bound both by a full-width macro.
+    return (static_cast<uint64_t>(costs.tile) + costs.key) * (PAGED_K_MACRO / PAGED_NR);
+}
+
 __aicore__ inline bool PreferScoreCuts(uint64_t total, uint64_t gridPeak, uint32_t pairs,
     ScoreWorkCosts costs, uint64_t planningCost = 0U)
 {
-    // A target rounds forward by at most one complete Q band. The following
-    // pair may reload the same K macro. Bounding both by a full-width macro
-    // makes this decision identical for every participant without enumerating
-    // the other pairs' cuts. A pair must never choose its own execution mode.
-    const uint64_t boundaryCost = (static_cast<uint64_t>(costs.tile) + costs.key) *
-        (PAGED_K_MACRO / PAGED_NR);
-    return gridPeak > ShareScoreGridWork(total, pairs) + boundaryCost + planningCost;
+    // Every participant applies the same global bound before computing cuts.
+    return gridPeak > ShareScoreGridWork(total, pairs) + ScoreCutBoundaryCost(costs) + planningCost;
 }
 
 __aicore__ inline DeviceScoreCut FindScoreCut(const DeviceWorkShape &shape,
@@ -579,9 +589,9 @@ __aicore__ __attribute__((noinline)) static void SelectScorePlan(
         candidate = pairCandidate > candidate ? pairCandidate : candidate;
         direct = pairDirect > direct ? pairDirect : direct;
     }
-    const uint64_t boundary = (static_cast<uint64_t>(costs.key) + costs.tile) * (PAGED_K_MACRO / PAGED_NR);
     const uint64_t publication = 4U * pairs;
-    WriteScoreCut(plan, pairs + 1U, {direct > candidate + publication + boundary, 0U, 0U});
+    WriteScoreCut(plan, pairs + 1U,
+        {direct > candidate + publication + ScoreCutBoundaryCost(costs), 0U, 0U});
 }
 
 __aicore__ inline ScorePartition ReadScorePartition(GM_ADDR slot, uint32_t pairs, uint32_t pair)
@@ -601,10 +611,7 @@ template <bool CAUSAL>
 __aicore__ inline ScorePartition PrepareScorePartition(const PagedTilingData &tiling, GM_ADDR cu,
     GM_ADDR kv, GM_ADDR workspace, uint32_t qBand, uint32_t pair, LocalTensor<int32_t> metadata)
 {
-    const uint32_t keyLoadCost = tiling.pageCols == 0U ? 1U :
-        SparseIndexer::Common::CeilDiv(PAGED_NR, PagedMax(1U, tiling.summariesPerPage));
-    const ScoreWorkCosts costs{keyLoadCost,
-        PagedMax(1U, tiling.groups * ((qBand * tiling.headsPerGroup + 15U) / 16U))};
+    const ScoreWorkCosts costs = GetScoreWorkCosts(tiling, qBand);
     if (tiling.numRequests == 1U) {
         return MakeSingleRequestPartition<CAUSAL>(tiling, cu, kv, qBand, pair, costs);
     }
