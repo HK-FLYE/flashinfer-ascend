@@ -72,22 +72,18 @@ struct StageImplementation<Stage::TopK, SelectionStagePolicy<SelectionPolicy, Co
 } // namespace IndexerRegionScore::Block
 
 namespace IndexerRegionScorePaged {
-template <IndexerRegionScore::FusedSelect::Implementation implementation>
 struct FusedTopKPolicy {
     template <class Arguments>
     __aicore__ static inline void Select(const Arguments &arguments)
     {
-        arguments.template SelectRows<IndexerRegionScore::FusedSelect::Run<implementation>>();
+        arguments.template SelectRows<IndexerRegionScore::FusedSelect::Run>();
     }
 };
 
-template <IndexerRegionScore::FusedSelect::Implementation implementation>
-using FusedTopKStrategyFor = IndexerRegionScore::Block::StageType<
+using FusedTopKStrategy = IndexerRegionScore::Block::StageType<
     IndexerRegionScore::Block::Stage::TopK,
-    IndexerRegionScore::Block::SelectionStagePolicy<FusedTopKPolicy<implementation>,
+    IndexerRegionScore::Block::SelectionStagePolicy<FusedTopKPolicy,
         IndexerRegionScore::FusedSelect::Compact>>;
-
-using FusedTopKStrategy = FusedTopKStrategyFor<IndexerRegionScore::FusedSelect::kDefaultImplementation>;
 
 } // 命名空间结束。
 

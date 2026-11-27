@@ -3,7 +3,6 @@
 #include "kernel_operator.h"
 #include "arch35/indexer_region_score_pipeline.h"
 #include "arch35/block/block_topk.hpp"
-#include "arch35/dispatch_config.hpp"
 #include "arch35/weighted_pipeline.hpp"
 
 using IndexerRegionScore::RegionScoreTilingData;
@@ -16,7 +15,7 @@ using ContinuousKeyCacheStage = IndexerRegionScore::Block::StageType<
     IndexerRegionScore::Block::KeyCachePolicy<IndexerRegionScore::Block::KeyCacheKind::Continuous>>;
 
 template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
-__aicore__ inline void RunPagedInline(GM_ADDR query, GM_ADDR weights,
+__aicore__ __attribute__((always_inline)) inline void RunPagedInline(GM_ADDR query, GM_ADDR weights,
     GM_ADDR pagedKeySummary, GM_ADDR actualKvLengths, GM_ADDR blockTable, GM_ADDR cuSeqLens,
     GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
     AscendC::TPipe *pipe)
@@ -39,20 +38,16 @@ __aicore__ __attribute__((noinline)) void RunPagedCubeWithStrategies(GM_ADDR que
     GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
     AscendC::TPipe *pipe)
 {
-    // Cube 部分页实现独立存放，使用独立名称避免混核链接合并。
-    RunPagedInline<CacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights, pagedKeySummary,
-        actualKvLengths, blockTable, cuSeqLens, output, selectedRegionIds, workspace, tiling, pipe);
-}
-
-template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
-__aicore__ __attribute__((always_inline)) inline void RunPagedVectorWithStrategies(GM_ADDR query, GM_ADDR weights,
-    GM_ADDR pagedKeySummary, GM_ADDR actualKvLengths, GM_ADDR blockTable, GM_ADDR cuSeqLens,
-    GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
-    AscendC::TPipe *pipe)
-{
-    // Vector 只使用请求 token 范围，共用分页实现并强制内联。
-    RunPagedInline<CacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights, pagedKeySummary,
-        actualKvLengths, blockTable, cuSeqLens, output, selectedRegionIds, workspace, tiling, pipe);
+    // 在被选中的实现内部解析完整 POD 一次。
+    PagedTilingData sharedTiling{};
+    uint32_t *local = reinterpret_cast<uint32_t *>(&sharedTiling);
+    auto global = reinterpret_cast<__gm__ uint32_t *>(tiling);
+    for (uint32_t i = 0U; i < sizeof(PagedTilingData) / sizeof(uint32_t); ++i) {
+        local[i] = global[i];
+    }
+    RegionScoreRunner<CacheStrategy, MaskStrategy, SelectionStrategy, false, ALLOW_H4_TAIL> runner;
+    runner.Run(query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
+        output, selectedRegionIds, workspace, sharedTiling, sharedTiling.reservedStride0, pipe);
 }
 
 template <typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
@@ -128,7 +123,7 @@ __aicore__ inline void RunGridWithStrategies(GM_ADDR query, GM_ADDR weights, GM_
                     output, selectedRegionIds, workspace, tiling, pipe);
             }
         } else {
-            RunPagedVectorWithStrategies<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
+            RunPagedInline<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
                 query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
                 output, selectedRegionIds, workspace, tiling, pipe);
         }
@@ -143,14 +138,13 @@ __aicore__ inline void RunGridWithStrategies(GM_ADDR query, GM_ADDR weights, GM_
 }
 } // 命名空间 IndexerRegionScorePaged
 
-
 namespace IndexerRegionScoreWeighted {
 using ContinuousKeyCacheStage = IndexerRegionScore::Block::StageType<
     IndexerRegionScore::Block::Stage::KeyCache,
     IndexerRegionScore::Block::KeyCachePolicy<IndexerRegionScore::Block::KeyCacheKind::Continuous>>;
 
 template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
-__aicore__ inline void RunPagedInline(GM_ADDR query, GM_ADDR weights,
+__aicore__ __attribute__((always_inline)) inline void RunPagedInline(GM_ADDR query, GM_ADDR weights,
     GM_ADDR pagedKeySummary, GM_ADDR actualKvLengths, GM_ADDR blockTable, GM_ADDR cuSeqLens,
     GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
     AscendC::TPipe *pipe)
@@ -173,20 +167,16 @@ __aicore__ __attribute__((noinline)) void RunPagedCubeWithStrategies(GM_ADDR que
     GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
     AscendC::TPipe *pipe)
 {
-    // Cube 部分页实现独立存放，使用独立名称避免混核链接合并。
-    RunPagedInline<CacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights, pagedKeySummary,
-        actualKvLengths, blockTable, cuSeqLens, output, selectedRegionIds, workspace, tiling, pipe);
-}
-
-template <typename CacheStrategy, typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
-__aicore__ __attribute__((always_inline)) inline void RunPagedVectorWithStrategies(GM_ADDR query, GM_ADDR weights,
-    GM_ADDR pagedKeySummary, GM_ADDR actualKvLengths, GM_ADDR blockTable, GM_ADDR cuSeqLens,
-    GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
-    AscendC::TPipe *pipe)
-{
-    // Vector 只使用请求 token 范围，共用分页实现并强制内联。
-    RunPagedInline<CacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights, pagedKeySummary,
-        actualKvLengths, blockTable, cuSeqLens, output, selectedRegionIds, workspace, tiling, pipe);
+    // 在被选中的实现内部解析完整 POD 一次。
+    PagedTilingData sharedTiling{};
+    uint32_t *local = reinterpret_cast<uint32_t *>(&sharedTiling);
+    auto global = reinterpret_cast<__gm__ uint32_t *>(tiling);
+    for (uint32_t i = 0U; i < sizeof(PagedTilingData) / sizeof(uint32_t); ++i) {
+        local[i] = global[i];
+    }
+    RegionScoreRunner<CacheStrategy, MaskStrategy, SelectionStrategy, false, ALLOW_H4_TAIL> runner;
+    runner.Run(query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
+        output, selectedRegionIds, workspace, sharedTiling, sharedTiling.reservedStride0, pipe);
 }
 
 template <typename MaskStrategy, typename SelectionStrategy, bool ALLOW_H4_TAIL = false>
@@ -224,48 +214,26 @@ __aicore__ __attribute__((noinline)) void RunCubeWithStrategies(GM_ADDR query, G
             const uint32_t proxyDim = reinterpret_cast<__gm__ uint32_t *>(tiling)[
                 offsetof(PagedTilingData, proxyDim) / sizeof(uint32_t)];
             if (proxyDim == 128U) {
-                if ASCEND_IS_AIC {
-                    RunD128PagedCubeIsolated<MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights,
-                        pagedKeySummary, actualKvLengths, blockTable, cuSeqLens, output,
-                        selectedRegionIds, workspace, tiling, pipe);
-                } else {
-                PagedTilingData sharedTiling{};
-                auto local = reinterpret_cast<uint32_t *>(&sharedTiling);
-                auto global = reinterpret_cast<__gm__ uint32_t *>(tiling);
-                for (uint32_t i = 0U; i < sizeof(PagedTilingData) / sizeof(uint32_t); ++i) {
-                    local[i] = global[i];
-                }
-                if (sharedTiling.pageLoadMode == PAGE_LOAD_WITH_OFFSET) {
-                    D128QueryResidentRunner<PartialPagedD128KeyCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL> runner;
-                    runner.Run(query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                        output, selectedRegionIds, workspace, sharedTiling, sharedTiling.reservedStride0, pipe);
-                } else {
-                    D128QueryResidentRunner<PagedD128KeyCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL> runner;
-                    runner.Run(query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                        output, selectedRegionIds, workspace, sharedTiling, sharedTiling.reservedStride0, pipe);
-                }
-                }
+                RunD128PagedCubeIsolated<MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights,
+                    pagedKeySummary, actualKvLengths, blockTable, cuSeqLens, output,
+                    selectedRegionIds, workspace, tiling, pipe);
                 return;
             }
         }
-        if ASCEND_IS_AIC {
-            auto global = reinterpret_cast<__gm__ uint64_t *>(tiling);
-            const uint64_t pageLoadMode = global[offsetof(PagedTilingData, pageLoadMode) / sizeof(uint64_t)];
-            if (pageLoadMode == PAGE_LOAD_WITH_OFFSET) {
-                RunPagedCubeWithStrategies<PartialPagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
-                    query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                    output, selectedRegionIds, workspace, tiling, pipe);
-            } else {
-                // 页对齐路径保持内联，避免短 case 支付额外函数调用成本。
-                RunPagedInline<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
-                    query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                    output, selectedRegionIds, workspace, tiling, pipe);
-            }
+
+        auto global = reinterpret_cast<__gm__ uint64_t *>(tiling);
+        const uint64_t pageLoadMode = global[offsetof(PagedTilingData, pageLoadMode) / sizeof(uint64_t)];
+        if (pageLoadMode == PAGE_LOAD_WITH_OFFSET) {
+            RunPagedCubeWithStrategies<PartialPagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
+                query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
+                output, selectedRegionIds, workspace, tiling, pipe);
         } else {
-            RunPagedVectorWithStrategies<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
+            // 页对齐路径保持内联，避免短 case 支付额外函数调用成本。
+            RunPagedInline<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
                 query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
                 output, selectedRegionIds, workspace, tiling, pipe);
         }
+
         return;
     } else {
         GET_TILING_DATA_WITH_STRUCT(RegionScoreTilingData, tilingData, tiling);
@@ -281,17 +249,12 @@ __aicore__ __attribute__((noinline)) void RunVectorWithStrategies(GM_ADDR query,
     GM_ADDR output, GM_ADDR selectedRegionIds, GM_ADDR workspace, GM_ADDR tiling,
     AscendC::TPipe *pipe)
 {
-    // Cube 入口读取分页搬运模式；被选中实现解析完整 ABI 一次。
+    // Vector 按请求范围处理归约与选择；D128 使用独立驻留参数。
     if constexpr (CacheStrategy::IS_PAGED) {
         if constexpr (sizeof(QkInputType) == 2U && MaskStrategy::CAUSAL) {
             const uint32_t proxyDim = reinterpret_cast<__gm__ uint32_t *>(tiling)[
                 offsetof(PagedTilingData, proxyDim) / sizeof(uint32_t)];
             if (proxyDim == 128U) {
-                if ASCEND_IS_AIC {
-                    RunD128PagedCubeIsolated<MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(query, weights,
-                        pagedKeySummary, actualKvLengths, blockTable, cuSeqLens, output,
-                        selectedRegionIds, workspace, tiling, pipe);
-                } else {
                 PagedTilingData sharedTiling{};
                 auto local = reinterpret_cast<uint32_t *>(&sharedTiling);
                 auto global = reinterpret_cast<__gm__ uint32_t *>(tiling);
@@ -307,28 +270,14 @@ __aicore__ __attribute__((noinline)) void RunVectorWithStrategies(GM_ADDR query,
                     runner.Run(query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
                         output, selectedRegionIds, workspace, sharedTiling, sharedTiling.reservedStride0, pipe);
                 }
-                }
+
                 return;
             }
         }
-        if ASCEND_IS_AIC {
-            auto global = reinterpret_cast<__gm__ uint64_t *>(tiling);
-            const uint64_t pageLoadMode = global[offsetof(PagedTilingData, pageLoadMode) / sizeof(uint64_t)];
-            if (pageLoadMode == PAGE_LOAD_WITH_OFFSET) {
-                RunPagedCubeWithStrategies<PartialPagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
-                    query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                    output, selectedRegionIds, workspace, tiling, pipe);
-            } else {
-                // 页对齐路径保持内联，避免短 case 支付额外函数调用成本。
-                RunPagedInline<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
-                    query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                    output, selectedRegionIds, workspace, tiling, pipe);
-            }
-        } else {
-            RunPagedVectorWithStrategies<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
-                query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
-                output, selectedRegionIds, workspace, tiling, pipe);
-        }
+
+        RunPagedInline<PagedCacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
+            query, weights, pagedKeySummary, actualKvLengths, blockTable, cuSeqLens,
+            output, selectedRegionIds, workspace, tiling, pipe);
         return;
     } else {
         GET_TILING_DATA_WITH_STRUCT(RegionScoreTilingData, tilingData, tiling);
@@ -339,7 +288,6 @@ __aicore__ __attribute__((noinline)) void RunVectorWithStrategies(GM_ADDR query,
     }
 }
 } // 命名空间 IndexerRegionScoreWeighted
-
 
 #include "arch35/dispatch.hpp"
 

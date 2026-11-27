@@ -219,7 +219,6 @@ using namespace AscendC;
 constexpr uint32_t PAGED_H = 4U;
 constexpr uint32_t PAGED_D = 256U;
 constexpr uint32_t PAGED_MQ_MAX = 32U;
-constexpr uint32_t PAGED_Q_MACRO_MAX = 64U;
 constexpr uint32_t PAGED_K_MACRO = kPagedKeyMacro;
 constexpr uint32_t PAGED_NR = 128U;
 constexpr uint32_t PAGED_M_MAX = 128U;
@@ -249,32 +248,6 @@ constexpr uint32_t PAGED_C_READY_EVENT = RegionScoreSyncPolicy::kCubeToVec;
 constexpr uint32_t PAGED_WORK_DRAINED_EVENT = 10U;
 constexpr uint32_t PAGED_AIV1_EVENT_OFFSET = RegionScoreSyncPolicy::kAivPairOffset;
 constexpr FixpipeConfig PAGED_FIX_TO_UB_ROW_MAJOR = {CO2Layout::ROW_MAJOR, true};
-#ifndef INDEXER_REGION_SCORE_PAGED_DEBUG_SYNC_TRACE
-#define INDEXER_REGION_SCORE_PAGED_DEBUG_SYNC_TRACE 0
-#endif
-constexpr bool PAGED_DEBUG_SYNC_TRACE =
-    INDEXER_REGION_SCORE_PAGED_DEBUG_SYNC_TRACE != 0;
-#ifndef INDEXER_REGION_SCORE_BOUNDED_DEBUG_TRACE
-#define INDEXER_REGION_SCORE_BOUNDED_DEBUG_TRACE 0
-#endif
-constexpr bool PAGED_DEBUG_BOUNDED_TRACE =
-    INDEXER_REGION_SCORE_BOUNDED_DEBUG_TRACE != 0;
-
-// Stages: 0=entry, 1=compute drained, 2=selection returned, 3=final sync returned.
-__aicore__ inline void TraceBoundedBatch(uint32_t stage, uint32_t begin, uint32_t count)
-{
-    if constexpr (PAGED_DEBUG_BOUNDED_TRACE) {
-        if (GetBlockIdx() == 0U) {
-            if ASCEND_IS_AIC {
-                AscendC::PRINTF("[IRS_BOUNDED][C0] stage=%u begin=%u count=%u\n", stage, begin, count);
-            } else {
-                AscendC::PRINTF("[IRS_BOUNDED][V0] stage=%u begin=%u count=%u\n", stage, begin, count);
-            }
-        }
-    }
-}
-
-
 __aicore__ inline uint32_t PagedMin(uint32_t left, uint32_t right)
 {
     return left < right ? left : right;
@@ -655,11 +628,6 @@ private:
         const uint32_t qCount = PagedMin(QMacroTile(), qEnd - qStart);
         const uint32_t qRowsAlign = PagedAlignUp(qCount * Heads(), 16U);
         const uint32_t slot = static_cast<uint32_t>(flatQ % PAGED_PIPE_SLOTS);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF(
-                "[PagedRegionScore][C] q-gather flat=%llu group=%u q=%u+%u slot=%u rows=%u\n",
-                flatQ, group, qStart, qCount, slot, qRowsAlign);
-        }
         GatherQueryToL1(slot, group, qStart, qCount, qRowsAlign);
     }
 
@@ -773,27 +741,11 @@ private:
         }
     }
 
-    __aicore__ inline void TraceCubeTile(
-        uint32_t streamLoop, uint32_t request, uint32_t group, uint32_t qStart,
-        uint32_t qMicro, uint32_t qMicroCount, uint32_t kStart, uint32_t kMicro,
-        uint32_t kMicroCount, uint32_t querySlot, uint32_t resultSlot, bool fullyMasked)
-    {
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF(
-                "[PagedRegionScore][C] tile seq=%u req=%u g=%u q=%u+%u "
-                "k=%u+%u qSlot=%u cSlot=%u masked=%u\n",
-                streamLoop, request, group, qStart + qMicro,
-                qMicroCount, kStart + kMicro, kMicroCount,
-                querySlot, resultSlot,
-                static_cast<uint32_t>(fullyMasked));
-        }
-    }
-
     template <bool CAUSAL>
     __aicore__ inline void ComputeCubeQueryMicro(
         LocalTensor<QkInputType> keyL1, uint32_t qRowsAlign, uint32_t kRowsAlign,
-        uint32_t qMicro, uint32_t qMicroCount, uint32_t request, uint32_t group,
-        uint32_t qStart, uint32_t kStart, uint32_t kMacroCount, uint32_t querySlot,
+        uint32_t qMicro, uint32_t qMicroCount, uint32_t request,
+        uint32_t kStart, uint32_t kMacroCount, uint32_t querySlot,
         int32_t maxVisible, uint32_t &streamLoop, bool &nextKeyPrepared,
         uint32_t coreKEnd, uint32_t keyMacroIndex)
     {
@@ -808,8 +760,6 @@ private:
                     kMicroCount == PAGED_NR &&
                     static_cast<int32_t>(kStart + kMicro) >= maxVisible;
             }
-            TraceCubeTile(streamLoop, request, group, qStart, qMicro, qMicroCount,
-                          kStart, kMicro, kMicroCount, querySlot, resultSlot, fullyMasked);
             ComputeOneTile(keyL1, qRowsAlign, kRowsAlign,
                            qMicro * Heads(), kMicro,
                            qMicroCount, kMicroCount,
@@ -839,7 +789,7 @@ private:
                 }
             }
             ComputeCubeQueryMicro<CAUSAL>(keyL1, qRowsAlign, kRowsAlign, qMicro, qMicroCount,
-                                request, group, qStart, kStart, kMacroCount, querySlot,
+                                request, kStart, kMacroCount, querySlot,
                                 maxVisible, streamLoop, nextKeyPrepared, coreKEnd, keyMacroIndex);
         }
     }
@@ -898,13 +848,6 @@ private:
             const uint32_t keySlot = keyMacroIndex % kPagedKeyL1Slots;
             const uint32_t kRowsAlign = PagedAlignUp(kMacroCount, kPagedNAlignment);
             keyAdapter_->WaitKeyMacroReady(keySlot);
-            if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-                AscendC::PRINTF("[PagedRegionScore][C] K ready request=%u macro=%u slot=%u\n",
-                                request, keyMacroIndex, keySlot);
-                AscendC::PRINTF(
-                    "[PagedRegionScore][C] work request=%u q=%u+%u k=%u+%u\n",
-                    request, qBegin, qEnd - qBegin, kStart, kMacroCount);
-            }
             LocalTensor<QkInputType> keyL1 = keyAdapter_->GetKeyL1(keySlot);
 
             if (!residentQueries) {
@@ -945,9 +888,6 @@ private:
                 firstKeyMacroIndex % kPagedKeyL1Slots,
                 PagedAlignUp(PagedMin(PAGED_K_MACRO, requestKEnd - requestKBegin),
                                   kPagedNAlignment));
-            if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-                AscendC::PRINTF("[PagedRegionScore][C] prepared first K request=%u\n", request);
-            }
 
             ProcessCubeRequestKeys<CAUSAL>(request, requestQBegin, qBegin, qEnd,
                                           queryMacrosPerGroup, flatQueryMacros,
@@ -968,9 +908,6 @@ private:
         CrossCoreSetFlag<PAGED_SYNC_MODE, PIPE_FIX>(PAGED_WORK_DRAINED_EVENT);
         CrossCoreSetFlag<PAGED_SYNC_MODE, PIPE_FIX>(
             PAGED_WORK_DRAINED_EVENT + PAGED_AIV1_EVENT_OFFSET);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][C] drained\n");
-        }
     }
 
     __aicore__ inline int32_t GetGroupFusedMaxVisibleLength(
@@ -1614,7 +1551,7 @@ private:
 
         if constexpr (CausalH4BatchPolicy<KeyAdapter>::ENABLED) {
             // Retain the Q4 decode geometry and exclude completely masked tiles.
-            if (tiling_.groups == 1U && tiling_.qTile == 4U && tiling_.regionSize == 8U &&
+            if (tiling_.groups == 1U && tiling_.qTile == 4U &&
                 qCount == 4U && localQCount == 4U && kCount == PAGED_NR &&
                 static_cast<int64_t>(kStart) < visibleUb_.GetValue(3U) &&
                 static_cast<int64_t>(kStart) + PAGED_NR > visibleUb_.GetValue(0U)) {
@@ -1635,7 +1572,7 @@ private:
                 return;
             }
             // A request's causal positions increase with its query rows.
-            if (tiling_.groups == 1U && tiling_.qTile == 4U && tiling_.regionSize == 8U &&
+            if (tiling_.groups == 1U && tiling_.qTile == 4U &&
                 qCount == 4U && localQCount == 4U && kCount == PAGED_NR &&
                 static_cast<int64_t>(kStart) + PAGED_NR <= visibleUb_.GetValue(0U)) {
                 const uint32_t storeSlot = AcquireOutputStore();
@@ -1669,20 +1606,8 @@ private:
         uint32_t kStart, uint32_t kMicro, uint32_t kMicroCount, uint32_t resultSlot,
         uint32_t request, uint32_t localQStart, uint32_t localQCount, uint32_t &streamLoop)
     {
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF(
-                "[PagedRegionScore][V%u] tile seq=%u req=%u g=%u "
-                "q=%u+%u k=%u+%u cSlot=%u local=%u+%u\n",
-                GetSubBlockIdx(), streamLoop, request, group,
-                qStart + qMicro, qMicroCount, kStart + kMicro,
-                kMicroCount, resultSlot, localQStart, localQCount);
-        }
         if constexpr (!CAUSAL) {
             RegionScoreSyncPolicy::AivWaitCubeDone(resultSlot);
-        }
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][V%u] got ready slot=%u\n",
-                            GetSubBlockIdx(), resultSlot);
         }
         if constexpr (CAUSAL) {
             PostprocessCausalTile(
@@ -1695,10 +1620,6 @@ private:
         }
         PipeBarrier<PIPE_V>();
         RegionScoreSyncPolicy::AivArriveVecReady(resultSlot);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][V%u] set free slot=%u\n",
-                            GetSubBlockIdx(), resultSlot);
-        }
         ++streamLoop;
     }
 
@@ -1764,10 +1685,6 @@ private:
         typename RequestScheduler<CAUSAL>::Coord work;
         while (scheduler.Next(work, *this)) {
             const auto [request, requestQBegin, qBegin, qEnd, requestKBegin, requestKEnd] = work;
-            if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-                AscendC::PRINTF("[PagedRegionScore][V%u] request=%u q=%u+%u\n",
-                                GetSubBlockIdx(), request, qBegin, qEnd - qBegin);
-            }
             KeyMacroScheduler macroScheduler({requestKBegin, requestKEnd, requestKBegin / PAGED_K_MACRO});
             KeyMacroScheduler::Coord macro;
             while (macroScheduler.Next(macro)) {
@@ -1785,16 +1702,10 @@ private:
         for (uint32_t slot = 0U; slot < PAGED_PIPE_SLOTS; ++slot) {
             RegionScoreSyncPolicy::AivArriveVecReady(slot);
         }
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][V%u] seeded free\n", GetSubBlockIdx());
-        }
 
         uint32_t streamLoop = 0U;
         ProcessVectorRequests<CAUSAL>(streamLoop);
         CrossCoreWaitFlag<PAGED_SYNC_MODE, PIPE_V>(PAGED_WORK_DRAINED_EVENT);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][V%u] drained\n", GetSubBlockIdx());
-        }
     }
 
     template <bool CAUSAL>
@@ -1997,7 +1908,6 @@ __aicore__ inline void RunBoundedScoreBatches(
         const uint32_t begin = work.begin;
         batch.batchBegin = begin;
         batch.batchCount = work.count;
-        TraceBoundedBatch(0U, begin, batch.batchCount);
         typename CacheStrategy::Adapter keyAdapter;
         Compute compute;
         compute.Init(query, weights, actualKvLengths, scorePool, &batch, pipe, &keyAdapter);
@@ -2005,14 +1915,11 @@ __aicore__ inline void RunBoundedScoreBatches(
         MaskStrategy::Process(compute);
         compute.Release();
         keyAdapter.Release();
-        TraceBoundedBatch(1U, begin, batch.batchCount);
         SelectionStrategy::Run(scorePool, actualKvLengths, cuSeqLens, selectedRegionIds,
                                workspace, batch, scratchOffset, pipe);
-        TraceBoundedBatch(2U, begin, batch.batchCount);
         // Selector stores wait for MTE3 completion, including private native paths.
         // All AIC/AIVs participate even when their current shard owns no rows.
         RegionScoreSyncPolicy::GlobalBarrier();
-        TraceBoundedBatch(3U, begin, batch.batchCount);
         pipe->Reset();
         if ASCEND_IS_AIC {
             // DAV3510 TPipe::Init reserves and seeds M_MTE1 IDs 0/1/2 for
@@ -2075,15 +1982,6 @@ struct NoMaskStrategy {
     template <typename Compute>
     __aicore__ static inline void Process(Compute &compute)
     {
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            if ASCEND_IS_AIC {
-                AscendC::PRINTF("[PagedRegionScore] enter role=0 block=%u sub=%u pair=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), compute.PairCore());
-            } else {
-                AscendC::PRINTF("[PagedRegionScore] enter role=1 block=%u sub=%u pair=%u\n",
-                                GetBlockIdx(), GetSubBlockIdx(), compute.PairCore());
-            }
-        }
         // 输入布局为 [T,G,H,D]，按硬件块处理分组以保证各布局连续访问。
         if (compute.UseGroupFused()) {
             if ASCEND_IS_AIC {

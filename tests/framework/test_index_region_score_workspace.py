@@ -81,3 +81,29 @@ int main()
     )
     result = subprocess.run([str(binary)], check=True, capture_output=True, text=True)
     print(result.stdout, end="")
+
+
+def test_index_region_score_aligned_output_checks_storage_not_shape():
+    from types import SimpleNamespace
+
+    import torch
+
+    from flashinfer.ascendc.attention.index_region_score.runner import _aligned_score_span
+
+    nd = SimpleNamespace(get_npu_format=lambda tensor: 2)
+    groups, tokens, logical, pitch = 4, 5, 257, 384
+    backing = torch.empty(groups, tokens, pitch, dtype=torch.float32)
+    score = backing[..., :logical]
+    padded = _aligned_score_span(score, logical, (), nd)
+    assert padded.shape == backing.shape
+    assert padded.stride() == backing.stride()
+    assert padded.data_ptr() == score.data_ptr()
+
+    # Padding remains part of the native output address range.
+    assert _aligned_score_span(score, logical, (backing[..., logical:],), nd) is None
+    assert _aligned_score_span(score, logical - 1, (), nd) is None
+
+    # A view with the same logical strides may lack the final row's padding.
+    short = torch.empty((groups * tokens - 1) * pitch + logical)
+    score = short.as_strided((groups, tokens, logical), (tokens * pitch, pitch, 1))
+    assert _aligned_score_span(score, logical, (), nd) is None

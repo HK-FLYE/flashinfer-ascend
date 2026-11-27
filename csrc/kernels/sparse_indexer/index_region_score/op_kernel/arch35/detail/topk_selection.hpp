@@ -17,8 +17,7 @@ using namespace AscendC;
 // Tile and ISA capacities shared by the IRS caller policies.
 constexpr uint32_t kScoreTile = 1024U;
 constexpr uint32_t kRadixTile = 8192U;
-constexpr uint32_t kRadixMaxTopK = SparseTopK::kMaxKeepCount;
-constexpr uint32_t kMaxTopK = kRadixMaxTopK;
+constexpr uint32_t kMaxTopK = SparseTopK::kMaxKeepCount;
 constexpr uint32_t kNativeTopK = 512U;
 constexpr uint32_t kSmallHeapMaxTopK = 7U;
 constexpr uint32_t kDmaBlockBytes = 32U;
@@ -410,15 +409,6 @@ __aicore__ inline bool ScoreWorse(float a, uint32_t ai, float b, uint32_t bi)
     return a < b || (a == b && ai > bi);
 }
 
-// IRS chooses the radix implementation when instantiating its device entry.
-enum class Implementation : uint8_t {
-    RadixMerge,
-    HighPrefixFp32,
-};
-
-// Preserve the established route for specialized IRS row policies as well.
-inline constexpr Implementation kDefaultImplementation = Implementation::HighPrefixFp32;
-
 class Selector final {
 #if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510) && \
     defined(ORIG_DTYPE_QUERY) && defined(DT_FLOAT16) && defined(DT_BF16) && \
@@ -449,7 +439,6 @@ public:
         batchScratch_ = alignedSelection && batchCount != 0U;
         scoreStrideGroup_ = scoreStrideGroup;
         scoreStrideToken_ = scoreStrideToken;
-        rout_ = rout;
         maxRegionLen_ = Min(maxRegionLen, rout);
         topK_ = topK;
         selectedStride_ = alignedSelection ? (topK + 7U) / 8U * 8U : topK;
@@ -478,18 +467,16 @@ public:
         orderIndices_ = base[SelectionWorkspace::kOrderIds].ReinterpretCast<uint32_t>();
     }
 
-    template <Implementation implementation>
     struct DefaultRowPolicy {
         __aicore__ inline void ProcessRow(Selector &selector, uint32_t row)
         {
-            selector.ProcessRow<implementation>(row);
+            selector.ProcessRow(row);
         }
     };
 
-    template <Implementation implementation = kDefaultImplementation>
     __aicore__ inline void Process()
     {
-        DefaultRowPolicy<implementation> policy;
+        DefaultRowPolicy policy;
         ProcessRows(policy);
     }
 
@@ -627,7 +614,6 @@ private:
         }
     }
 
-    template <Implementation implementation = kDefaultImplementation>
     __aicore__ inline void SelectHistoryTopK(uint32_t group, uint32_t token,
                                               uint32_t history, uint32_t &retained,
                                               uint32_t &directMode)
@@ -643,12 +629,10 @@ private:
 #endif
         // IRS owns the row-length choice between independent TopK entries.
         if (topK_ > kSmallHeapMaxTopK) {
-            if constexpr (implementation == Implementation::HighPrefixFp32) {
-                if (history > topK_ &&
-                    history <= SparseIndexer::Common::Primitive::TopK::kMaxElements &&
-                    TryHighPrefixTopK(group, token, history, retained)) {
-                    return;
-                }
+            if (history > topK_ &&
+                history <= SparseIndexer::Common::Primitive::TopK::kMaxElements &&
+                TryHighPrefixTopK(group, token, history, retained)) {
+                return;
             }
             if (history <= topK_) {
                 SelectHistoryTopKShortRow(group, token, history, retained);
@@ -1044,7 +1028,7 @@ private:
         PrepareIncomingRadixCandidates(ScoreOffset(group, token), 0U, history,
             ids, keys, incomingKeys, incomingIds, retained);
         AppendRadixCandidates(rankedKeys, incomingKeys, incomingIds, 0U, retained);
-        FinishRankedCandidates();
+        rankedIdsReady_ = true;
     }
 
     // Select one window directly; no window-candidate merge is needed.
@@ -1068,11 +1052,6 @@ private:
                 ids, keys, incomingKeys, incomingIds, retained);
             AppendRadixCandidates(rankedKeys, incomingKeys, incomingIds, 0U, retained);
         }
-        FinishRankedCandidates();
-    }
-
-    __aicore__ inline void FinishRankedCandidates()
-    {
         rankedIdsReady_ = true;
     }
 
@@ -1114,7 +1093,7 @@ private:
                 mergedIds, retained, combined);
             retained = topK_;
         }
-        FinishRankedCandidates();
+        rankedIdsReady_ = true;
     }
 
     __aicore__ inline void SelectHistoryTopKRadix(uint32_t group, uint32_t token,
@@ -1244,7 +1223,6 @@ private:
         }
     }
 
-    template <Implementation implementation = kDefaultImplementation>
     __aicore__ inline void ProcessRow(uint32_t row)
     {
         rankedIdsReady_ = false;
@@ -1256,7 +1234,7 @@ private:
         uint32_t retained = 0U;
         uint32_t directMode = 0U;
         if (history != 0U) {
-            SelectHistoryTopK<implementation>(group, token, history, retained, directMode);
+            SelectHistoryTopK(group, token, history, retained, directMode);
         }
         Store(row, retained, directMode);
     }
@@ -1284,7 +1262,6 @@ private:
     uint32_t tokens_ = 0U;
     uint64_t scoreStrideGroup_ = 0U;
     uint64_t scoreStrideToken_ = 0U;
-    uint32_t rout_ = 0U;
     uint32_t maxRegionLen_ = 0U;
     uint32_t topK_ = 0U;
     uint32_t selectedStride_ = 0U;
@@ -1698,7 +1675,6 @@ __aicore__ __attribute__((noinline)) static void RunIdCompactBatch(GM_ADDR score
 #endif
 
 // 评分与寻址资源释放并全核同步后，运行独立 AIV 选择流水。
-template <Implementation implementation = kDefaultImplementation>
 __aicore__ inline void Run(GM_ADDR scores, GM_ADDR actualKvLengths,
                             GM_ADDR cuSeqLens, GM_ADDR selectedIds,
                             uint32_t groups, uint32_t tokens,
@@ -1717,7 +1693,7 @@ __aicore__ inline void Run(GM_ADDR scores, GM_ADDR actualKvLengths,
                   groups, tokens, scoreStrideGroup, scoreStrideToken, rout,
                   maxRegionLen, topK, maskMode, regionSize,
                   numRequests, usedCubeCores, pipe, alignedSelection, batchBegin, batchCount);
-    selector.Process<implementation>();
+    selector.Process();
 }
 
 // 二次全核同步后压紧私有对齐行，共享搬运单元按原分组处理。

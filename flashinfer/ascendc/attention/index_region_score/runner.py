@@ -52,18 +52,15 @@ def _paged_span(key, torch_npu):
     return key.as_strided((span,), (1,)), (pages, summaries, stride[0])
 
 
-def _aligned_score_span(query, score, protected, attributes, torch_npu):
+def _aligned_score_span(score, logical_regions, protected, torch_npu):
     import torch
 
-    if (query.dtype != torch.float8_e4m3fn or tuple(query.shape[1:]) != (1, 4, 256) or
-            query.shape[0] < 32 or attributes["cache_mode"] != 1 or attributes["mask_mode"] != 3 or
-            attributes["region_size"] != 8 or attributes["top_k"] != 512 or
-            score.dim() != 3 or score.dtype != torch.float32 or torch_npu.get_npu_format(score) != 2):
+    if score.dim() != 3 or score.dtype != torch.float32 or torch_npu.get_npu_format(score) != 2:
         return None
     groups, tokens, regions = score.shape
     pitch = (regions + 127) // 128 * 128
     strides = (tokens * pitch, pitch, 1)
-    if (regions == 0 or regions != attributes["max_region_len"] or regions == pitch or
+    if (regions == 0 or regions != logical_regions or regions == pitch or
             tuple(score.stride()) != strides or score.data_ptr() % 32 or
             score.storage_offset() * score.element_size() % 32):
         return None
@@ -111,7 +108,10 @@ class IndexRegionScoreRunner:
         elif not score.is_contiguous() or score.data_ptr() % 32 or torch_npu.get_npu_format(score) != 2:
             protected = (query, weights, key_summary, actual_kv_lengths, block_table,
                          cu_seq_lens, selected_region_ids) + inputs
-            aligned_score = _aligned_score_span(query, score, protected, attributes, torch_npu)
+            logical_regions = attributes["max_region_len"]
+            if logical_regions == -1:
+                logical_regions = key_summary.shape[0]
+            aligned_score = _aligned_score_span(score, logical_regions, protected, torch_npu)
             score_output = (aligned_score if aligned_score is not None else
                             torch.empty(tuple(score.shape), dtype=score.dtype, device=score.device))
         ids_output = selected_region_ids

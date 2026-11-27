@@ -10,8 +10,6 @@
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK0_TOPK 1
 #define INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_TOPK 12
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_TOPK 13
-// Legacy score-order key. Reserved after removal of that output mode.
-#define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_B8_TOPK 77ULL
 #define INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_H4_TAIL_TOPK 140ULL
 #define INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_H4_TAIL_TOPK 141ULL
 
@@ -49,41 +47,30 @@ IRS_SCORE_PLAN_INLINE uint64_t ScorePlanWorkspaceBytes(uint32_t requests, uint32
 
 #undef IRS_SCORE_PLAN_INLINE
 
-
-
 // Preserve the region-ID order bit in the existing selectionConfig POD layout.
 inline constexpr uint32_t kSelectionRegionIdOrder = 1U << 16U;
 
 // 位 [1:0] 为缓存模式：0 连续、1 分页，2/3 保留。
 // 位 [5:2] 为 maskMode 原值，预留 0..9，目前支持 0/3。
-// 位 [6] 保留，原用于分数降序的短行特化。
+// 位 [6] 保留。
 // 位 [7] 启用逻辑 R 尾块下完整 H4 tile 的批量归约。
 // TopK 始终执行；位 [63:8] 必须为零。
 // TopK 数量、排序/对齐标志和权重类型仍保存在 POD 中。
 constexpr uint32_t TILING_KEY_CACHE_SHIFT = 0U;
 constexpr uint32_t TILING_KEY_CACHE_WIDTH = 2U;
-constexpr uint64_t TILING_KEY_CACHE_VALUE_MASK = (1ULL << TILING_KEY_CACHE_WIDTH) - 1ULL;
 constexpr uint32_t TILING_KEY_MASK_SHIFT = TILING_KEY_CACHE_SHIFT + TILING_KEY_CACHE_WIDTH;
-constexpr uint32_t TILING_KEY_MASK_WIDTH = 4U;
-constexpr uint64_t TILING_KEY_MASK_VALUE_MASK = (1ULL << TILING_KEY_MASK_WIDTH) - 1ULL;
-constexpr uint32_t TILING_KEY_SELECTION_SHIFT = TILING_KEY_MASK_SHIFT + TILING_KEY_MASK_WIDTH;
 constexpr uint64_t TILING_KEY_H4_TAIL = 1ULL << 7U;
-enum class TopKSelectionStrategy : uint32_t { Default = 0U, ShortRow = 1U };
 // 调用方编码前校验模式；不得截断保留值或将 maskMode 折叠为布尔值，以免误选其他策略。
-inline constexpr uint64_t MakeTilingKey(uint32_t cacheMode, uint32_t maskMode,
-    TopKSelectionStrategy selectionStrategy = TopKSelectionStrategy::Default)
+inline constexpr uint64_t MakeTilingKey(uint32_t cacheMode, uint32_t maskMode)
 {
     return (static_cast<uint64_t>(cacheMode) << TILING_KEY_CACHE_SHIFT) |
-           (static_cast<uint64_t>(maskMode) << TILING_KEY_MASK_SHIFT) |
-           (static_cast<uint64_t>(selectionStrategy) << TILING_KEY_SELECTION_SHIFT);
+           (static_cast<uint64_t>(maskMode) << TILING_KEY_MASK_SHIFT);
 }
 
 static_assert(MakeTilingKey(0U, 0U) == INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK0_TOPK &&
               MakeTilingKey(1U, 0U) == INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK0_TOPK &&
               MakeTilingKey(0U, 3U) == INDEXER_REGION_SCORE_TILING_KEY_CONTINUOUS_MASK3_TOPK &&
-              MakeTilingKey(1U, 3U) == INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_TOPK &&
-              MakeTilingKey(1U, 3U, TopKSelectionStrategy::ShortRow) ==
-                  INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_B8_TOPK,
+              MakeTilingKey(1U, 3U) == INDEXER_REGION_SCORE_TILING_KEY_PAGED_MASK3_TOPK,
               "tiling-key macros must match the shared encoder");
 
 // 因果计划协议有固定开销；Host 工作区计算与设备执行共用此门限以保持 mailbox 决策一致。

@@ -60,14 +60,8 @@ struct RegionScoreBlockMmad {
         uint32_t resultSlot)
     {
         CrossCoreWaitFlag<PAGED_SYNC_MODE, PIPE_FIX>(PAGED_C_FREE_EVENT + resultSlot);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][C] got free0 slot=%u\n", resultSlot);
-        }
         CrossCoreWaitFlag<PAGED_SYNC_MODE, PIPE_FIX>(
             PAGED_C_FREE_EVENT + resultSlot + PAGED_AIV1_EVENT_OFFSET);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][C] got free1 slot=%u\n", resultSlot);
-        }
 
         FixpipeParamsC310<CO2Layout::ROW_MAJOR> fp;
         bool singleAiv = false;
@@ -94,10 +88,6 @@ struct RegionScoreBlockMmad {
         }
         CrossCoreSetFlag<PAGED_SYNC_MODE, PIPE_FIX>(
             PAGED_C_READY_EVENT + resultSlot + PAGED_AIV1_EVENT_OFFSET);
-        if constexpr (PAGED_DEBUG_SYNC_TRACE) {
-            AscendC::PRINTF("[PagedRegionScore][C] set ready slot=%u q=%u k=%u\n",
-                            resultSlot, qCount, kCount);
-        }
         SetFlag<HardEvent::FIX_M>(fixToM);
     }
 };

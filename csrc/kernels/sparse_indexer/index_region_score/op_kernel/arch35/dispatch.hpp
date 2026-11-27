@@ -28,8 +28,12 @@ __aicore__ inline bool IsUniformRequestGrid(const DispatchShape &t, GM_ADDR cu, 
     if (rows == 0U || rows % t.qTile != 0U) {
         return false;
     }
-    // A bounded exact scan avoids replicating a large-B metadata pass.
-    if (t.numRequests > 64U) {
+    // Bound the replicated scan by one metadata window. Larger request lists
+    // use the shared planner's parallel metadata loading.
+    constexpr uint32_t metadataRequestWords = 2U; // One Q boundary and one KV length.
+    constexpr uint32_t maxReplicatedRequests =
+        IndexerRegionScoreWeighted::SCORE_METADATA_CHUNK / metadataRequestWords;
+    if (t.numRequests > maxReplicatedRequests) {
         return false;
     }
     const auto bounds = reinterpret_cast<__gm__ const int32_t *>(cu);
@@ -66,49 +70,21 @@ __aicore__ inline void RunWithStrategies(GM_ADDR query, GM_ADDR weights, GM_ADDR
     AscendC::TPipe *pipe)
 {
     DispatchShape decoded{};
-#if IRS_DEVICE_DISPATCH_MODE == 3 || (defined(IRS_DEVICE_DISPATCH_TRACE) && IRS_DEVICE_DISPATCH_TRACE)
     if constexpr (CacheStrategy::IS_PAGED) {
-        decoded.numRequests = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(PagedTilingData, numRequests) / sizeof(uint32_t)];
+        const auto words = reinterpret_cast<__gm__ const uint32_t *>(tiling);
+        decoded.numRequests = words[offsetof(PagedTilingData, numRequests) / sizeof(uint32_t)];
+        decoded.totalTokens = words[offsetof(PagedTilingData, totalTokens) / sizeof(uint32_t)];
+        decoded.qShardCount = words[offsetof(PagedTilingData, qShardCount) / sizeof(uint32_t)];
+        decoded.qTile = words[offsetof(PagedTilingData, qTile) / sizeof(uint32_t)];
+        decoded.batchTokens = words[offsetof(PagedTilingData, batchTokens) / sizeof(uint32_t)];
     } else {
-        decoded.numRequests = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(RegionScoreTilingData, numRequests) / sizeof(uint32_t)];
-    }
-#elif IRS_DEVICE_DISPATCH_MODE == 1
-    if constexpr (CacheStrategy::IS_PAGED) {
-        decoded.numRequests = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(PagedTilingData, numRequests) / sizeof(uint32_t)];
-    }
-#endif
-#if IRS_DEVICE_DISPATCH_MODE == 1
-    if constexpr (CacheStrategy::IS_PAGED) {
-        decoded.totalTokens = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(PagedTilingData, totalTokens) / sizeof(uint32_t)];
-        decoded.qShardCount = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(PagedTilingData, qShardCount) / sizeof(uint32_t)];
-        decoded.qTile = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(PagedTilingData, qTile) / sizeof(uint32_t)];
-        decoded.batchTokens = reinterpret_cast<__gm__ const uint32_t *>(tiling)[offsetof(PagedTilingData, batchTokens) / sizeof(uint32_t)];
-    } else {
-        // Continuous qTile is derived by NormalizeContinuousTiling, not copied from its POD qTile field.
+        // Continuous qTile is derived by normalization, rather than its POD qTile field.
         GET_TILING_DATA_WITH_STRUCT(RegionScoreTilingData, data, tiling);
         const auto normalized = NormalizeContinuousTiling(data);
         decoded = {normalized.numRequests, normalized.totalTokens, normalized.qShardCount,
             normalized.qTile, normalized.batchTokens};
     }
-#endif
-#if IRS_DEVICE_DISPATCH_MODE == 0
-    const bool direct = true;
-#elif IRS_DEVICE_DISPATCH_MODE == 2
-    const bool direct = false;
-#elif IRS_DEVICE_DISPATCH_MODE == 3
-    // Keep both code paths linked while forcing grid for every valid request count.
-    const bool direct = decoded.numRequests != 0U;
-#else
     const bool direct = IsUniformRequestGrid<MaskStrategy::CAUSAL>(decoded, cuSeqLens, actualKvLengths);
-#endif
-#if defined(IRS_DEVICE_DISPATCH_TRACE) && IRS_DEVICE_DISPATCH_TRACE
-    if ASCEND_IS_AIC {
-        if (GetBlockIdx() == 0U) {
-            AscendC::PRINTF("[IRS dispatch] mode=%u direct=%u requests=%u\n",
-                IRS_DEVICE_DISPATCH_MODE, static_cast<uint32_t>(direct), decoded.numRequests);
-        }
-    }
-#endif
     if (direct) {
         RunGridWithStrategies<CacheStrategy, MaskStrategy, SelectionStrategy, ALLOW_H4_TAIL>(
             query, weights, keySummary, actualKvLengths, pagedKeySummary, blockTable,
