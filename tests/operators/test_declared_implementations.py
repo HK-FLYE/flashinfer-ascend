@@ -14,6 +14,7 @@ from flashinfer.operators.testing import (
     case_output_count,
     case_parameters,
     case_tolerances,
+    comparison_values,
     numerical_cases,
 )
 from flashinfer.runtime import Backend, CompileMode, KernelRegistry, get_global_registry, kernel_registry_scope
@@ -72,12 +73,13 @@ def test_public_default_route(npu_runtime, aot_runtime, op, configuration):
     else:
         actual, expected = tuple(actual)[:count], tuple(expected)[:count]
     assert len(actual) == len(expected) == len(tolerances)
-    for output, golden, (atol, rtol) in zip(actual, expected, tolerances):
+    for index, (output, golden, (atol, rtol)) in enumerate(zip(actual, expected, tolerances)):
         if operator.schema:
             assert torch_npu.get_npu_format(output) == 2  # Typed public calls allocate ND outputs.
         if atol == rtol == 0:
             assert output.dtype == golden.dtype
-        torch.testing.assert_close(output.cpu().double(), golden.double(), atol=atol, rtol=rtol)
+        output, golden = comparison_values(cases, index, output, golden)
+        torch.testing.assert_close(output, golden, atol=atol, rtol=rtol)
 
 
 def _cases():
