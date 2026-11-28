@@ -7,22 +7,67 @@ executor; its device buffer is an implicit final kernel argument.
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+from itertools import repeat
 from threading import RLock
 
 from flashinfer.runtime import SchemaError
 
 
-def _reject_output_overlap(parameters, tensors):
+def _storage_span(parameter, tensor, layout):
+    if tensor is None or getattr(parameter, "device", None) == "cpu" or tensor.numel() == 0:
+        return 0, 0
+    itemsize = tensor.element_size()
+    if layout == "NZ":
+        storage = tensor.untyped_storage()
+        begin = storage.data_ptr()
+        return begin, begin + storage.nbytes()
+    begin = tensor.data_ptr()
+    if not hasattr(tensor, "stride") or tensor.is_contiguous():
+        return begin, begin + tensor.numel() * itemsize
+    strides = tensor.stride()
+    axes = [(stride, size - 1) for size, stride in zip(tensor.shape, strides) if size > 1]
+    if any(stride < 0 for stride in strides) or any(stride == 0 for stride, _ in axes):
+        raise ValueError("ACLNN strided Tensor requires nonnegative strides and positive strides on non-singleton axes")
+    elements = 1 + sum(stride * steps for stride, steps in axes)
+    offset = tensor.storage_offset()
+    if offset < 0 or offset + elements > tensor.untyped_storage().nbytes() // itemsize:
+        raise ValueError("ACLNN strided Tensor exceeds its storage span")
+    if parameter.role == "output":
+        occupied = 1
+        for stride, steps in sorted(axes):
+            if stride < occupied:
+                raise ValueError("ACLNN strided output has internally overlapping elements")
+            occupied += stride * steps
+    return begin, begin + elements * itemsize
+
+
+def _reject_output_overlap(parameters, tensors, *, layouts=None):
+    spans = tuple(_storage_span(p, t, layout) for p, t, layout in
+                  zip(parameters, tensors, repeat(None) if layouts is None else layouts))
+    aliases = {}
+    if any(getattr(p, "alias_of", None) is not None for p in parameters):
+        from torch._C import _is_alias_of
+
+        indices = {p.name: i for i, p in enumerate(parameters)}
+        for index, p in enumerate(parameters):
+            if p.alias_of is None:
+                continue
+            input_index = indices[p.alias_of]
+            source, target = tensors[input_index], tensors[index]
+            if (source.device != target.device or not _is_alias_of(source, target)
+                    or source.dtype != target.dtype or source.shape != target.shape
+                    or source.stride() != target.stride() or source.storage_offset() != target.storage_offset()):
+                raise ValueError("ACLNN alias pair must be the exact same storage view")
+            aliases[index] = input_index
     for output_index, (parameter, output) in enumerate(zip(parameters, tensors)):
         if parameter.role != "output":
             continue
-        out_lo = output.data_ptr()
-        out_hi = out_lo + output.numel() * output.element_size()
+        out_lo, out_hi = spans[output_index]
         for tensor_index, tensor in enumerate(tensors):
-            if tensor_index == output_index or tensor is None:
+            if (tensor_index == output_index or tensor_index == aliases.get(output_index)
+                    or tensor is None or tensor.device != output.device):
                 continue
-            lo = tensor.data_ptr()
-            hi = lo + tensor.numel() * tensor.element_size()
+            lo, hi = spans[tensor_index]
             if max(lo, out_lo) < min(hi, out_hi):
                 raise ValueError("output tensors must not overlap other arguments")
 
@@ -85,20 +130,24 @@ class TorchOpPackageRunner:
         device = next((t.device for p,t in arguments if p.device == "npu"), None)
         if device is None or device.type != npu:
             raise ValueError("Ascend C tensor adapter requires NPU tensors")
+        layouts = []
         for p, t in arguments:
             if p.device == "cpu":
                 if t.device.type != "cpu":
                     raise ValueError("expected a CPU input for " + p.name)
+                layouts.append(None)
                 continue
             if t.device != device:
                 raise ValueError("Ascend C tensors must share one device")
             layout = {2: "ND", 29: "NZ"}.get(torch_npu.get_npu_format(t))
-            if not t.is_contiguous() or layout not in p.physical_layouts:
+            if layout not in p.physical_layouts or (
+                    not t.is_contiguous() and not (p.allow_strided and layout == "ND")):
                 raise ValueError("Ascend C tensor adapter requires contiguous %s tensors for %s"
                                  % ("/".join(p.physical_layouts), p.name))
+            layouts.append(layout)
         if arguments:
             params, flat = zip(*arguments)
-            _reject_output_overlap(params, flat)
+            _reject_output_overlap(params, flat, layouts=layouts)
 
     def __call__(self, *tensors, **attributes):
         names = self.recipe.tensor_parameter_names

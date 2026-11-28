@@ -15,7 +15,9 @@ from flashinfer.operators.testing import (
     case_parameters,
     case_tolerances,
     comparison_values,
+    is_void_mutation,
     numerical_cases,
+    run_void_mutation,
 )
 from flashinfer.runtime import Backend, CompileMode, KernelRegistry, get_global_registry, kernel_registry_scope
 
@@ -64,8 +66,11 @@ def test_public_default_route(npu_runtime, aot_runtime, op, configuration):
     else:
         call = getattr(flashinfer, operator.name)
     cases = cases_module(op)
-    count = case_output_count(operator, cases, configuration)
     args, options, expected = cases.sample(torch, torch_npu, **configuration)
+    if is_void_mutation(operator, cases):
+        run_void_mutation(torch, call, cases, args, options, expected)
+        return
+    count = case_output_count(operator, cases, configuration)
     actual = call(*args, **options)
     tolerances = case_tolerances(cases, configuration)[:count]
     if count == 1:

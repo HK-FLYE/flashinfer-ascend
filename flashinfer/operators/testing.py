@@ -75,6 +75,23 @@ def case_tolerances(cases, configuration):
     return cases.TOLERANCES
 
 
+def is_void_mutation(operator, cases):
+    if getattr(cases, "verify_mutation", None) is None:
+        return False
+    assert operator.torch_declarations is not None and not operator.output_names
+    assert any(declaration.mutates_args and declaration.schema.endswith("-> ()")
+               for declaration in operator.torch_declarations())
+    return True
+
+
+def run_void_mutation(torch, call, cases, args, options, expected):
+    tensors = tuple(value for value in (*args, *options.values()) if isinstance(value, torch.Tensor))
+    pointers = tuple(tensor.data_ptr() for tensor in tensors)
+    assert call(*args, **options) is None, "void mutation operator must return None"
+    assert pointers == tuple(tensor.data_ptr() for tensor in tensors), "input storage changed"
+    return [float(error) for error in cases.verify_mutation(torch, args, expected)]
+
+
 def comparison_values(cases, output_index, actual, reference):
     """Compare the entire output unless the author declares a valid range."""
     assert actual.shape == reference.shape, "reference output shape differs"
@@ -93,10 +110,17 @@ def numerical_cases(torch, torch_npu, name, *, first_only=False, kernel_id=None,
     parameters = case_parameters(cases, kernel_id)
     call = public_function(name)
     observations = {}
+    void_mutation = is_void_mutation(operator, cases)
     for index, configuration in enumerate(parameters[:1] if first_only else parameters):
+        args, options, expected = cases.sample(torch, torch_npu, **configuration)
+        if void_mutation:
+            errors = run_void_mutation(torch, call, cases, args, options, expected)
+            record = dict(case=configuration, max_abs=errors)
+            print(json.dumps(record, sort_keys=True), flush=True)
+            observations[str(index)] = record
+            continue
         tolerances = case_tolerances(cases, configuration)
         output_count = case_output_count(operator, cases, configuration)
-        args, options, expected = cases.sample(torch, torch_npu, **configuration)
         if kernel_id is not None:
             options = dict(options, kernel_id=kernel_id)
         if backend is not None:
@@ -221,8 +245,10 @@ def run(name, mode="matrix", *, kernel_id=None):
             cases = cases_module(name)
             args, options, _ = cases.sample(torch, torch_npu, **case_parameters(cases, kernel_id)[0])
             expected_error = AotMissingError if mode == "missing" else AotCorruptError
+            if not is_void_mutation(definition(name), cases):
+                options = dict(options, backend="ascendc", kernel_id=kernel_id)
             try:
-                public_function(name)(*args, **dict(options, backend="ascendc", kernel_id=kernel_id))
+                public_function(name)(*args, **options)
             except expected_error as error:
                 if mode == "missing":
                     assert error.spec.fingerprint == spec.fingerprint

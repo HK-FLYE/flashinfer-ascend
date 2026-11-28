@@ -23,7 +23,7 @@ def schema_arguments(schema):
             keyword_only = True
             continue
         match = re.fullmatch(
-            r"(Tensor\??|float|int|bool|str\??) ([a-z][a-z0-9_]*)(?:=(.+))?", value
+            r"(Tensor\??|float|int\??|bool|str\??) ([a-z][a-z0-9_]*)(?:=(.+))?", value
         )
         if match is None:
             raise SchemaError("unsupported author schema argument: " + value)

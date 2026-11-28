@@ -105,6 +105,7 @@ def torch_call(recipe):
         % len(recipe.get("attributes", ())),
     ]
     params = recipe["tensor_parameters"]
+    slots = {param["name"]: index for index, param in enumerate(params)}
     arguments = []
     def tensor(i, param):
         listed, optional = param.get("tensor_list", False), param.get("optional", False)
@@ -112,7 +113,9 @@ def torch_call(recipe):
         flags = [output, listed, optional]
         fmt = sum({"ND": 1, "NZ": 2}[f] for f in param.get("physical_layouts", ("ND",)))
         flags = ", ".join(str(b).lower() for b in flags)
-        lines.append(f'    auto t{i} = operands.take({flags}, {fmt}, {str(param.get("device") == "cpu").lower()});')
+        cpu = str(param.get("device") == "cpu").lower()
+        strided = ", true" if param.get("allow_strided") else ""
+        lines.append(f'    auto t{i} = operands.take({flags}, {fmt}, {cpu}{strided});')
         if listed:
             value = f't{i}' if optional else f'*t{i}'
         elif optional:
@@ -121,8 +124,9 @@ def torch_call(recipe):
             value = f't{i}->front()'
         conversion = param.get("native_conversions", ())
         if conversion:
-            packed = str(conversion[0]["native_dtype"] == "int4").lower()
-            value = f'StorageView{{{value}, {packed}}}'
+            kind = {"int4": "Int4", "uint64": "UInt64", "float4_e2m1": "Float4E2M1",
+                    "float8_e8m0": "Float8E8M0"}[conversion[0]["native_dtype"]]
+            value = f'StorageView{{{value}, StorageKind::{kind}}}'
         lines.append(f'    auto p{i} = {value};')
         arguments.append(f'p{i}')
     for i, param in enumerate(params):
@@ -154,6 +158,10 @@ def torch_call(recipe):
     for i, param in enumerate(params):
         if param["role"] == "output":
             tensor(i, param)
+    # Use the consumed Tensor slices so optional and TensorList widths are resolved.
+    for i, param in enumerate(params):
+        if param.get("alias_of") is not None:
+            lines.append(f'    operands.exact_alias(*t{slots[param["alias_of"]]}, *t{i});')
     lines += ['    operands.finish();', '    EXEC_NPU_CMD(' + recipe["host_entry"] + ', ' + ', '.join(arguments) + ');', '}']
     return "\n".join(lines) + "\n"
 
